@@ -108,11 +108,13 @@ are deduped by basename, so an import graph that reaches the same DLL twice maps
 key uses the filesystem's native path representation with ASCII case folded; it does not require a
 Windows filename to fit the ANSI code page. A lossless legacy narrow filename alias retains the existing
 bytewise case behavior for narrow API and import-name lookups. `Module::name`, mapped address labels,
-and path diagnostics use UTF-8. This does not add Unicode case folding or change the separately defined
-`LoadLibrary`/`GetModuleHandle` API conversions.
+and path diagnostics use UTF-8. The `LoadLibrary*`/`GetModuleHandle*` shims look a wide name up by its native
+basename when it has a character outside ASCII (`Loader::find_loaded_module_w`, `load_runtime_module_w`), and
+module names compare case-insensitively with the system's own table (`CompareStringOrdinal`), as Windows
+compares them; a narrow name outside ASCII compares the same way through the ANSI code page.
 
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
-reuse, existing ACP aliases, export execution, and path errors. On native Windows with Python available,
+reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
 `run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
 and `--run`, including a Unicode parent directory and an ACP-named imported DLL. It checks strict UTF-8
 trace names and unchanged fixture bytes. Both tests use only locally built synthetic images.
@@ -197,7 +199,7 @@ Current limits, by design:
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
   address. `XMemAllocDefault`/`XMemFreeDefault` share that heap. `XMemVirtualAlloc` accepts the attribute word,
-  drops the console's `PAGE_GRAPHICS_*` and write-combine protection bits, commits 2 MiB guest pages 2 MiB-aligned,
+  drops the console's `PAGE_GRAPHICS_*` protection bits, commits 2 MiB guest pages 2 MiB-aligned,
   and passes `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` through. Physical pages
   (`XMemAllocatePhysicalPages`, `XMemFreePhysicalPages`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter`) are
   64 KiB pages of pagefile-backed sections, mapped one view per page into the placeholder that a reserve-only
@@ -399,9 +401,10 @@ from the ANSI code page.
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
-| `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault` and `XMemFreeDefault` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (the allocators only), `caller` (module+RVA) |
-| `xmem_virtual_alloc` | the first `XMemVirtualAlloc` for each distinct (type, attributes, protect) | `api`, `type`, `attributes`, `protect`, `size`, `caller` |
+| `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault`, `XMemFreeDefault` and `XMemVirtualAlloc` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (not for the frees), `caller` (module+RVA) |
 | `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
+| `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
+| `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
 | `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
 | `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |

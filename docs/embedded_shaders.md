@@ -308,20 +308,81 @@ with a translated corpus of 26,521 entries, none of them the builder's.
 | RTX 3070, NVIDIA 610.74 (subgroups 32..32, limit 49,152) | `--wave64-emulate` | 49 of 50 creations `S_OK`; #50 `Box16Rehydration` has no module, `E_INVALIDARG`, and the constructor throws `0x80070057` |
 | same | native | the same 49 of 50; the runtime warns that this device cannot require 64-wide subgroups |
 | Radeon integrated (Ryzen 7 9700X), AMD 32.0.21042.62 (subgroups 32..64, limit 32,768) | `--wave64-emulate` | 49 of 50 `S_OK`, stops at #50 the same way |
-| same | native | 48 creations `S_OK`; #49 `LeafRehydration` did not come back from the driver's pipeline compile in 16 minutes, and the run was stopped there |
+| same | native | 49 of 50 `S_OK`, stops at #50 the same way. That is the translator of `main` `561b65a8`; with the one of `3faac557`, 48 creations returned `S_OK` and #49 `LeafRehydration` did not come back from the driver's pipeline compile in 16 minutes (below) |
 
-With #1864's translator change applied to a local copy of the tools (not part of this step), 52 of 52 translate
+The rows above were measured before #1864 (`buffer_store_short`) was on `main`. With it (`main` `8575d36e`) the
+step translates 52 of 52, and on the Radeon with the emulated modules all 53 creations return `S_OK` and
+`bvh_builder_test` passes on the Vulkan device; the RTX 3070 and the native modules were not run again.
+
+Before that, with #1864's translator change applied to a local copy of the tools (not part of this step), 52 of 52 translate
 and pass `spirv-val`, and with the emulated modules all 53 creations return `S_OK` on both GPUs: the constructor
 and the destructor return and the test passes. So with the emulated modules the one thing between this step and a
 constructed builder on the Vulkan device is `buffer_store_short`. The PC-device run of the test (WARP) is
 unchanged: 53 of 53.
 
-The Radeon's native stop is that driver's compile time for one module, not the lookup. `vk_pipeline_check` creates
-the same pipelines without the D3D12 layer: all 51 on the RTX 3070 (native and emulated) and on the Radeon
-(emulated), and on the Radeon with the native modules 50 of 51, while `LeafRehydration`, a 1.66 MB wave64 module
-that asks for 64-wide subgroups, was still compiling when the check was stopped after 15 minutes. The same
-program's emulated module is created in 12 s on that driver, and its native module in 11 s on the RTX 3070. Why the
-native module costs the AMD compiler that much has not been looked into.
+**`LeafRehydration` on the AMD driver (SHADER-995).** The step was first measured with the translator of `main`
+`3faac557`. `vk_pipeline_check` then created the same pipelines without the D3D12 layer: all 51 on the RTX 3070
+(native and emulated) and on the Radeon (emulated), and on the Radeon with the native modules 50 of 51, while
+`LeafRehydration`, a 1.66 MB wave64 module, was still compiling when the check was stopped after 15 minutes. Its
+emulated module was created in 12 s on that driver, and its native module in 11 s on the RTX 3070.
+
+The stop was that driver's compile time for the control-flow form of one module, not the lookup, native wave64 or
+the module's size. The translator of `3faac557` emitted a structured tree deeper than 16 in the dispatch-loop form
+(SHADER-299: one loop around an `OpSwitch` with a case per basic block), and this program's tree nests 18 deep
+(`ReloadTriangles`' 17; found by lowering `--max-structured-depth` until the form changes). Since SHADER-427 the
+bound is 64, so with `main` `561b65a8` all 51 native modules are structured (47) or barrier rounds (4), the native
+row of the table above is that translation, and `vk_pipeline_check` creates all 51 native pipelines on the Radeon
+(18.4 s on one thread, `LoadInstances` 8.6 s the slowest; the 51 emulated ones 26.9 s, `LeafRehydration` 11.6 s the
+slowest). No build option is involved, and the step needed no change. @Jadiac5 measured the same translation on an
+RX 9070 XT (RDNA4, AMD 32.0.32029.2010): 51 of 51 native and 51 of 51 emulated, the slowest module in 19 to 35 s
+([their comment](https://github.com/ItsNotRexed/Leonida/pull/5680#issuecomment-7101091229)). Those are the
+structured modules too, so the dispatch-loop module below has only been tried on the gfx1036 and the RTX 3070.
+
+Measured on the Radeon (gfx1036, AMD 32.0.21042.62) with `vk_pipeline_check --jobs 1`, one module in the driver at
+a time beside the one long run. That driver keeps compiled shaders on disk and gives back a module it has seen in
+0.2 s, so every time is the first compile of a module, or of a copy with another generator word in its header:
+
+| `LeafRehydration` module | size | shape | pipeline creation |
+|---|---|---|---|
+| dispatch loop, translator of `3faac557` | 1,658,968 B | 1,532 blocks: one loop around an `OpSwitch` with 581 cases | created after 2,039.5 s (34 minutes): 2,014 s of CPU time, one busy thread, the process at 1.2 GB after 5 minutes and 1.7 GB after 21. Slow, not hung |
+| the same module, pipeline requiring 32-wide subgroups, or no size | | | not within 150 s either way |
+| dispatch loop, current translator (`--dispatch-loop` or `--max-structured-depth 16`, the same bytes) | 1,192,148 B | 2,954 blocks, the same loop and switch | XXnot created within 10 minutes; the run was stopped there |
+| structured, the default now | 1,238,360 B | 4,108 blocks, 1,763 selections, no loop, no switch | 2.9 s (3.6 s and 3.2 s for two more copies) |
+| `--wave64-emulate`, translator of `3faac557` | 1,703,748 B | emulated wave64 structured | 12.6 s |
+| `--wave64-emulate`, current translator | 1,358,436 B | emulated wave64 structured | 12.4 s |
+
+What the time depends on, tried on the current translator's dispatch-loop module with a limit of 45 to 150 s per
+compile:
+
+* **Not the subgroup operations or the subgroup size.** All three native forms hold the same 590
+  `OpGroupNonUniformAny` and no other subgroup operation. A copy with each of them replaced by an `OpLogicalOr` (a
+  compile-time probe, not an equivalent module) did not finish in 120 s, and neither did the first module with
+  32-wide or no required subgroup size.
+* **Not the size of the switch by itself.** The other programs compile in the dispatch-loop form on that driver,
+  2.5 to 5 times slower than structured: `LoadInstances` (628 cases, 5.35 MB) in 40.3 s against 8.6 s,
+  `ReloadTriangles` (311) 3.6 s against 0.7 s, `ConstructBVH4` (206) 2.2 s against 0.6 s, `PT_ConstructBVH4` (186)
+  1.9 s, `LoadTriangles` (185) 2.1 s, `SplitInstances` (153, 1.53 MB) 4.0 s against 1.2 s, `RefitBVH4` (125) 1.3 s,
+  `FindTreelets` (89) 0.9 s, and the wave64 `Box32Rehydration` (47) 0.5 s and `RadixAlloc` (17) 0.4 s.
+* **It is how much of this program the loop reaches.** With only the first K of the 581 cases left in the
+  `OpSwitch` (the other blocks unreachable; a probe again): K = 64 0.8 s, 128 1.5 s, 256 3.6 s, 272 5.4 s, 280
+  23.1 s, 284 24.5 s, 286 43.5 s, 287 42.9 s, and 288, 320, 384 and 512 not within 60 to 90 s. So past case 272 a
+  few more blocks multiply the time. That looks like growth with the paths through the program rather than with
+  its size, which these numbers suggest and do not show.
+* **Nothing done to the module from outside changed that.** `spirv-opt -O` (1,350,016 B) and the local SSA
+  rewrite with dead-code elimination (`--ssa-rewrite` after the two local eliminations and before
+  `--eliminate-dead-code-aggressive`, 1,120,512 B) validate and did not finish in 120 s;
+  `--eliminate-dead-branches --merge-blocks --cfg-cleanup` returns the module unchanged. Marking every load and
+  store of the dispatch variables `%pc` and `%done` `Volatile`, which keeps the module equivalent, did not finish in
+  150 s either (whether that driver honours the flag was not checked). `-Os`, `--merge-return` and
+  `--scalar-replacement` were not run.
+
+So the AMD compiler's time on this module comes from the dispatch-loop form of this one program: of the eleven
+tried it is the only one that is both large and without a loop of its own (its structured module has no
+`OpLoopMerge`), which is an observation, not an explanation, and which of the driver's passes takes the time was
+not looked into. The default translation does not emit that form for any of these 51 programs, so the step keeps
+what `wave64_settings` chooses for this driver (native, #857) and makes no exception for the builder. A module can
+still come out in the dispatch-loop form elsewhere (a graph `cfg_structure` cannot make reducible, a tree deeper
+than the bound, `--dispatch-loop`); [testing.md](testing.md), "Known problems", has the row for that.
 
 Still open: nothing has dispatched one of these pipelines through the D3D12 layer, so this shows that the
 constructor's pipelines are created, not that a build produces the right tree (section 5).

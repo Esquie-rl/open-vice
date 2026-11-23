@@ -6,11 +6,12 @@
 // size at +8, and XMemVirtualQuery's MEMORY_BASIC_INFORMATION prefix inside a zeroed 64-byte output.
 // XMemTransferMemory follows the call shape in Microsoft's public samples: TRUE for any direction and size, with
 // nothing committed, and one trace event per distinct (type, size). XMemVirtualAlloc accepts attribute words and console
-// protection bits and commits 2 MiB guest pages; the placeholder flags pass through; physical pages keep their
+// graphics protection bits and commits 2 MiB guest pages; the placeholder flags pass through; physical pages keep their
 // contents across unmap and remap, alias when mapped twice, and scatter-map per address.
 #include <windows.h>
 #include <psapi.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "shims.h"
@@ -247,17 +249,43 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
     }
 
     // The attribute word is accepted (every measured call passes a nonzero one) and the protection loses its graphics
-    // and write-combine bits.
+    // bits, in the 64 KiB page mode as well.
     void* const attributed = virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT | kXmem64kPages, 0x181,
-                                           PAGE_READWRITE | PAGE_WRITECOMBINE | PAGE_GRAPHICS_READWRITE);
+                                           PAGE_READWRITE | PAGE_GRAPHICS_READWRITE);
     check(attributed != nullptr, "XMemVirtualAlloc accepts a nonzero attribute word and console protection bits");
     if (attributed) {
         MEMORY_BASIC_INFORMATION info{};
         VirtualQuery(attributed, &info, sizeof(info));
         check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
-              "the region is committed PAGE_READWRITE (graphics and write-combine bits dropped)");
+              "the region is committed PAGE_READWRITE (graphics bits dropped)");
         static_cast<volatile uint8_t*>(attributed)[0] = 0x42;
         check(VirtualFree(attributed, 0, MEM_RELEASE), "release the attributed region");
+    }
+
+    // The retail executable's GPU pools: the attribute word is recorded, and the PAGE_GRAPHICS_* bits are dropped.
+    MEMORY_BASIC_INFORMATION mbi{};
+    void* const pool = virtual_alloc(nullptr, SIZE_T{8} << 30, MEM_RESERVE | 0x20400000, 0x21, PAGE_READWRITE);
+    check(pool != nullptr, "attributes 0x21 with 64 KiB pages reserves 8 GiB");
+    if (pool) {
+        check(VirtualQuery(pool, &mbi, sizeof mbi) && mbi.State == MEM_RESERVE, "the 8 GiB pool is reserve-only");
+        check(VirtualFree(pool, 0, MEM_RELEASE), "release the 8 GiB pool");
+    }
+
+    void* const noaccess = virtual_alloc(nullptr, 0x10000, MEM_RESERVE | 0x20400000, 0x3, 0x801);
+    check(noaccess != nullptr, "attributes 0x3 with protect PAGE_GRAPHICS_NOACCESS|PAGE_NOACCESS succeeds");
+    if (noaccess) {
+        check(VirtualQuery(noaccess, &mbi, sizeof mbi) && mbi.AllocationProtect == PAGE_NOACCESS,
+              "protect 0x801 becomes PAGE_NOACCESS");
+        check(VirtualFree(noaccess, 0, MEM_RELEASE), "release the PAGE_NOACCESS pool");
+    }
+
+    void* const gpu = virtual_alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x183, 0x22004);
+    check(gpu != nullptr, "attributes 0x183 with protect 0x22004 succeeds");
+    if (gpu) {
+        check(VirtualQuery(gpu, &mbi, sizeof mbi) && mbi.Protect == PAGE_READWRITE, "protect 0x22004 becomes PAGE_READWRITE");
+        static_cast<volatile uint8_t*>(gpu)[0] = 0x5a;
+        check(static_cast<volatile uint8_t*>(gpu)[0] == 0x5a, "the 0x183 allocation is writable");
+        check(VirtualFree(gpu, 0, MEM_RELEASE), "release the 0x183 allocation");
     }
 
     SetLastError(ERROR_SUCCESS);
@@ -502,6 +530,12 @@ void test_physical_pages_commit_on_touch(const PhysicalApi& api) {
               access_faults(static_cast<volatile uint32_t*>(static_cast<void*>(window)), true),
           "a write to a committed read-only page still faults to the next handler");
     VirtualProtect(window, kPage64k, PAGE_READWRITE, &old);
+    check(VirtualProtect(window + 4096, 4096, PAGE_READONLY, &old) != FALSE &&
+              access_faults(static_cast<volatile uint32_t*>(static_cast<void*>(window + 4096)), true),
+          "a write to a read-only 4 KiB part of a read-write page still faults to the next handler");
+    check(!access_faults(static_cast<volatile uint32_t*>(static_cast<void*>(window + 8192)), true),
+          "the rest of that page stays writable");
+    VirtualProtect(window + 4096, 4096, PAGE_READWRITE, &old);
     void* const elsewhere = VirtualAlloc(nullptr, kPage64k, MEM_RESERVE, PAGE_READWRITE);
     check(elsewhere != nullptr && access_faults(static_cast<volatile uint32_t*>(elsewhere), false),
           "a fault outside the mapped pages still reaches the next handler");
@@ -539,6 +573,93 @@ void test_physical_pages_commit_on_touch(const PhysicalApi& api) {
     check(api.free_pages(count, pages.data()) == TRUE, "XMemFreePhysicalPages frees them");
 }
 
+void test_commit_physical_pages(const PhysicalApi& api) {
+    constexpr uint64_t kPages = 3;
+    uint64_t pages[kPages]{};
+    uint64_t count = kPages;
+    check(api.allocate(0x280, &count, pages) == TRUE && count == kPages, "three physical pages for commit by number");
+    if (count != kPages) return;
+    check(rt::xmem::commit_physical_pages(pages, 0), "committing no pages succeeds");
+    check(!rt::xmem::commit_physical_pages(nullptr, 1), "committing from a null page array fails");
+    const uint64_t unknown = 0x1fffff0;
+    check(!rt::xmem::commit_physical_pages(&unknown, 1), "committing a page number that was never allocated fails");
+    check(rt::xmem::commit_physical_pages(pages, 2), "commit_physical_pages commits two pages that were never mapped");
+
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    check(window != nullptr, "XMemVirtualAlloc reserves a window for them");
+    if (window) {
+        check(api.map(window, kPages, pages) == window, "the three pages map");
+        MEMORY_BASIC_INFORMATION info[kPages]{};
+        bool queried = true;
+        for (uint64_t i = 0; i < kPages; ++i)
+            queried &= VirtualQuery(window + i * kPage64k, &info[i], sizeof(info[i])) == sizeof(info[i]);
+        check(queried && info[0].State == MEM_COMMIT && info[1].State == MEM_COMMIT && info[2].State == MEM_RESERVE,
+              "the two committed by number are committed in the window and the third is not yet");
+        check(read_u32(window, 0) == 0 && read_u32(window + kPage64k, 0) == 0,
+              "pages committed by number read as zero");
+        api.map(window, kPages, nullptr);
+    }
+    check(api.free_pages(kPages, pages) == TRUE, "XMemFreePhysicalPages frees them");
+}
+
+void test_first_touch_during_remap(const PhysicalApi& api) {
+    constexpr uint64_t kSlice = 16;
+    constexpr uint64_t kSlices = 256;
+    std::vector<uint64_t> pages(kSlice * kSlices);
+    uint64_t count = pages.size();
+    check(api.allocate(0x280, &count, pages.data()) == TRUE && count == pages.size(),
+          "4,096 physical pages for the remap race");
+    if (count != pages.size()) return;
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kSlice * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    check(window != nullptr, "XMemVirtualAlloc reserves a window for the remap race");
+    if (!window) {
+        api.free_pages(count, pages.data());
+        return;
+    }
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> touches{0};
+    std::atomic<uint64_t> unmapped_faults{0};
+    std::vector<std::thread> writers;
+    for (int t = 0; t < 4; ++t) {
+        writers.emplace_back([&, t] {
+            uint64_t i = static_cast<uint64_t>(t);
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto* const word =
+                    static_cast<volatile uint32_t*>(static_cast<void*>(window + (i % kSlice) * kPage64k)) + t;
+                if (access_faults(word, true)) {
+                    unmapped_faults.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    touches.fetch_add(1, std::memory_order_relaxed);
+                }
+                ++i;
+            }
+        });
+    }
+    const ULONGLONG started = GetTickCount64();
+    bool remapped = true;
+    for (uint64_t s = 0; s < kSlices; ++s) {
+        remapped &= api.map(window, kSlice, pages.data() + s * kSlice) == window;
+        Sleep(0);
+        remapped &= api.map(window, kSlice, nullptr) == window;
+    }
+    remapped &= api.map(window, kSlice, pages.data() + (kSlices - 1) * kSlice) == window;
+    stop.store(true);
+    for (auto& writer : writers) writer.join();
+    const ULONGLONG elapsed = GetTickCount64() - started;
+    check(remapped, "256 slices map and unmap while 4 threads write into the window");
+    check(elapsed < 30000, "first-touch faults during map and unmap finish without hanging");
+    check(touches.load() > 0, "writes land while the pages are mapped");
+    std::printf("remap race: %llu writes landed, %llu hit an unmapped page, %llu ms\n",
+                static_cast<unsigned long long>(touches.load()),
+                static_cast<unsigned long long>(unmapped_faults.load()), static_cast<unsigned long long>(elapsed));
+    static_cast<volatile uint32_t*>(static_cast<void*>(window))[8] = 0x600dcafe;
+    check(read_u32(window, 32) == 0x600dcafe, "the last slice is still mapped and writable");
+    api.map(window, kSlice, nullptr);
+    check(api.free_pages(count, pages.data()) == TRUE, "XMemFreePhysicalPages frees the remap race pages");
+}
+
 // The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.
 void test_placeholders(const PhysicalApi& api) {
     auto* const base = static_cast<uint8_t*>(
@@ -574,7 +695,7 @@ void test_placeholders(const PhysicalApi& api) {
 }
 
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
-void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
+void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
     wchar_t temp[MAX_PATH];
     GetTempPathW(MAX_PATH, temp);
     const std::wstring path =
@@ -593,6 +714,9 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
     free_mem(b, 0x5e50000);  // same word again: no second event
     free_mem(c, 0x99);
     free_mem(nullptr, 0x77);  // a free-only word is recorded too
+    void* const v = virtual_alloc ? virtual_alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x183, PAGE_READWRITE)
+                                  : nullptr;
+    if (v) VirtualFree(v, 0, MEM_RELEASE);
     rt::startup_trace::close();
 
     std::ifstream in(path);
@@ -604,14 +728,16 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
         for (size_t at = log.find(needle); at != std::string::npos; at = log.find(needle, at + 1)) ++n;
         return n;
     };
-    check(count("\"kind\":\"xmem_attributes\"") == 5, "five events: two XMemAlloc words and three XMemFree words");
+    check(count("\"kind\":\"xmem_attributes\"") == 6, "six events: two XMemAlloc words, three XMemFree words and one XMemVirtualAlloc word");
+    check(count("\"api\":\"XMemVirtualAlloc\",\"attributes\":\"0x183\",\"size\":65536") == 1,
+          "XMemVirtualAlloc 0x183 is recorded once, with its size");
     check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x5e50000\",\"size\":4096") == 1,
           "XMemAlloc 0x5e50000 is recorded once, with the size of the first call");
     check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x99\",\"size\":16") == 1, "XMemAlloc 0x99 is recorded once");
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x5e50000\"") == 1, "XMemFree 0x5e50000 is recorded once");
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x77\"") == 1, "XMemFree 0x77 is recorded");
     check(count("\"attributes\":\"0x1111\"") == 0, "nothing was recorded while the trace was off");
-    check(count("\"caller\":\"") == 5, "every event names its caller");
+    check(count("\"caller\":\"") == 6, "every event names its caller");
     DeleteFileW(path.c_str());
 }
 
@@ -712,6 +838,14 @@ void test_title_virtual_alloc() {
         check(alloc != nullptr, what);
         if (!alloc) continue;
 
+        void* const gfx = alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x2004);  // PAGE_GRAPHICS_READWRITE
+        check(gfx != nullptr, "title VirtualAlloc with protect 0x2004 succeeds");
+        if (gfx) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            check(VirtualQuery(gfx, &mbi, sizeof mbi) && mbi.Protect == PAGE_READWRITE,
+                  "protect 0x2004 commits PAGE_READWRITE");
+            VirtualFree(gfx, 0, MEM_RELEASE);
+        }
         for (const DWORD bits : {kMemGraphics, kMemTitle, kMemGraphics | kMemTitle, DWORD{0}}) {
             void* const p = alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT | bits, PAGE_READWRITE);
             std::snprintf(what, sizeof what, "%s!VirtualAlloc with type bits %#lx returns memory", dll,
@@ -792,7 +926,7 @@ int main() {
     if (virtual_alloc && get_write_watch && reset_write_watch) {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
     }
-    test_attribute_trace(alloc, free_mem);
+    test_attribute_trace(alloc, free_mem, virtual_alloc);
     if (transfer) {
         test_transfer_memory(transfer);
         test_transfer_trace(transfer);
@@ -805,6 +939,8 @@ int main() {
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
         test_physical_pages_commit_on_touch(physical);
+        test_commit_physical_pages(physical);
+        test_first_touch_during_remap(physical);
         test_placeholders(physical);
     }
 

@@ -1721,6 +1721,43 @@ def runtime_gpu_per_vertex():
         return None
 
 
+def runtime_gpu_barycentric_fallback():
+    """Whether the selected Vulkan GPU's driver has a known BaryCoordKHR bug (Mesa ANV, AMD Windows on gfx90c), or None
+    when it can't be told."""
+    try:
+        v = runtime_gpu_info().get("barycentric_fallback")
+        return v if isinstance(v, bool) else None
+    except (AttributeError, TypeError):
+        return None
+
+
+def barycentric_fallback_override():
+    """LEONIDA_BARY_FALLBACK=1/0 forces the same barycentric path as the GPU test runner; None leaves it automatic."""
+    v = (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+# VkDriverId of Intel's Windows Vulkan driver (igvk64.dll).
+VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS = 5
+
+
+def runtime_gpu_mesh_draws_crash():
+    """True where the GPU the runtime would use is on Intel's Windows Vulkan driver with VK_EXT_mesh_shader: there
+    vkCmdDrawMeshTasksEXT crashes (0xC0000409 in igvk64.dll) for a mesh shader with a live push-constant load at
+    byte offset 32 or more, which every corpus mesh shader has (BUILD-2202, measured on an Arc A770 with driver
+    32.0.101.9175; --mesh-compute is exact there). No fixed driver version is known, so every one counts. False
+    for any other GPU or one without mesh shaders, None when tools/vk_subgroup_info.py can't tell."""
+    info = runtime_gpu_info()
+    if not info or "driver_id" not in info:
+        return None
+    return info.get("driver_id") == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS and \
+        info.get("mesh_in_supported_stages") is True
+
+
 def runtime_gpu_max_push_constants():
     """max_push_constants_size as tools/vk_subgroup_info.py answers for the GPU the runtime would use, or None."""
     v = runtime_gpu_info().get("max_push_constants_size")
@@ -2731,7 +2768,11 @@ def main() -> int:
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
-                         "without VK_EXT_mesh_shader")
+                         "without VK_EXT_mesh_shader; on by itself on Intel's Windows Vulkan driver, whose mesh "
+                         "draws crash on the corpus' mesh shaders (BUILD-2202)")
+    ap.add_argument("--native-mesh", action="store_true",
+                    help="keep native mesh shaders on Intel's Windows Vulkan driver instead of turning on "
+                         "--mesh-compute (for a driver that fixes BUILD-2202's crash)")
     ap.add_argument("--pc-tail-ubo", action="store_true",
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
@@ -2799,6 +2840,14 @@ def main() -> int:
             stages = [s for s in stages if s not in WINDOWS_ONLY]
             log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
                 "(or pass --runtime-build)")
+    if "shaders" in stages and not a.mesh_compute and not a.native_mesh:
+        crash = runtime_gpu_mesh_draws_crash()
+        if crash:
+            log("shaders: the GPU the runtime would use is on Intel's Windows Vulkan driver, whose mesh draws crash on "
+                "these mesh shaders (BUILD-2202): translating with --mesh-compute (--native-mesh keeps them native)")
+            a.mesh_compute = True
+        elif crash is None:
+            a.mesh_compute = keep_recorded_fallback("--mesh-compute", work)
     emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute) if "shaders" in stages
                               else (False, a.wave64_emulate == "auto"))
     if "shaders" in stages and not a.f16_interp_fallback:
@@ -2809,6 +2858,26 @@ def main() -> int:
             a.f16_interp_fallback = True
         elif per_vertex is None:
             a.f16_interp_fallback = keep_recorded_fallback("--f16-interp-fallback", work)
+    if "shaders" in stages:
+        if a.bary_fallback:
+            # Command-line precedence: --bary-fallback wins over LEONIDA_BARY_FALLBACK=0.
+            pass
+        else:
+            override = barycentric_fallback_override()
+            if override is True:
+                log("shaders: LEONIDA_BARY_FALLBACK=1 forces --bary-fallback")
+                a.bary_fallback = True
+            elif override is False:
+                log("shaders: LEONIDA_BARY_FALLBACK=0 forces native barycentrics")
+                a.bary_fallback = False
+            else:
+                bary_fallback = runtime_gpu_barycentric_fallback()
+                if bary_fallback is True:
+                    log("shaders: this GPU's driver has a known BaryCoordKHR bug (Mesa ANV, or AMD's Windows driver "
+                        "on gfx90c): translating with --bary-fallback")
+                    a.bary_fallback = True
+                elif bary_fallback is None:
+                    a.bary_fallback = keep_recorded_fallback("--bary-fallback", work)
     if "shaders" in stages and not a.pc_tail_ubo:
         need_pc = 152 if a.mesh_compute else 144
         max_pc = runtime_gpu_max_push_constants()

@@ -63,6 +63,19 @@ The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetComm
 
 The shims added since account for the rest of the difference from the first version of the table. The UCRT's `_configure_narrow_argv`, `_configure_wide_argv`, `__p___argc`, `__p___wargv` and `abort` are served by `runtime/shims/process.cpp`, which is why almost every DLL gained one or two. The file-system calls listed in *Console paths and the write overlay* below (`CreateFile2`, `CopyFile2`, `CreateDirectoryW`, `FindFirstFileExW`, `SetFileAttributesW` and the rest) account for `msvcp140.dll`, `vcomp140.dll`, `Bink2Scarlett.dll`'s `CreateFile2` and part of the two HTTP clients. `winhttp.dll` is a module the shims own (*WinHTTP offline* below), so every `WinHttp*` import binds to it: 15 in `libHttpClient.GDK.dll` (all 16 but `WinHttpCrackUrl`) and 15 in `XCurl.dll` (all but `WinHttpQueryOption`). That is why the two HTTP clients moved the most: 11 to 26 and 9 to 24 shim imports.
 
+The UCRT argv configuration imports honor the executable's startup mode. Each run starts with `argc == 0` and
+null narrow/wide argument tables, while `GetCommandLineA/W` is already available to TLS and process-attach
+callbacks. Default startup publishes unexpanded arguments for its chosen width. `setargv.obj` / `wsetargv.obj`
+startup expands wildcard arguments against the host working directory, including quoted patterns; an unmatched
+pattern stays literal. Narrow expansion searches the ACP-converted pattern and converts matching names back to
+ACP, so its matches can differ from wide startup. The two widths retain independent tables, and the most recently
+configured width sets the shared `argc`. `noarg.obj` leaves the initial tables null; later no-argument
+configuration is a no-op that preserves existing pointers and counts. These are guest-owned tables, without
+changing the host CRT's argument globals. This does not add console-path wildcard routing or change the legacy
+`msvcrt!__getmainargs` wildcard policy. `run_argv_modes` compares the same six linker-selected MSVC fixtures
+natively and through the loader; `run_startup_cmdline` also checks native preconfiguration and command-line
+identity through attach and entry.
+
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):
 
@@ -104,12 +117,77 @@ Seven more `xmem.dll` imports follow argument shapes measured locally at a title
   keeps their protection, which mapped pages get (AWE's rule). The measured title also reserves a placeholder with
   `MEM_RESERVE_PLACEHOLDER` and carves windows out of it with `MEM_REPLACE_PLACEHOLDER`, and the shim passes both
   through. **ASSUMPTION:** nothing commits into a window with `kernel32!VirtualAlloc`, which a placeholder refuses.
-- `XMemVirtualAlloc` used to refuse any nonzero attribute word and 2 MiB pages. All 23 measured calls pass a
-  nonzero word and five commit 2 MiB pages. The word is now accepted and traced (`xmem_virtual_alloc`). 2 MiB
-  regions are aligned through `VirtualAlloc2`. The console's `PAGE_GRAPHICS_*` bits and `PAGE_WRITECOMBINE` are
-  dropped from the protection, because the D3D12 layer reads this memory on the CPU.
+- `XMemVirtualAlloc` used to refuse 2 MiB pages, and five of the 23 measured calls commit them. They are now
+  committed 2 MiB-aligned through `VirtualAlloc2`. The attribute word is recorded (`xmem_attributes`) and the
+  console's `PAGE_GRAPHICS_*` bits are dropped from the protection, as before.
 - `XMemIsToolsMemAvailable()` is `FALSE`: a PC has no development-kit tools memory. The measured title asks only
   on an out-of-memory path, after an allocation has already failed.
+
+## The retail executable (RT-5)
+
+`game_scarlett_master.exe` (120,181,760 bytes on disk, SHA-256
+`e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`) is a PE32+ x86-64 image with no resource
+section. `gta6rt --dry-run` maps it at its preferred base together with the four package DLLs it imports, and
+exits 0 with nothing on stderr:
+
+```powershell
+$game = "D:\path\to\your\package"
+$scratch = Join-Path $env:TEMP 'leonida-overlay'
+runtime\build\gta6rt.exe --dry-run "D:\path\to\game_scarlett_master.exe" --game-dir $game --overlay $scratch
+```
+
+`--overlay` points the write overlay away from `<game-dir>\overlay`, so a dry run writes nothing into the package.
+Measured at `1cc6e3c1`, Windows 11, MSVC 14.44:
+
+| Image | Base | Size of image | Entry RVA | Shim | Host | Module | Unimplemented |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `game_scarlett_master.exe` | `0x140000000` | 184,995,840 | `0x56a1ec8` | 53 | 432 | 72 | **30** |
+| `XboxBvhBuilder.dll` | `0x180000000` | 909,312 | `0x227cc` | 5 | 52 | 0 | 0 |
+| `amd_fidelityfx_loader_xbox.dll` | relocated | 32,768 | `0x18d0` | 6 | 16 | 0 | 0 |
+| `libHttpClient.GDK.dll` | relocated | 999,424 | `0x11f0` | 28 | 170 | 0 | 0 |
+| `Bink2Scarlett.dll` | relocated | 278,528 | `0x2ac1c` | 5 | 55 | 0 | 0 |
+
+The 72 module imports are served by those four DLLs. The 30 unimplemented imports all fall under the dry-run's
+policy "other" (none is counted as returning an `HRESULT`), and they come from seven Xbox-only DLLs:
+
+| DLL | Unimplemented imports | What the names suggest (not measured) |
+|---|---:|---|
+| `xmem.dll` | 7: `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemIsToolsMemAvailable`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter` | the console's physical page and default allocation routines; `XMemAlloc`, `XMemFree`, `XMemVirtualQuery`, `XMemGetWorkingSetStatistics` and `XMemTransferMemory` already bind |
+| `d3d12_xs.dll` | 1: `D3D12ConfigureVirtualMemoryX` | GPU virtual memory setup |
+| `xg_xs.dll` | 2: `XGCreateTextureComputer`, `XGSuggestSwizzleMode` | texture layout computation |
+| `XCRDAPI.dll` | 1: `DStorageGetFactory` | DirectStorage |
+| `chad.dll` | 5: `XDspActivate`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand` | the audio DSP |
+| `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit |
+| `AcpHal.dll` | 9: `AcpHalAllocateShapeContexts`, `AcpHalCreate`, `AcpHalReleaseShapeContexts`, `ApuAlloc`, `ApuCreateHeap`, `ApuFree`, `ApuIsVirtualAddressValid`, `ApuMapApuAddress`, `ApuMapVirtualAddress` | the audio hardware layer |
+
+The game executable imports two functions from `xg_xs.dll`, the console's texture layout library:
+`XGSuggestSwizzleMode` (2 call sites, in the helper that fills a texture description) and `XGCreateTextureComputer`
+(4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). The runtime has no model of the console
+resource layout, so `runtime/shims/xg_xs.cpp` computes none: both return `E_NOTIMPL` and write no layout. Two of the
+four `XGCreateTextureComputer` callers ignore the HRESULT and call through the object at once, so the shim still stores
+a static object in the out pointer; its slot 1 (read as `Release`) does nothing, and every other slot up to 31 logs its
+index and caller once and returns `E_NOTIMPL` without writing its arguments. The call shapes and the reasoning are at
+the top of the file; `xg_xs_test` covers them. Textures whose layout the game asks for are therefore not laid out yet.
+The table above was measured before this shim and still lists these two as unimplemented; they are served now.
+
+Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
+they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
+`xapu.dll`, `AcpHal.dll`) with no shim at all.
+
+The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so the same dry run lists 23.
+
+`--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
+`DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and
+again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
+unimplemented imports is reached by the TLS callbacks or the `DllMain`s.
+
+What this does not show: `--run` has not been run, so the entry point has not been called and no import is known to be
+reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
+that name exists), and an unimplemented import stops the run only if the title calls it
+([When an unimplemented import is called](#when-an-unimplemented-import-is-called)). The executable imports 25
+functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
+host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
+which opens none.
 
 ## Console paths and the write overlay
 
@@ -220,7 +298,7 @@ mostly correspond one to one to the `xgameruntime.lib` functions. The executable
 
 Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
 shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`, and the DirectStorage
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `xg_xs.dll`, `gameinput.dll`, and the DirectStorage
 modules `dstorage_xs.dll`, `xcrdapi.dll` and `dstorage.dll`, [directstorage.md](directstorage.md)) with a
 pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
@@ -230,8 +308,8 @@ function as `IXErrorImpl` slot 3 (below), so a report reaches the callback `XErr
 initializers succeed offline and log the GDK version and mode once. `QueryApiImpl` serves `XThreadingImpl`,
 `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`, `XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`,
 `XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl` (below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`,
-`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl` and `XUserDeviceImpl` from xgameruntime-docs'
-layout (below); for any other class it logs
+`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl`, `XUserDeviceImpl`, `XAccessibilityImpl` and
+`XLauncherImpl` from xgameruntime-docs' layout (below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` serves slot by slot.
