@@ -235,6 +235,16 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 return static_cast<std::uint32_t>(E_INVALIDARG);
             case 34: case 35: case 46: copy_array(m, slot, a2, a1); break;  // (count, objects, ...)
             case 45: copy_array(m, slot, a1, a3); break;                    // (fences, values, count, ...)
+            case 41:                                                        // CreateCommandSignature(desc, ...)
+                if (const auto* desc = reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1)) {
+                    m->array[41][0] = desc->ByteStride | std::uint64_t{desc->NumArgumentDescs} << 32;
+                    for (UINT i = 0; desc->pArgumentDescs && i < desc->NumArgumentDescs && i < 3; ++i) {
+                        std::uint32_t type = 0;  // read as its 32 bits: a console type is outside the enum's range
+                        std::memcpy(&type, &desc->pArgumentDescs[i].Type, sizeof(type));
+                        m->array[41][i + 1] = type;
+                    }
+                }
+                break;
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
             default: break;
         }
