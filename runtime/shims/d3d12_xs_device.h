@@ -27,8 +27,10 @@
 //   slot 26   GetCustomHeapProperties, called by the retail title with the C ABI: return buffer in RCX, the device
 //             in RDX (the PC form is `this` in RCX, return buffer in RDX). Slot 25 (GetResourceAllocationInfo, also a
 //             struct wider than 8 bytes) takes the same form by the same rule. Both accept either form.
-//   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> PC CreateCommittedResource on a DEFAULT heap,
-//             with the Xbox flag bits dropped and an all-ones state as COMMON. Not backed by the memory at va.
+//   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> a buffer on the title's pages at va, made by
+//             the handler of set_placed_at_va_handler (below). Where that cannot be made, PC CreateCommittedResource
+//             on a DEFAULT heap, with the Xbox flag bits dropped and an all-ones state as COMMON: not backed by the
+//             memory at va.
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The 32-byte Xbox desc starts with
 //             a D3D12_COMMAND_QUEUE_DESC; only that prefix is passed on, with the console-only flag bits cleared
 //             (DISABLE_GPU_TIMEOUT is kept). The four extra words are logged once.
@@ -139,6 +141,14 @@ unsigned device_proxy_slot_count(const void* device);
 
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
+
+// Device slot 133 (the console's CreatePlacedResourceX) makes a buffer on the title's pages at `va`. The proxy does
+// not create it itself: the device behind it does, through this handler, which the Vulkan layer registers
+// (rt::d3d12::create_buffer_at_host_address). With none registered, a PC device behind the proxy, or a handler
+// that fails (a texture, a range the import refuses), the slot creates the committed stand-in described at the top.
+using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc, REFIID riid,
+                                      void** out);
+void set_placed_at_va_handler(PlacedAtVaHandler handler);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor handle translation), 26 (the

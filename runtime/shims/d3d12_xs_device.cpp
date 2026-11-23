@@ -269,12 +269,12 @@ const char* slot_name(unsigned slot) {
         case 70: return "Xbox shader-resource view from raw words";
         case 73: return "Xbox CreateCommandListX -> console list proxy";
         case 75: return "CreateCommandQueue1 -> queue proxy";
-        case 133: return "Xbox CreatePlacedResourceX -> committed resource";
         case 76: return "Xbox resource creation";
         case 127: return "Xbox CreateCommittedResource3";
         case 78: return "Xbox SetFrameIntervalX";
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
+        case 133: return "Xbox CreatePlacedResourceX (a buffer on the title's pages, else committed)";
         default: return "forwarded";
     }
 }
@@ -2866,6 +2866,65 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
     return hr;
 }
 
+// Device slot 133 is the console's CreatePlacedResourceX: (va, desc, state, clear, riid, out), measured on the retail
+// executable (docs/retail_boot_chain.md, section 3.4). `va` is the start of a physical-page range the title has just
+// mapped, `desc` a 56-byte description with Xbox bits above the PC resource flags and an Xbox layout word, and
+// `state` is 0xFFFFFFFF, which is no PC state. The resource is a buffer on those pages, made by the handler the
+// device behind the proxy registered (set_placed_at_va_handler), with the PC flags kept and the layout made
+// ROW_MAJOR, as slot 76 does.
+std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
+
+HRESULT proxy_create_buffer_at_va(DeviceProxy* self, void* va, const D3D12_RESOURCE_DESC* xbox_desc,
+                                  std::uint32_t state, const IID* riid, void** out) {
+    if (out) *out = nullptr;
+    // Without a handler (a PC device behind the proxy, or none registered) the slot refuses like any slot past the
+    // PC vtable, whatever its arguments.
+    const PlacedAtVaHandler handler = g_placed_at_va.load(std::memory_order_acquire);
+    if (!handler) return E_NOTIMPL;
+    if (!out || !xbox_desc || !riid) return E_POINTER;
+    // An integer mask: a D3D12_RESOURCE_FLAGS constant past the SDK's last enumerator is not a constant expression
+    // for clang-cl with SDK 10.0.26100 (found in review). The cast is applied to the masked value at run time.
+    constexpr std::uint32_t kPcResourceFlags = 0x7ff;
+    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+    const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
+    if (pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) pc_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 133 CreatePlacedResourceX: va=%p dimension=%d width=%llu xbox flags=0x%x "
+                     "state=0x%x -> a buffer on the title's pages\n",
+                     va, static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
+                     xbox_flags, state);
+    }
+    return handler(self->real, va, pc_desc, *riid, out);
+}
+
+// Slot 133 with both of its paths. The buffer on the title's own pages (proxy_create_buffer_at_va) is tried first: it
+// is the only one whose memory is the memory at `va`. Where it cannot be made (no handler registered, a PC device
+// behind the proxy, a texture, no VK_EXT_external_memory_host, or a range the import refuses), the committed DEFAULT
+// stand-in (proxy_create_placed_resource_x) answers, so the title still gets a resource and does not assert; that
+// one is not backed by the VA and its first-call log line says so.
+HRESULT proxy_create_placed_resource_slot133(DeviceProxy* self, std::uint64_t va,
+                                             const D3D12_RESOURCE_DESC* xbox_desc, std::uint32_t state,
+                                             const D3D12_CLEAR_VALUE* clear_value, const IID* riid, void** out) {
+    if (out && xbox_desc && riid) {
+        const HRESULT hr = proxy_create_buffer_at_va(self, reinterpret_cast<void*>(va), xbox_desc, state, riid, out);
+        if (SUCCEEDED(hr)) {
+            note_slot(133);
+            return hr;
+        }
+        *out = nullptr;
+        static std::atomic<bool> logged{false};
+        if (hr != E_NOTIMPL && !logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 133: no buffer on the title's pages at %p (hr=0x%08x); creating the "
+                         "committed stand-in\n",
+                         reinterpret_cast<void*>(va), static_cast<unsigned>(hr));
+    }
+    return proxy_create_placed_resource_x(self, va, xbox_desc, state, clear_value, riid, out);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -2959,7 +3018,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 133) {
-        return hr_to_u64(proxy_create_placed_resource_x(
+        return hr_to_u64(proxy_create_placed_resource_slot133(
             self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2), static_cast<std::uint32_t>(a3),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4), reinterpret_cast<const IID*>(a5),
             reinterpret_cast<void**>(a6)));
@@ -3269,6 +3328,10 @@ D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, 
 unsigned device_proxy_slot_count(const void* device) {
     if (!is_device_proxy(device)) return 0;
     return static_cast<const DeviceProxy*>(device)->slot_count;
+}
+
+void set_placed_at_va_handler(PlacedAtVaHandler handler) {
+    g_placed_at_va.store(handler, std::memory_order_release);
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {
