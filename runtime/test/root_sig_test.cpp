@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -308,6 +309,20 @@ void test_registered_shim(bool supports_1_2) {
           "shim registry exposes d3d12_xs!D3D12CreateRootSignatureDeserializer");
     check(rt::shims::find("d3d12_xs.dll", "D3D12XboxCreateDevice") != nullptr,
           "shim registry exposes d3d12_xs!D3D12XboxCreateDevice");
+
+    // D3D-661: the title checks only for success (>= 0), with a pointer to a 32-byte block as the one argument.
+    using ConfigureFn = HRESULT(WINAPI*)(const void*);
+    auto configure = reinterpret_cast<ConfigureFn>(rt::shims::find("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX"));
+    check(configure != nullptr, "shim registry exposes d3d12_xs!D3D12ConfigureVirtualMemoryX");
+    if (configure) {
+        uint32_t block[8] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
+                             0x55555555u, 0x66666666u, 0x77777777u, 0x88888888u};
+        uint32_t before[8];
+        std::memcpy(before, block, sizeof(block));
+        check(configure(block) == S_OK, "D3D12ConfigureVirtualMemoryX returns S_OK for a 32-byte block");
+        check(std::memcmp(before, block, sizeof(block)) == 0, "D3D12ConfigureVirtualMemoryX leaves the block unchanged");
+        check(configure(nullptr) == S_OK, "D3D12ConfigureVirtualMemoryX returns S_OK for a null block");
+    }
     if (!fn) return;
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC xbox{};

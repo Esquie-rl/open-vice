@@ -213,6 +213,32 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     return result(method, S_OK);
 }
 
+// D3D-661. Call-site shape in the 1.0.2.1 executable (one call site; static look, issue #6750): one argument, a pointer
+// to a 32-byte block on the caller's stack. The caller zeroes the block and sets only the second 32-bit word, a value
+// derived from the size of the XMemVirtualAlloc reservation it makes next. The result is only checked for success
+// (>= 0), and the block is not read again after the call, so it is input only. It is the first d3d12_xs import the
+// title reaches, before D3D12XboxCreateDevice. The PC device has no GPU virtual-address layout to configure, so the
+// block is logged (8 x 32-bit words) and S_OK is returned. Only the first argument is read.
+HRESULT WINAPI D3D12ConfigureVirtualMemoryX(const void* config) {
+    constexpr auto method = "D3D12ConfigureVirtualMemoryX";
+    if (config) {
+        const uint32_t* words = static_cast<const uint32_t*>(config);
+        char line[8 * 9 + 1];
+        line[0] = '\0';
+        size_t used = 0;
+        for (int i = 0; i < 8 && used < sizeof(line); ++i) {
+            int n = std::snprintf(line + used, sizeof(line) - used, "%s%08x", i ? " " : "",
+                                  static_cast<unsigned>(words[i]));
+            if (n < 0) break;
+            used += static_cast<size_t>(n);
+        }
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX config[8] = %s\n", line);
+    } else {
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX config = null\n");
+    }
+    return rt::d3d12_trace::result(method, S_OK);
+}
+
 static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
@@ -225,4 +251,5 @@ SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
+    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&D3D12ConfigureVirtualMemoryX)},
 );
