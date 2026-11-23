@@ -4026,7 +4026,13 @@ public:
         VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         module_info.codeSize = words.size() * 4;
         module_info.pCode = words.data();
-        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
+        // local: every Vulkan failure is logged with its VkResult and, under LEONIDA_STUB_PIPELINES, becomes a no-op
+        // stub like a missing shader, so one pipeline the driver refuses does not stop the title.
+        if (const VkResult r = vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_); r != VK_SUCCESS) {
+            std::fprintf(stderr, "[rt] d3d12: compute %s: vkCreateShaderModule failed (VkResult %d)\n",
+                         entry->name.c_str(), int(r));
+            return stub_or(E_FAIL, "compute (shader module refused)");
+        }
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
@@ -4038,7 +4044,11 @@ public:
             layout_info.pSetLayouts = &set0_layout;
             pipeline_.bindless_set = device_.bindless->set();
         }
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
+        if (const VkResult r = vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout); r != VK_SUCCESS) {
+            std::fprintf(stderr, "[rt] d3d12: compute %s: vkCreatePipelineLayout failed (VkResult %d)\n",
+                         entry->name.c_str(), int(r));
+            return stub_or(E_FAIL, "compute (layout refused)");
+        }
         VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -4047,15 +4057,24 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
-            VK_SUCCESS)
-            return E_FAIL;
+        if (const VkResult r = vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
+                                                           &pipeline_.pipeline);
+            r != VK_SUCCESS) {
+            std::fprintf(stderr, "[rt] d3d12: compute %s: vkCreateComputePipelines failed (VkResult %d)\n",
+                         entry->name.c_str(), int(r));
+            pipeline_.pipeline = VK_NULL_HANDLE;
+            return stub_or(E_FAIL, "compute (driver refused)");
+        }
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
         const std::vector<std::uint8_t>& code = program.bytes;
         VkDeviceSize offset = 0;
-        if (!device_.arena_allocate(code.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
+        if (!device_.arena_allocate(code.size(), 256, offset, DeviceState::arena_shader)) {
+            std::fprintf(stderr, "[rt] d3d12: compute %s: no room for %zu code bytes in the shader arena\n",
+                         entry->name.c_str(), code.size());
+            return E_OUTOFMEMORY;
+        }
         std::memcpy(device_.arena.mapped + offset, code.data(), code.size());
         code_bytes_ = code.size();
         code_base_ = offset;

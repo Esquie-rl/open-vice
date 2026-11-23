@@ -1354,7 +1354,9 @@ PresentState* present_state_for(DeviceProxy* device) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
         return state;
     }
-    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter));
+    // local: the presentation's pacer shares the device's frame-token source (#7685), so the tokens WaitFrameEventX
+    // (device slot 80) hands out are tokens the pacer issued. Without it every tokened PresentX was E_INVALIDARG.
+    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), nullptr, device->frame_tokens);
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(state->window));
     return state;
 }
@@ -1365,6 +1367,8 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
     // local: pump the presentation window's messages, so Windows does not mark it "not responding". Only that
     // window's messages: a title's own thread messages stay in its queue.
     if (state && state->window) {
+        // A parent's show state (a minimized start) can leave the window iconic or hidden: bring it back.
+        if (IsIconic(state->window) || !IsWindowVisible(state->window)) ShowWindow(state->window, SW_RESTORE);
         MSG msg;
         for (int i = 0; i < 64 && PeekMessageW(&msg, state->window, 0, 0, PM_REMOVE); ++i) {
             TranslateMessage(&msg);
@@ -1372,10 +1376,18 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
         }
     }
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
-    return hr_to_u64(state->xbox->PresentX(
-        static_cast<UINT>(plane_count),
-        reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
-        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params)));
+    const HRESULT hr = state->xbox->PresentX(static_cast<UINT>(plane_count),
+                                             reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
+                                             reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params));
+    // local: count the presents and log their results (the first ten, every failure up to 20, then every 100th).
+    static std::atomic<unsigned> presents{0}, failures{0};
+    const unsigned n = ++presents;
+    const bool failed = FAILED(hr);
+    const unsigned f = failed ? ++failures : failures.load();
+    if (n <= 10 || n % 100 == 0 || (failed && f <= 20))
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX #%u planes=%llu -> 0x%08lx (%u failed so far)\n", n,
+                     static_cast<unsigned long long>(plane_count), static_cast<unsigned long>(hr), f);
+    return hr_to_u64(hr);
 }
 
 #else  // !LEONIDA_VULKAN_DEVICE: this translation unit stands alone (mock and COM tests)
