@@ -955,7 +955,7 @@ int check_xbox_slots() {
 int run_env_slots(bool valid, bool on_slot70 = false) {
     const char* frame_interval = on_slot70 ? "70" : valid ? "96" : "2";
     const char* schedule_event = valid ? "97" : "2";
-    const char* wait_event = valid ? "98" : "2";
+    const char* wait_event = on_slot74 ? "74" : valid ? "98" : "2";
     const char* queue_x = valid ? "99" : "2";
     const char* list_x = valid ? "100" : "2";
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_FRAME_INTERVAL_SLOT", frame_interval) != FALSE);
