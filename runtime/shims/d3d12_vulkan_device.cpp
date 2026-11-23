@@ -859,6 +859,8 @@ struct DeviceState {
                              error.message().c_str());
                 return;
             }
+            // The file is this session's own now: a later save of this session must not take it for another's.
+            session_stamp_at_load = store::stamp_of(pipeline_cache_session_path);
             std::fprintf(stderr, "[rt] d3d12: saved %zu bytes to %s in %.0f ms\n", data.size(), name.c_str(),
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
         } catch (const std::exception& e) {
@@ -866,6 +868,36 @@ struct DeviceState {
         } catch (...) {
             std::fprintf(stderr, "[rt] d3d12: could not save the pipeline cache to %s\n", name.c_str());
         }
+    }
+
+    // A save while the session runs, called after a pipeline was created: at most one every
+    // LEONIDA_PIPELINE_CACHE_SAVE_SECONDS (default 120; 0 saves only at teardown), and only if pipelines missed the
+    // cache since the last one. A title that is killed, or that ends through TerminateProcess, never reaches the
+    // device's teardown, and a cold boot of a title compiles for tens of minutes (measured on a retail boot: about
+    // 2,700 compute pipelines at roughly one a second): without this every such launch starts from nothing. One
+    // thread saves at a time; the others go on creating pipelines (the driver synchronizes the cache).
+    std::mutex pipeline_cache_save_mutex;
+    std::chrono::steady_clock::time_point pipeline_cache_last_save = std::chrono::steady_clock::now();
+    std::uint64_t pipeline_cache_misses_at_last_save = 0;
+    void save_pipeline_cache_if_due() noexcept {
+        static const long seconds = [] {
+            char text[16]{};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_PIPELINE_CACHE_SAVE_SECONDS", text, sizeof(text));
+            if (n == 0 || n >= sizeof(text)) return 120l;
+            char* end = nullptr;
+            const long value = std::strtol(text, &end, 10);
+            return end != text && *end == 0 && value >= 0 ? value : 120l;
+        }();
+        if (seconds == 0 || pipeline_cache_session_path.empty()) return;
+        const std::unique_lock lock(pipeline_cache_save_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - pipeline_cache_last_save < std::chrono::seconds(seconds)) return;
+        const std::uint64_t misses = std::uint64_t(pipeline_stats.created) - std::uint64_t(pipeline_stats.cache_hits);
+        pipeline_cache_last_save = now;
+        if (misses == pipeline_cache_misses_at_last_save) return;
+        pipeline_cache_misses_at_last_save = misses;
+        save_pipeline_cache();
     }
 
     QueueClock clock;  // what every queue's GetClockCalibration uses
@@ -4201,6 +4233,7 @@ public:
         }
         if (created != VK_SUCCESS) return E_FAIL;
         feedback.record(device_.pipeline_stats);
+        device_.save_pipeline_cache_if_due();
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
@@ -4321,6 +4354,7 @@ private:
                                                           &info, nullptr, &pipeline) != VK_SUCCESS)
             return VK_NULL_HANDLE;
         feedback.record(device_.pipeline_stats);
+        device_.save_pipeline_cache_if_due();
         return pipeline;
     }
 

@@ -2594,6 +2594,9 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_pipeline_cache_persist_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_pipeline_cache_persist COMMAND d3d12_pipeline_cache_persist_test)
     set_tests_properties(d3d12_pipeline_cache_persist PROPERTIES SKIP_RETURN_CODE 77)
+    # The save while a session runs (LEONIDA_PIPELINE_CACHE_SAVE_SECONDS is read once, so its own process).
+    add_test(NAME d3d12_pipeline_cache_persist_periodic COMMAND d3d12_pipeline_cache_persist_test --periodic)
+    set_tests_properties(d3d12_pipeline_cache_persist_periodic PROPERTIES SKIP_RETURN_CODE 77)
 
     # ExecuteIndirect with CountBuffer (vkCmdDrawIndirectCount) + optional BLAS/TLAS/RayQueryKHR GPU test.
     add_executable(d3d12_indirect_rt_test test/d3d12_indirect_rt_test.cpp)
@@ -3285,7 +3288,7 @@ endif()
 # would start from it). Only d3d12_pipeline_cache_persist chooses its own file, in a scratch folder it removes.
 get_directory_property(_leonida_tests TESTS)
 foreach(_test ${_leonida_tests})
-  if(NOT _test STREQUAL "d3d12_pipeline_cache_persist")
+  if(NOT _test MATCHES "^d3d12_pipeline_cache_persist(_periodic)?$")
     set_property(TEST ${_test} APPEND PROPERTY ENVIRONMENT "LEONIDA_PIPELINE_CACHE=off")
   endif()
 endforeach()

@@ -331,7 +331,10 @@ private:
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // --periodic (its own process: the interval is read once): a session saves while it runs, see below.
+    const bool periodic = argc == 2 && !std::strcmp(argv[1], "--periodic");
+    if (periodic) REQUIRE(set_env(L"LEONIDA_PIPELINE_CACHE_SAVE_SECONDS", L"1"));
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) {
@@ -363,6 +366,34 @@ int main() {
     root_desc.Desc_1_0 = {3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     Setup setup{d, dir, serialize(root_desc)};
     REQUIRE(!setup.root_blob.empty());
+
+    if (periodic) {
+        // A session that is never torn down (a title that is killed, or ends through TerminateProcess) still leaves
+        // its pipelines behind: with a 1 s interval, the first pipeline created more than a second into the session
+        // saves the cache while the device is alive, and the next session starts from that file.
+        Live live;
+        REQUIRE(open_session(live, setup, 0, pipeline_count - 1));
+        Sleep(1200);
+        const auto container = shader_container(fssm_of(pipeline_count - 1));
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = live.root.p;
+        desc.CS = {container.data(), container.size()};
+        Ref<ID3D12PipelineState> late;
+        REQUIRE(SUCCEEDED(live.device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&late.p))));
+        CHECK(fs::is_regular_file(session_file));  // the device is still alive
+        const store::Stamp while_alive = store::stamp_of(session_file);
+        CHECK(payload_of(session_file).size() > 64);
+        // Nothing new since: a pipeline the cache has, a second later, does not write the file again.
+        Sleep(1200);
+        Ref<ID3D12PipelineState> same;
+        REQUIRE(SUCCEEDED(live.device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&same.p))));
+        const bool feedback = rt::d3d12::pipeline_cache_stats(live.device.p).pipelines == pipeline_count + 1;
+        if (feedback) CHECK(store::stamp_of(session_file) == while_alive);
+        std::printf("periodic: the cache was saved while the session ran (%llu bytes)\n",
+                    static_cast<unsigned long long>(fs::file_size(session_file)));
+        if (failures) std::printf("%d check(s) failed\n", failures);
+        return failures ? 1 : 0;
+    }
 
     // 1. The second session finds what the first made; the file survives a session that made nothing new.
     const Session first = run_session(setup);

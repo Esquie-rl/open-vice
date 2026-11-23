@@ -2057,7 +2057,10 @@ Pipeline creation:
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
   When the device is destroyed, the runtime saves the cache, with the pipelines the session added, to
   `pipeline_cache.user.bin` beside the executable (`LEONIDA_PIPELINE_CACHE` names another file, `off` turns the file
-  off; `LEONIDA_PIPELINE_CACHE_MAX_MB`, 1024 by default, caps its size). The paths are resolved to absolute ones when the
+  off; `LEONIDA_PIPELINE_CACHE_MAX_MB`, 1024 by default, caps its size). It also saves while the session runs, after a
+  pipeline creation, at most once every `LEONIDA_PIPELINE_CACHE_SAVE_SECONDS` (120 by default, 0 for never) and only
+  when pipelines missed the cache since the last save: a title that is killed or ends through `TerminateProcess` never
+  destroys its device, and a cold retail boot compiles about 2,700 compute pipelines at roughly one a second. The paths are resolved to absolute ones when the
   device is made, so a change of working directory or of a link later does not move the save, and at the save the file is
   checked once more against the build's `pipeline_cache.bin` by file identity: the seed is never written. The file is
   the driver's data behind a 32-byte frame (magic, byte count, hash), so a file cut short or changed is ignored and
