@@ -1,355 +1,185 @@
-// acphal.dll: Audio Control Processor HAL. Scalable Hardware Audio Processing Engine
-// (SHAPE) and APU (Audio Processing Unit) physical memory management for Xbox Series.
+// AcpHal.dll: the console's audio hardware layer. The Apu* functions are a heap of memory the audio processor reads,
+// with 32-bit "APU addresses" for it; AcpHalCreate returns the object commands go through and the shape contexts are
+// the per-voice records the hardware works on. A PC has no audio processor: the heap is ordinary memory, an APU
+// address is an offset into it, contexts are zeroed memory and commands are accepted and dropped (no sound).
 //
-// On a PC there is no SHAPE/ACP hardware and APU physical memory does not exist.
-// This shim creates the APU heap from process memory and answers queries from it.
-// The SHAPE context arrays are allocated on the process heap; the ACP interface
-// accepts and discards commands.
-//
-// Signatures from the public GDK reference (devdocs.xbox.com):
-//   AcpHal, APU reference, SHAPE_CONTEXTS, APU_ADDRESS.
-
+// Measured from the game executable (one thunk per import; call-site counts in brackets), statically read:
+//   HRESULT ApuCreateHeap(UINT32 a, UINT32 b)                 [1] a = MiB << 20, b = a byte count; failure is fatal
+//   HRESULT ApuAlloc(void** va, UINT32* apu, UINT32 size, UINT32 align, UINT32 flags)
+//                                                             [1] apu NULL, align 0x800, flags 2; result unchecked,
+//                                                                 *va read straight after
+//   ApuFree(void* va)                                         [1] tail call at shutdown, result ignored
+//   bool ApuIsVirtualAddressValid(void* va, UINT32 align)     [4] align 0x40, 0x80 or 0x800; result in AL
+//   UINT32 ApuMapVirtualAddress(void* va)                     [4] stored into a 32-bit context field; once with NULL
+//   void* ApuMapApuAddress(UINT32 apu)                        [2] result tested for NULL, then written through
+//   HRESULT AcpHalAllocateShapeContexts(contexts*)            [1] failure is fatal, see kShapeTypes
+//   HRESULT AcpHalCreate(IAcpHal** out)                       [1] failure is fatal; the object's slots below
+//   AcpHalReleaseShapeContexts()                              [1] no argument register set up; result ignored
+// The argument meanings (cached/non-cached sizes, flags) and the names of the object's slots are hypotheses.
 #include <windows.h>
 
+#include <malloc.h>
+
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
+#include <map>
 #include <mutex>
-#include <set>
-#include <string>
-#include <vector>
 
 #include "shims.h"
-#include "startup_trace.h"
 
 namespace {
 
-// ---- APU_ADDRESS (from the GDK) ----
+constexpr HRESULT kEFail = static_cast<HRESULT>(0x80004005L);
+constexpr HRESULT kEOutOfMemory = static_cast<HRESULT>(0x8007000EL);
+constexpr HRESULT kEInvalidArg = static_cast<HRESULT>(0x80070057L);
+constexpr HRESULT kEPointer = static_cast<HRESULT>(0x80004003L);
 
-// The console APU uses a 40-bit physical address space.
-// On a PC we translate to a host pointer.
-struct APU_ADDRESS {
-    uint64_t value;  // 40-bit physical address
+// Hypothesis: any nonzero base works, the title only passes APU addresses back to this DLL and to the hardware.
+// Nonzero so that address 0 stays "none" (ApuMapVirtualAddress(NULL) is 0).
+constexpr uint32_t kApuBase = 0x40000000;
+
+std::mutex g_mutex;
+uint8_t* g_heap = nullptr;
+uint32_t g_heap_size = 0;
+std::map<uint32_t, uint32_t> g_blocks;  // offset -> size of each live ApuAlloc block
+
+void warn_once(std::atomic<bool>& flag, const char* text) {
+    if (!flag.exchange(true, std::memory_order_relaxed)) std::fprintf(stderr, "[rt] acphal: %s\n", text);
+}
+
+// One region for both sizes: a PC has no cached/non-cached split. The single call site's second size is the first
+// ApuAlloc's size plus 16 KiB, so flags 2 is probably the non-cached heap.
+HRESULT ApuCreateHeap(uint32_t cached, uint32_t non_cached) {
+    const uint64_t total = uint64_t(cached) + non_cached;
+    if (total == 0 || total > 0xFFFFFFFFull - kApuBase) return kEInvalidArg;
+    std::lock_guard lock(g_mutex);
+    if (g_heap) return kEFail;  // shortcut: one heap per process, the only call site creates it once at boot
+    g_heap = static_cast<uint8_t*>(VirtualAlloc(nullptr, size_t(total), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!g_heap) return kEOutOfMemory;
+    g_heap_size = static_cast<uint32_t>(total);
+    return S_OK;
+}
+
+// First fit between the live blocks. The flags are not decoded (see ApuCreateHeap).
+HRESULT ApuAlloc(void** va, uint32_t* apu, uint32_t size, uint32_t align, uint32_t /*flags*/) {
+    if (!va) return kEPointer;
+    *va = nullptr;
+    if (align == 0) align = 1;
+    if (size == 0 || (align & (align - 1)) != 0) return kEInvalidArg;
+    std::lock_guard lock(g_mutex);
+    if (!g_heap) return kEFail;
+    uint64_t at = 0;
+    for (auto it = g_blocks.begin();; ++it) {
+        at = (at + align - 1) & ~uint64_t(align - 1);
+        const uint64_t limit = it == g_blocks.end() ? g_heap_size : it->first;
+        if (at + size <= limit) break;
+        if (it == g_blocks.end()) return kEOutOfMemory;
+        at = uint64_t(it->first) + it->second;
+    }
+    g_blocks.emplace(static_cast<uint32_t>(at), size);
+    std::memset(g_heap + at, 0, size);
+    *va = g_heap + at;
+    if (apu) *apu = kApuBase + static_cast<uint32_t>(at);
+    return S_OK;
+}
+
+HRESULT ApuFree(void* va) {
+    std::lock_guard lock(g_mutex);
+    auto* p = static_cast<uint8_t*>(va);
+    if (!g_heap || p < g_heap || p >= g_heap + g_heap_size) return kEInvalidArg;
+    return g_blocks.erase(static_cast<uint32_t>(p - g_heap)) ? S_OK : kEInvalidArg;
+}
+
+// TRUE when the address is inside a live block and its APU address is a multiple of `align`.
+BOOL ApuIsVirtualAddressValid(const void* va, uint32_t align) {
+    std::lock_guard lock(g_mutex);
+    auto* p = static_cast<const uint8_t*>(va);
+    if (!g_heap || p < g_heap || p >= g_heap + g_heap_size) return FALSE;
+    const uint32_t offset = static_cast<uint32_t>(p - g_heap);
+    auto it = g_blocks.upper_bound(offset);
+    if (it == g_blocks.begin()) return FALSE;
+    --it;
+    if (offset - it->first >= it->second) return FALSE;
+    return align == 0 || ((kApuBase + offset) & (align - 1)) == 0;
+}
+
+uint32_t ApuMapVirtualAddress(const void* va) {
+    std::lock_guard lock(g_mutex);
+    auto* p = static_cast<const uint8_t*>(va);
+    if (!g_heap || p < g_heap || p >= g_heap + g_heap_size) return 0;
+    return kApuBase + static_cast<uint32_t>(p - g_heap);
+}
+
+void* ApuMapApuAddress(uint32_t apu) {
+    std::lock_guard lock(g_mutex);
+    if (!g_heap || apu < kApuBase || apu - kApuBase >= g_heap_size) return nullptr;
+    return g_heap + (apu - kApuBase);
+}
+
+// The one caller zeroes 6 dwords, sets the fifth to 350, and afterwards reads a pointer at +0x38 and clears
+// count * 64 bytes there; nothing else in the image touches the struct. Hypothesis: 6 counts, then 6 pointers, one
+// per context type, 64 bytes per context (measured for the fifth type only; the others are zero at the call site).
+constexpr int kShapeTypes = 6;
+constexpr size_t kShapeContextSize = 64;
+struct ShapeContexts {
+    uint32_t count[kShapeTypes];
+    void* contexts[kShapeTypes];
+};
+static_assert(offsetof(ShapeContexts, contexts) + 4 * sizeof(void*) == 0x38, "fifth pointer is read at +0x38");
+void* g_shape[kShapeTypes] = {};
+
+HRESULT AcpHalAllocateShapeContexts(ShapeContexts* s) {
+    if (!s) return kEPointer;
+    std::lock_guard lock(g_mutex);
+    for (int i = 0; i < kShapeTypes; ++i) {
+        _aligned_free(g_shape[i]);
+        g_shape[i] = s->count[i] ? _aligned_malloc(s->count[i] * kShapeContextSize, 64) : nullptr;
+        if (s->count[i] && !g_shape[i]) return kEOutOfMemory;
+        if (g_shape[i]) std::memset(g_shape[i], 0, s->count[i] * kShapeContextSize);
+        if (s->count[i]) s->contexts[i] = g_shape[i];  // a zero count leaves its pointer alone: only +0x38 is measured
+    }
+    return S_OK;
+}
+
+HRESULT AcpHalReleaseShapeContexts() {
+    std::lock_guard lock(g_mutex);
+    for (void*& p : g_shape) {
+        _aligned_free(p);
+        p = nullptr;
+    }
+    return S_OK;
+}
+
+// Slots as the title calls them: 0 with (0x1000, 0x1000) once at boot, checked; 1 with no arguments at shutdown;
+// 2 with a command id, two dwords, a pointer and a dword, checked once at boot; 5 last at shutdown, after which the
+// title drops the pointer (taken as Release). Slots 3 and 4 are never called. Names are hypotheses.
+struct AcpHal final {  // no virtual destructor: it would add a slot the title does not know
+    virtual HRESULT connect(uint32_t, uint32_t) { return S_OK; }
+    virtual HRESULT disconnect() { return S_OK; }
+    virtual HRESULT submit_command(uint32_t, uint32_t, uint32_t, const void*, uint32_t) {
+        static std::atomic<bool> warned{false};
+        warn_once(warned, "AcpHal command accepted and dropped: no audio processor on a PC (logged once)");
+        return S_OK;
+    }
+    // Not called by this title. Read elsewhere as PopMessage (bool) and GetNumMessages (count), a hypothesis; 0 is
+    // "no message" under that reading and S_OK under any other, where E_NOTIMPL would read as a pending message.
+    virtual uint32_t slot3() { return 0; }
+    virtual uint32_t slot4() { return 0; }
+    virtual HRESULT release() {
+        delete this;
+        return S_OK;
+    }
 };
 
-// ---- APU heap state (from the GDK) ----
-
-struct ApuHeapState {
-    uint32_t version;
-    uint32_t flags;
-    uint64_t cachedUsed;
-    uint64_t cachedTotal;
-    uint64_t nonCachedUsed;
-    uint64_t nonCachedTotal;
-};
-
-// ---- ACP Command structure (from the GDK, simplified) ----
-
-// We only need to accept and drop them.
-
-// ---- APU heap state ----
-
-std::mutex g_apu_mutex;
-bool g_apu_heap_created = false;
-uint64_t g_apu_cached_size = 0;
-void* g_apu_cached_base = nullptr;
-uint64_t g_apu_noncached_size = 0;
-void* g_apu_noncached_base = nullptr;
-
-// ---- SHAPE context structures (from the GDK) ----
-
-// These are opaque context types. We allocate memory for them and track the
-// pointers so the title can use them.
-struct SHAPE_SRC_CONTEXT {};
-struct SHAPE_EQCOMP_CONTEXT {};
-struct SHAPE_FILTVOL_CONTEXT {};
-struct SHAPE_DMA_CONTEXT {};
-struct SHAPE_XMA_CONTEXT {};
-struct SHAPE_PCM_CONTEXT {};
-
-// The SHAPE_CONTEXTS structure (from the GDK)
-struct SHAPE_CONTEXTS {
-    uint32_t numSrcContexts;
-    uint32_t numEqCompContexts;
-    uint32_t numFiltVolContexts;
-    uint32_t numDmaContexts;
-    uint32_t numXmaContexts;
-    uint32_t numPcmContexts;
-    SHAPE_SRC_CONTEXT* srcContextArray;
-    SHAPE_EQCOMP_CONTEXT* eqCompContextArray;
-    SHAPE_FILTVOL_CONTEXT* filtVolContextArray;
-    SHAPE_DMA_CONTEXT* dmaContextArray;
-    SHAPE_XMA_CONTEXT* xmaContextArray;
-    SHAPE_PCM_CONTEXT* pcmContextArray;
-    APU_ADDRESS apuSrcContextArray;
-    APU_ADDRESS apuEqCompContextArray;
-    APU_ADDRESS apuFiltVolContextArray;
-    APU_ADDRESS apuDmaContextArray;
-    APU_ADDRESS apuXmaContextArray;
-    APU_ADDRESS apuPcmContextArray;
-};
-
-static_assert(sizeof(SHAPE_CONTEXTS) == 9 * 8 + 6 * 8, "SHAPE_CONTEXTS size check");
-
-// ---- Startup trace helper ----
-
-void trace_call(const char* api, const std::string& detail) {
-    if (!rt::startup_trace::enabled()) return;
-    static std::mutex mutex;
-    static std::set<std::string> seen;
-    {
-        std::lock_guard lock(mutex);
-        if (!seen.insert(std::string(api) + detail).second) return;
-    }
-    rt::startup_trace::event("acphal",
-                             std::string("\"api\":\"") + api + "\"" + detail);
-}
-
-// ---- ACP implementation methods ----
-
-// ---- AcpHalAllocateShapeContexts ----
-//
-// HRESULT AcpHalAllocateShapeContexts(SHAPE_CONTEXTS* contextArrays)
-
-HRESULT __stdcall AcpHalAllocateShapeContexts(SHAPE_CONTEXTS* ctx) {
-    if (!ctx) return E_POINTER;
-
-    // Validate: SRC count must equal PCM + XMA (GDK requirement)
-    if (ctx->numSrcContexts != ctx->numPcmContexts + ctx->numXmaContexts)
-        return E_INVALIDARG;
-
-    // Allocate arrays on the host heap
-    auto alloc = [](uint32_t count, size_t elemSize) -> void* {
-        if (count == 0) return nullptr;
-        return std::calloc(count, elemSize);
-    };
-
-    ctx->srcContextArray = static_cast<SHAPE_SRC_CONTEXT*>(
-        alloc(ctx->numSrcContexts, sizeof(SHAPE_SRC_CONTEXT)));
-    ctx->eqCompContextArray = static_cast<SHAPE_EQCOMP_CONTEXT*>(
-        alloc(ctx->numEqCompContexts, sizeof(SHAPE_EQCOMP_CONTEXT)));
-    ctx->filtVolContextArray = static_cast<SHAPE_FILTVOL_CONTEXT*>(
-        alloc(ctx->numFiltVolContexts, sizeof(SHAPE_FILTVOL_CONTEXT)));
-    ctx->dmaContextArray = static_cast<SHAPE_DMA_CONTEXT*>(
-        alloc(ctx->numDmaContexts, sizeof(SHAPE_DMA_CONTEXT)));
-    ctx->xmaContextArray = static_cast<SHAPE_XMA_CONTEXT*>(
-        alloc(ctx->numXmaContexts, sizeof(SHAPE_XMA_CONTEXT)));
-    ctx->pcmContextArray = static_cast<SHAPE_PCM_CONTEXT*>(
-        alloc(ctx->numPcmContexts, sizeof(SHAPE_PCM_CONTEXT)));
-
-    // APU physical addresses: not meaningful on PC, zero them
-    ctx->apuSrcContextArray = {};
-    ctx->apuEqCompContextArray = {};
-    ctx->apuFiltVolContextArray = {};
-    ctx->apuDmaContextArray = {};
-    ctx->apuXmaContextArray = {};
-    ctx->apuPcmContextArray = {};
-
-    trace_call("AcpHalAllocateShapeContexts",
-               ",\"src\":" + std::to_string(ctx->numSrcContexts) +
-               ",\"pcm\":" + std::to_string(ctx->numPcmContexts) +
-               ",\"xma\":" + std::to_string(ctx->numXmaContexts));
+HRESULT AcpHalCreate(AcpHal** out) {
+    if (!out) return kEPointer;
+    *out = new AcpHal;
     return S_OK;
-}
-
-// ---- AcpHalReleaseShapeContexts ----
-//
-// HRESULT AcpHalReleaseShapeContexts(SHAPE_CONTEXTS* contextArrays)
-
-HRESULT __stdcall AcpHalReleaseShapeContexts(SHAPE_CONTEXTS* ctx) {
-    if (!ctx) return E_POINTER;
-
-    auto free_array = [](void* ptr) {
-        if (ptr) std::free(ptr);
-    };
-    free_array(ctx->srcContextArray);
-    free_array(ctx->eqCompContextArray);
-    free_array(ctx->filtVolContextArray);
-    free_array(ctx->dmaContextArray);
-    free_array(ctx->xmaContextArray);
-    free_array(ctx->pcmContextArray);
-
-    std::memset(ctx, 0, sizeof(*ctx));
-
-    trace_call("AcpHalReleaseShapeContexts", "");
-    return S_OK;
-}
-
-// ---- AcpHalCreate ----
-//
-// HRESULT AcpHalCreate(IAcpHal** acp)
-
-HRESULT __stdcall AcpHalCreate(void** acp) {
-    if (!acp) return E_POINTER;
-    *acp = nullptr;
-
-    static std::atomic<uint32_t> next_id{1};
-    uint32_t id = next_id++;
-
-    // Return an opaque handle pointer. The title passes it to IAcpHal methods,
-    // which we implement as individual exported functions. On the console the
-    // ACP interface is COM-like; the exports handle the dispatch internally.
-    // Since we don't implement any methods beyond create/release, the handle
-    // is just a unique id cast to a pointer.
-    void* handle = reinterpret_cast<void*>(static_cast<uintptr_t>(id) << 4);
-
-    *acp = handle;
-
-    trace_call("AcpHalCreate", "");
-    return S_OK;
-}
-
-// ---- ApuCreateHeap ----
-//
-// HRESULT ApuCreateHeap(UINT32 cachedSizeInBytes, UINT32 nonCachedSizeInBytes)
-
-HRESULT __stdcall ApuCreateHeap(uint32_t cachedSizeInBytes,
-                                 uint32_t nonCachedSizeInBytes) {
-    std::lock_guard lock(g_apu_mutex);
-    if (g_apu_heap_created)
-        return 0x8004BA01;  // APU_E_HEAP_ALREADY_ALLOCATED
-
-    if (cachedSizeInBytes == 0)
-        return E_INVALIDARG;
-
-    // Allocate the APU heap from VirtualAlloc
-    g_apu_cached_size = cachedSizeInBytes;
-    g_apu_cached_base = VirtualAlloc(nullptr, cachedSizeInBytes,
-                                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!g_apu_cached_base) return E_OUTOFMEMORY;
-
-    if (nonCachedSizeInBytes > 0) {
-        g_apu_noncached_size = nonCachedSizeInBytes;
-        g_apu_noncached_base = VirtualAlloc(nullptr, nonCachedSizeInBytes,
-                                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!g_apu_noncached_base) {
-            VirtualFree(g_apu_cached_base, 0, MEM_RELEASE);
-            g_apu_cached_base = nullptr;
-            g_apu_cached_size = 0;
-            return E_OUTOFMEMORY;
-        }
-    }
-
-    g_apu_heap_created = true;
-    trace_call("ApuCreateHeap",
-               ",\"cachedSize\":" + std::to_string(cachedSizeInBytes));
-    return S_OK;
-}
-
-// ---- ApuAlloc ----
-//
-// HRESULT ApuAlloc(void** virtualAddress, APU_ADDRESS* physicalAddress,
-//                   UINT32 sizeInBytes, UINT32 alignmentInBytes, UINT32 flags)
-
-// APU allocation flags
-constexpr uint32_t APU_ALLOC_CACHED = 0;
-constexpr uint32_t APU_ALLOC_NONCACHED = 1;
-
-HRESULT __stdcall ApuAlloc(void** virtualAddress, APU_ADDRESS* physicalAddress,
-                            uint32_t sizeInBytes, uint32_t alignmentInBytes,
-                            uint32_t flags) {
-    if (!virtualAddress) return E_POINTER;
-    *virtualAddress = nullptr;
-    if (physicalAddress) *physicalAddress = {};
-
-    if (sizeInBytes == 0 || alignmentInBytes == 0 ||
-        (alignmentInBytes & 3) != 0 ||
-        (alignmentInBytes & (alignmentInBytes - 1)) != 0 ||
-        (flags != APU_ALLOC_CACHED && flags != APU_ALLOC_NONCACHED))
-        return E_INVALIDARG;
-
-    std::lock_guard lock(g_apu_mutex);
-
-    bool cached = (flags == APU_ALLOC_CACHED);
-    void* heap_base = cached ? g_apu_cached_base : g_apu_noncached_base;
-    uint64_t heap_size = cached ? g_apu_cached_size : g_apu_noncached_size;
-
-    if (!heap_base) {
-        // Create a default heap
-        uint32_t default_cached = 64 * 1024 * 1024;
-        uint32_t default_noncached = 1024 * 1024;
-        cached = true;
-        heap_base = VirtualAlloc(nullptr, default_cached,
-                                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!heap_base) return E_OUTOFMEMORY;
-        g_apu_cached_base = heap_base;
-        g_apu_cached_size = default_cached;
-        g_apu_noncached_base = VirtualAlloc(nullptr, default_noncached,
-                                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (g_apu_noncached_base) {
-            g_apu_noncached_size = default_noncached;
-        }
-        g_apu_heap_created = true;
-        heap_size = default_cached;
-    }
-
-    // Best-effort small bump allocator from the cached heap
-    // This is a simplified version; the real console uses a proper heap.
-    static uint64_t bump_offset = 0;
-    uint64_t aligned = (bump_offset + alignmentInBytes - 1) & ~(static_cast<uint64_t>(alignmentInBytes) - 1);
-    if (aligned + sizeInBytes > heap_size) return E_OUTOFMEMORY;
-    bump_offset = aligned + sizeInBytes;
-
-    *virtualAddress = static_cast<uint8_t*>(heap_base) + aligned;
-    if (physicalAddress) {
-        physicalAddress->value = reinterpret_cast<uint64_t>(*virtualAddress);
-    }
-
-    return S_OK;
-}
-
-// ---- ApuFree ----
-//
-// void ApuFree(void* virtualAddress)
-
-void __stdcall ApuFree(void* virtualAddress) {
-    if (!virtualAddress) return;
-    // The bump allocator doesn't support free. No-op. The real APU heap
-    // lives for the process lifetime anyway.
-    trace_call("ApuFree", "");
-}
-
-// ---- ApuIsVirtualAddressValid ----
-//
-// BOOL ApuIsVirtualAddressValid(void* virtualAddress)
-
-BOOL __stdcall ApuIsVirtualAddressValid(void* virtualAddress) {
-    if (!virtualAddress) return FALSE;
-    std::lock_guard lock(g_apu_mutex);
-    // Check if the address falls within either APU heap
-    uintptr_t addr = reinterpret_cast<uintptr_t>(virtualAddress);
-    uintptr_t cached_start = reinterpret_cast<uintptr_t>(g_apu_cached_base);
-    uintptr_t noncached_start = reinterpret_cast<uintptr_t>(g_apu_noncached_base);
-
-    if (cached_start && addr >= cached_start &&
-        addr < cached_start + g_apu_cached_size) return TRUE;
-    if (noncached_start && addr >= noncached_start &&
-        addr < noncached_start + g_apu_noncached_size) return TRUE;
-    return FALSE;
-}
-
-// ---- ApuMapApuAddress ----
-//
-// void* ApuMapApuAddress(APU_ADDRESS address)
-
-void* __stdcall ApuMapApuAddress(APU_ADDRESS address) {
-    if (address.value == 0) return nullptr;
-    // On the console this translates a physical APU address to a virtual one.
-    // On PC the APU_ADDRESS was set to the virtual address itself, so return it.
-    return reinterpret_cast<void*>(static_cast<uintptr_t>(address.value));
-}
-
-// ---- ApuMapVirtualAddress ----
-//
-// APU_ADDRESS ApuMapVirtualAddress(void* virtualAddress)
-
-APU_ADDRESS __stdcall ApuMapVirtualAddress(void* virtualAddress) {
-    APU_ADDRESS result{};
-    if (!virtualAddress) return result;
-    result.value = reinterpret_cast<uint64_t>(virtualAddress);
-    return result;
 }
 
 }  // namespace
