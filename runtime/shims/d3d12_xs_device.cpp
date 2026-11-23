@@ -25,6 +25,8 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
+#include "d3d12_xs_alloc_size.h"
+#include "d3d12_xs_desc_clean.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -2815,12 +2817,47 @@ StructReturnCall struct_return_call(std::uint64_t a0, std::uint64_t a1) {
     return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0)};  // C form: return buffer, this
 }
 
+// The size the PC device saturates a total at (docs/d3d12_vulkan.md, GetResourceAllocationInfo).
+constexpr UINT64 kSizeSaturated = 0xFFFFFFFFFFFF0000ull;
+
 void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
                                                 std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
     note_slot(25);
     const StructReturnCall call = struct_return_call(a0, a1);
-    *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = call.self->real->GetResourceAllocationInfo(
-        static_cast<UINT>(visible_mask), static_cast<UINT>(count), descs);
+    ID3D12Device* const real = call.self->real;
+    // The descriptions are the console's. The PC device gets a copy with PC flags and layout; the title's array is
+    // read only. A copy that cannot be made answers as an invalid description.
+    const UINT desc_count = static_cast<UINT>(count);
+    std::unique_ptr<D3D12_RESOURCE_DESC[]> clean;
+    if (descs && desc_count) {
+        clean.reset(new (std::nothrow) D3D12_RESOURCE_DESC[desc_count]);
+        if (!clean) {
+            *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = {UINT64_MAX, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+            return call.ret;
+        }
+        for (UINT i = 0; i < desc_count; ++i) clean[i] = pc_resource_desc(descs[i]);
+        descs = clean.get();
+    }
+    D3D12_RESOURCE_ALLOCATION_INFO info =
+        real->GetResourceAllocationInfo(static_cast<UINT>(visible_mask), desc_count, descs);
+    // A render target takes whole console tiles, which the PC device's size does not (d3d12_xs_alloc_size.h). The
+    // total grows by what each render target lacks on its own, so the placement of the others stays as the PC lays it.
+    if (info.SizeInBytes != UINT64_MAX) {
+        const UINT64 extra = console_render_target_extra(descs, static_cast<UINT>(count), [&](UINT i) {
+            return real->GetResourceAllocationInfo(static_cast<UINT>(visible_mask), 1, &descs[i]).SizeInBytes;
+        });
+        if (extra) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: slot 25: render target sizes padded to console tiles, +%llu B on "
+                             "%llu B for %u description(s)\n",
+                             static_cast<unsigned long long>(extra),
+                             static_cast<unsigned long long>(info.SizeInBytes), static_cast<unsigned>(count));
+            info.SizeInBytes = extra > kSizeSaturated - info.SizeInBytes ? kSizeSaturated : info.SizeInBytes + extra;
+        }
+    }
+    *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
     return call.ret;
 }
 
