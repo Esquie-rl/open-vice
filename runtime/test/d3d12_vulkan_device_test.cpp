@@ -5765,7 +5765,10 @@ int main() {
             EXPECT(device5->EnumerateMetaCommandParameters(unknown_command, D3D12_META_COMMAND_PARAMETER_STAGE_CREATION,
                                                            &total_size, &param_count, nullptr) == E_INVALIDARG);
             void* meta = reinterpret_cast<void*>(1);
-            EXPECT(device5->CreateMetaCommand(unknown_command, 0, nullptr, 0, IID_ID3D12MetaCommand, &meta) ==
+            // PC slot 61 is CreateMetaCommand. The Xbox proxy uses it for CreateSamplerX.
+            Ref<ID3D12Device5> pc5;
+            EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&pc5.p))));
+            EXPECT(pc5->CreateMetaCommand(unknown_command, 0, nullptr, 0, IID_ID3D12MetaCommand, &meta) ==
                        E_INVALIDARG &&
                    meta == nullptr);
             D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER identifier{};
