@@ -372,6 +372,15 @@ through a PC D3D12 device and got an object that served both `IID_ID3D12ConsDmaC
 That is **Reported** (Wine, no GPU). It proves the wrapper's QI routing, not the game's use of DMA
 lists.
 
+The console's own `ID3D12Device` IID is not a runtime export either, but the executable supplies it:
+`game_scarlett_master.exe` 1.0.2.1 passes `5405c344-d457-444e-b4dd-2366e45aee39` to
+`D3D12XboxCreateDevice` as its `riid` (**Measured** under `gta6rt --run`; the GUID is stored in the
+executable's `.rdata`). It differs from the PC `IID_ID3D12Device` (`189819f1-…`) and from every
+`ID3D12Device1..14` IID, so a proxy that accepts only PC IIDs fails device creation with
+`E_NOINTERFACE`. `runtime/shims/d3d12_xs_device.cpp` accepts it as the device and asks the PC
+device for `ID3D12Device` in its place (the proxy vtable already presents the console's slot
+layout); `xs_proxy_mock_test` covers it.
+
 ## 5. The extension method surface
 
 SCARAB's catalogue has 105 rows labelled `method` and 106 labelled `enum`
