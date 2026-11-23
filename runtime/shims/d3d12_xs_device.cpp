@@ -259,6 +259,7 @@ const char* slot_name(unsigned slot) {
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
+        case 70: return "Xbox shader-resource view from raw words";
         case 73: return "Xbox CreateCommandListX -> PC CreateCommandList";
         case 75: return "CreateCommandQueue1 -> queue proxy";
         case 133: return "Xbox CreatePlacedResourceX -> committed resource";
@@ -2084,6 +2085,26 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     return wrap_list(static_cast<IUnknown*>(created), self, want, out);
 }
 
+// Xbox device slot 70: (texture_words, view_desc, destination), no return value. The retail executable's SRV writer
+// makes a view from raw descriptions and a GPU address with no resource object (docs/retail_boot_chain.md, stop 14,
+// measured by call shape only). The PC slot 70 is ID3D12Device8::CreatePlacedResource1, which would take the
+// destination handle for a resource description and write through it. The layout of the raw words is not measured,
+// so nothing reads them: the destination gets the PC's null shader-resource view, which a shader reads as zeros, and
+// the call returns. A view that reaches the GPU address needs that layout.
+void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words, std::uint64_t view_desc,
+                                 std::uint64_t destination) {
+    note_slot(70);
+    log_xbox_route_once(70, "CreateShaderResourceView from raw words (null view)", texture_words, view_desc,
+                        destination, 0, 0);
+    if (!destination) return;
+    D3D12_SHADER_RESOURCE_VIEW_DESC null_view{};
+    null_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    null_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    null_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    null_view.Texture2D.MipLevels = 1;
+    self->real->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
+}
+
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
 HRESULT proxy_create_command_queue1(DeviceProxy* self, std::uint64_t desc, std::uint64_t creator_id,
                                     const IID* riid, void** out) {
@@ -2509,6 +2530,47 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
                                                clearable ? clear_value : nullptr, *riid, out);
 }
 
+// The Xbox routes at their configured indices. Returns false when `slot` is none of them. Slot 70 asks too, because an
+// override that moves a route onto 70 must win over the built-in 70 handler.
+bool route_xbox_device_slot(DeviceProxy* self, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                            std::uint64_t a4, std::uint64_t a5, std::uint64_t& result) {
+    const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
+    if (slot == routes.frame_interval) {
+        log_xbox_route_once(slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_set_frame_interval_x(self, a1, a2, a3, a4));
+    } else if (slot == routes.schedule_event) {
+        log_xbox_route_once(slot, "ScheduleFrameEventX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_schedule_frame_event_x(self, a1, a2, a4));
+    } else if (slot == routes.wait_event) {
+        log_xbox_route_once(slot, "WaitFrameEventX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
+    } else if (slot == routes.queue_x) {
+        log_xbox_route_once(slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
+        // local (retail boot chain, stop 8): keep the PC prefix of the Xbox desc, the one PC flag, a PC priority, node 0.
+        const auto* xdesc = reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1);
+        D3D12_COMMAND_QUEUE_DESC pc{};
+        const D3D12_COMMAND_QUEUE_DESC* use = xdesc;
+        if (xdesc) {
+            pc = *xdesc;
+            pc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(pc.Flags & D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT);
+            if (pc.Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL && pc.Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH)
+                pc.Priority = pc.Priority > D3D12_COMMAND_QUEUE_PRIORITY_NORMAL ? D3D12_COMMAND_QUEUE_PRIORITY_HIGH
+                                                                                 : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+            if (pc.NodeMask > 1) pc.NodeMask = 0;
+            use = &pc;
+        }
+        result = hr_to_u64(proxy_create_command_queue(self, use, reinterpret_cast<const IID*>(a2),
+                                                      reinterpret_cast<void**>(a3)));
+    } else if (slot == routes.list_x) {
+        log_xbox_route_once(slot, "CreateCommandListX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
+                                                       reinterpret_cast<void**>(a5)));
+    } else {
+        return false;
+    }
+    return true;
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -2599,6 +2661,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2), static_cast<std::uint32_t>(a3),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4), reinterpret_cast<const IID*>(a5),
             reinterpret_cast<void**>(a6)));
+    } else if constexpr (Slot == 70) {
+        std::uint64_t routed = 0;
+        if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;  // an override moved a route here
+        proxy_create_srv_from_raw_x(self, a1, a2, a3);
+        return 0;
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
@@ -2612,51 +2679,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
-        const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
-        if (Slot == routes.frame_interval) {
-            log_xbox_route_once(Slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_set_frame_interval_x(self, a1, a2, a3, a4));
-        }
-        if (Slot == routes.schedule_event) {
-            log_xbox_route_once(Slot, "ScheduleFrameEventX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_schedule_frame_event_x(self, a1, a2, a4));
-        }
-        if (Slot == routes.wait_event) {
-            log_xbox_route_once(Slot, "WaitFrameEventX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
-        }
-        if (Slot == routes.queue_x) {
-            log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
-            // local (retail boot chain, stop 8): the Xbox desc is a PC D3D12_COMMAND_QUEUE_DESC prefix followed by
-            // Xbox words, and its Flags/Priority carry console bits the PC runtime refuses. Keep the PC prefix with
-            // the one PC flag, a PC priority and node 0.
-            const auto* xdesc = reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1);
-            D3D12_COMMAND_QUEUE_DESC pc{};
-            const D3D12_COMMAND_QUEUE_DESC* use = xdesc;
-            if (xdesc) {
-                pc = *xdesc;
-                pc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(pc.Flags & D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT);
-                if (pc.Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL && pc.Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH)
-                    pc.Priority = pc.Priority > D3D12_COMMAND_QUEUE_PRIORITY_NORMAL ? D3D12_COMMAND_QUEUE_PRIORITY_HIGH
-                                                                                     : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-                if (pc.NodeMask > 1) pc.NodeMask = 0;
-                if (pc.Flags != xdesc->Flags || pc.Priority != xdesc->Priority || pc.NodeMask != xdesc->NodeMask)
-                    std::fprintf(stderr,
-                                 "[rt] d3d12_xs: CreateCommandQueueX type %d: flags 0x%x -> 0x%x, priority %d -> %d, "
-                                 "node 0x%x -> 0x%x\n",
-                                 static_cast<int>(xdesc->Type), static_cast<unsigned>(xdesc->Flags),
-                                 static_cast<unsigned>(pc.Flags), xdesc->Priority, pc.Priority, xdesc->NodeMask,
-                                 pc.NodeMask);
-                use = &pc;
-            }
-            return hr_to_u64(proxy_create_command_queue(self, use, reinterpret_cast<const IID*>(a2),
-                                                        reinterpret_cast<void**>(a3)));
-        }
-        if (Slot == routes.list_x) {
-            log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
-                                                         reinterpret_cast<void**>(a5)));
-        }
+        std::uint64_t routed = 0;
+        if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
@@ -2879,7 +2903,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 ||
         slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 ||
-        slot == 50 || slot == 62 || slot == 67 || slot == 75 || slot == 76 || slot == 133)
+        slot == 50 || slot == 62 || slot == 67 || slot == 70 || slot == 75 || slot == 76 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
