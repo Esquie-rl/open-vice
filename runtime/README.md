@@ -312,6 +312,9 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   `<shaders>/library/index.json`. Two triangles of opposite winding are drawn with each and read back, which checks
   the write mask, culling, the front-face bit and blending the state blob asks for. Programs without a translation
   create nothing. Its SPIR-V is written word by word in the test, so it needs no shader compiler.
+- `d3d12_slot57_library_test` — optional, package-gated (`LEONIDA_PSO_LIBRARY`: the file `tools/shader_library.py --save` writes;
+  `LEONIDA_SHADERS`: the translated work folder): hands every vertex record of the user's own pipeline library to
+  slot 57 over the Vulkan device and prints, by `HRESULT`, how many pipelines were created, refused or failed.
 - `slot57_pipeline_state_test`, `slot57_input_layout_test` — the readers of slot 57's two blobs on hand-built
   bytes, with their refusals. No device.
 - `d3d12_set0_compute_test` — set 0 from the compute bind point: a compute PSO whose index entry lists set-0
