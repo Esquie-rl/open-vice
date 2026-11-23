@@ -100,15 +100,13 @@ const char* const kNotHResult[] = {
 };
 const char* const kXFamilies[] = {"XAsync", "XTaskQueue", "XUser", "XStore", "XGameSave", "XPackage", "XGameUi"};
 
-// The console-only audio and ACP HAL DLLs all return HRESULT (from the GDK reference at
-// devdocs.xbox.com). AcpHal.dll's ApuFree is void, ApuIsVirtualAddressValid is BOOL,
-// ApuMapVirtualAddress returns APU_ADDRESS (struct), and xapu.dll's XApuGetResultCount
-// returns uint32_t (the result count). Those are excluded from the HResult class here and
-// return 0 under `fail`.
+// The console-only audio and ACP HAL DLLs return HRESULT (from the GDK reference at devdocs.xbox.com), except:
+// AcpHal.dll's ApuFree (void here; #6885 measures an HRESULT, for which 0 is S_OK anyway), ApuIsVirtualAddressValid
+// (BOOL), ApuMapApuAddress (a pointer) and ApuMapVirtualAddress (a 32-bit APU address), and xapu.dll's
+// XApuGetResultCount (uint32_t, the result count). Those are left out of the HResult class and return 0 under `fail`.
 static bool is_acphal_hresult(const std::string& name) {
     return name == "AcpHalAllocateShapeContexts" || name == "AcpHalCreate" ||
-           name == "AcpHalReleaseShapeContexts" || name == "ApuAlloc" ||
-           name == "ApuCreateHeap" || name == "ApuMapApuAddress";
+           name == "AcpHalReleaseShapeContexts" || name == "ApuAlloc" || name == "ApuCreateHeap";
 }
 
 ReturnClass classify(const std::string& dll, const std::string& name) {
@@ -133,8 +131,6 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
     } else if (dll == "xapu.dll") {
         // XApuConnect/DequeueResult/Disconnect/EnqueueCommand return HRESULT; XApuGetResultCount returns uint32_t.
         if (name != "XApuGetResultCount" && starts_with(name, "XApu")) return ReturnClass::HResult;
-    } else if (dll == "xg_xs.dll") {
-        if (name == "XGCreateTextureComputer" || name == "XGSuggestSwizzleMode") return ReturnClass::HResult;
     } else if (dll == "acphal.dll") {
         if (is_acphal_hresult(name)) return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
