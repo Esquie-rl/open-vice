@@ -458,8 +458,9 @@ int check_levels() {
             EXPECT(r75 == E_NOTIMPL && !queue1 && mock->calls[75] == 0);
         }
 
-        // 133: past every PC device vtable; the retail title calls it. Refused, not a jump through a missing entry.
-        EXPECT(hr_of(raw(device, 133)) == E_NOTIMPL && mock->calls[127] == 0);
+        // 133: past every PC device vtable; the retail title calls it as CreatePlacedResourceX (#7075). With no
+        // description it is refused by the proxy, not a jump through a missing entry.
+        EXPECT(hr_of(raw(device, 133)) == E_INVALIDARG && mock->calls[127] == 0);
 
         // 86: Xbox CreatePipelineState -> PC slot 47 (ID3D12Device2)
         void* pso_out = reinterpret_cast<void*>(1);
@@ -938,7 +939,8 @@ int check_xbox_slots() {
     void* queue = nullptr;
     EXPECT(hr_of(raw(device, 48, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
     EXPECT(xs::is_queue_proxy(queue) && mock->calls[48] == 0 && mock->calls[8] == 1);
-    EXPECT(mock->args[8][0] == word(&kQueueDesc));
+    // The local slot-48 fix passes a cleaned copy of the description (PC flag, PC priority, node 0), not the caller's.
+    EXPECT(mock->args[8][0] != 0 && mock->args[8][0] != word(&kQueueDesc));
 
     // 73 CreateCommandListX(desc, allocator, initialState, riid, out): the type is desc's first word, the allocator
     // proxy is unwrapped, the node mask is 0 and the PC six-argument CreateCommandList (slot 12) is reached.
@@ -957,11 +959,13 @@ int check_xbox_slots() {
     const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
     void* list = nullptr;
     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
-    EXPECT(list && reinterpret_cast<Mock*>(list)->kind == Kind::command_list);
+    // A console device answers with the console-shaped list proxy over the real list, as slot 12 does (#2490).
+    EXPECT(list && xs::is_list_proxy(list) &&
+           reinterpret_cast<Mock*>(xs::list_proxy_real_list(list))->kind == Kind::command_list);
     EXPECT(mock->calls[73] == 0 && mock->calls[12] == 1 && xs::device_slot_hits(73) == 1);
     EXPECT(mock->args[12][0] == 0 && mock->args[12][1] == D3D12_COMMAND_LIST_TYPE_DIRECT);
     EXPECT(mock->args[12][2] == word(real_allocator) && mock->args[12][3] == 0);
-    EXPECT(mock->args[12][4] == word(&list_iid));
+    EXPECT(mock->args[12][4] && *reinterpret_cast<const IID*>(mock->args[12][4]) == list_iid);
 
     // Release the list before the refusal calls below: the COM convention (and the handler) nulls the caller's
     // output on failure, so an invalid call would clear this pointer.
@@ -1209,8 +1213,10 @@ int check_tail(bool want_guarded) {
     // Signal (14) still reaches the real queue, with the real fence.
     EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
+    // Console-only queue methods (the tail past the PC chain, SignalX, PresentX, ExecuteCommandListsX) report S_OK
+    // instead of refusing, as in #2490: frame pacing flows through them. None reaches the real queue's own slot.
     for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
-        EXPECT(hr_of(raw(queue, slot)) == E_NOTIMPL && queue_mock->calls[slot] == 0);
+        EXPECT(hr_of(raw(queue, slot)) == S_OK && queue_mock->calls[slot] == 0);
     EXPECT(raw(fence, 12) != 0);  // the completed value's address (check_fence_completed_value)
     for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
