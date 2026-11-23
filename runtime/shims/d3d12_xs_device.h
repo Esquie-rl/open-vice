@@ -21,6 +21,8 @@
 //   slot 26   GetCustomHeapProperties, called by the retail title with the C ABI: return buffer in RCX, the device
 //             in RDX (the PC form is `this` in RCX, return buffer in RDX). Slot 25 (GetResourceAllocationInfo, also a
 //             struct wider than 8 bytes) takes the same form by the same rule. Both accept either form.
+//   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> PC CreateCommittedResource on a DEFAULT heap,
+//             with the Xbox flag bits dropped and an all-ones state as COMMON. Not backed by the memory at va.
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
 // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in
