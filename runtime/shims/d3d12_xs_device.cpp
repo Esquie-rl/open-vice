@@ -1496,6 +1496,24 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 return hr_to_u64(S_OK);
             }
             if (Slot == (newer ? 32u : 30u)) return queue_present_x(self, a1, a2, a3);  // PresentX
+            if (Slot == 35u &&
+                self->queue_layout.load(std::memory_order_relaxed) != ChildProxy::kQueueLayoutOlder) {
+                // local port of #7286: queue slot 35 is the console ExecuteCommandListsX(count, lists, frame token,
+                // flags) the retail title submits with (KkelebekK, rafaelpssz: two call sites). It goes to the PC
+                // ExecuteCommandLists (slot 10) with the list proxies unwrapped as slot 10 does; the token and the
+                // flags are dropped. Answered S_OK with nothing executed before, so no recorded list ever ran.
+                d3d12_trace::record(child_trace_name<K>(Slot));
+                UnwrappedArray lists;
+                if (!lists.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true, std::memory_order_relaxed))
+                    std::fprintf(stderr, "[rt] d3d12_xs: ExecuteCommandListsX (queue slot 35) forwarded to "
+                                         "ExecuteCommandLists, %u list(s)\n", static_cast<unsigned>(static_cast<UINT>(a1)));
+                using ExecuteFn = void(WINAPI*)(void*, std::uint64_t, std::uint64_t);
+                reinterpret_cast<ExecuteFn>(self->real_vtable[10])(
+                    self->real, static_cast<std::uint64_t>(static_cast<UINT>(a1)), lists.data() ? lists.data() : a2);
+                return hr_to_u64(S_OK);
+            }
             if (Slot >= self->slot_count || (newer && (Slot == 14 || Slot == 15))) {
                 d3d12_trace::record(child_trace_name<K>(Slot), "console-only");
                 return hr_to_u64(S_OK);  // unmodelled console queue methods: frame pacing flows through them
