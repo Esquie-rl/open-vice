@@ -26,11 +26,21 @@ AMD RDNA2.
 
 ## Contenu de la branche
 
-PR amont fusionnées ou appliquées (diff propre de la PR) : #6919, #6582, #7017, #7009, #2490, #4313, #4348, #6973,
-#6953, #7075, #7021, #7066, #7052, #7110, #7078, #7115, #5680, #7290, #7163, #7323, #7403, #7685, #7642, #7556,
-#7529. `xg_xs.cpp` vient de #6891 (formes mesurées à 2 et 3 arguments). #6279 a été retirée (doublon de #1864).
+Rebasée (par merge) sur `main` amont `dfe4e4a` du 23/11/2026. Déjà dans `main` amont depuis : #6919, #6908,
+#6935, #6891 (`xg_xs.cpp`), #1864, #4473 et les correctifs du traducteur #6685, #6635, #6714, #5206.
 
-Correctifs du traducteur repris de `main` : #6685, #6635, #6714, #5206.
+PR amont encore appliquées localement (diff propre de la PR) :
+
+- ouvertes en amont : #6582, #7009, #2490, #6953, #7075, #7021, #7066, #7052, #7110, #7078, #7115, #7290, #7163,
+  #7323, #7403, #7685, #7642, #7556, #7529 ;
+- fermées sans fusion en amont, gardées ici : #7017, #4313, #4348, #6973, #5680.
+
+#6279 a été retirée (doublon de #1864).
+
+`xmem.cpp` est maintenant la version amont (#6908 + #6919 telles que fusionnées) avec #7556 par-dessus. Différences
+avec l'ancienne version locale : `PAGE_WRITECOMBINE` n'est plus retiré de la protection (seulement les bits
+`PAGE_GRAPHICS_*`), et l'événement de trace `xmem_virtual_alloc` n'existe plus (`XMemVirtualAlloc` passe par
+`xmem_attributes`). À surveiller au prochain lancement : lectures CPU lentes sur de la mémoire write-combined.
 
 Corrections locales :
 
