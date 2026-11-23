@@ -1,0 +1,808 @@
+diff --git a/docs/d3d12_vulkan.md b/docs/d3d12_vulkan.md
+index 7364d4097..bf4fe3e3a 100644
+--- a/docs/d3d12_vulkan.md
++++ b/docs/d3d12_vulkan.md
+@@ -2052,30 +2052,10 @@ Pipeline creation:
+   buffer device address, storage image without format, maintenance8.
+ - Request the subgroup size each shader was translated for (`requiredSubgroupSize` 64 or 32) where the device lists the stage
+   in `requiredSubgroupSizeStages`, and say so in the log where it cannot (section 3.2, "Subgroup size").
+-- Pipeline caches: graphics and compute PSOs use one `VkPipelineCache` per device. On first use the runtime reads
+-  the `pipelines` build stage's `pipeline_cache.bin` beside the executable if its Vulkan header matches the device
+-  and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
+-  When the device is destroyed, the runtime saves the cache, with the pipelines the session added, to
+-  `pipeline_cache.user.bin` beside the executable (`LEONIDA_PIPELINE_CACHE` names another file, `off` turns the file
+-  off; `LEONIDA_PIPELINE_CACHE_MAX_MB`, 1024 by default, caps its size). It also saves while the session runs, after a
+-  pipeline creation, at most once every `LEONIDA_PIPELINE_CACHE_SAVE_SECONDS` (120 by default, 0 for never) and only
+-  when pipelines missed the cache since the last save: a title that is killed or ends through `TerminateProcess` never
+-  destroys its device, and a cold retail boot compiles about 2,700 compute pipelines at roughly one a second. The paths are resolved to absolute ones when the
+-  device is made, so a change of working directory or of a link later does not move the save, and at the save the file is
+-  checked once more against the build's `pipeline_cache.bin` by file identity: the seed is never written. The file is
+-  the driver's data behind a 32-byte frame (magic, byte count, hash), so a file cut short or changed is ignored and
+-  replaced instead of reaching the driver, which wants back exactly the bytes it gave. It is read with `ReadFile` (no
+-  view that a lost network share turns into an exception), written to a staging file and renamed over the old one (for
+-  up to 5 s if another process holds the old one), so an interrupted or failed save leaves the previous file and never
+-  fails the run; file names are logged in UTF-8. It saves only if the session created a pipeline that missed the cache
+-  (creation feedback; a pipeline without valid feedback counts as a miss; without feedback, a cache that grew), not when
+-  the build's `pipeline_cache.bin` changed during the session (the next start prefers the new seed), and not when the
+-  cache is over the limit (one log line says so). If another session saved the file while this one ran, its pipelines
+-  are merged in (`vkMergePipelineCaches`) before this one saves. The next session starts from the file when it is whole,
+-  its Vulkan header matches the device and it is at least as new as `pipeline_cache.bin` (a rebuilt seed wins), else from
+-  the seed. At teardown the log says how many pipelines were created, how long they took and how many the cache already
+-  had (VK_EXT_pipeline_creation_feedback). `d3d12_pipeline_cache_persist_test` and `pipeline_cache_store_test` check
+-  this.
++- Graphics and compute PSOs use one Vulkan pipeline cache per device. The runtime reloads its last compatible
++  checkpoint or starts from the build's seed. It checkpoints newly compiled pipelines during long boots and at
++  device teardown. The file format, location, environment variables and measurement procedure are described in
++  [PSO/shader cache](pso_cache.md#runtime-vulkan-pipeline-cache).
+   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
+   bindings and the standard 144-byte push-constant range.
+   `GetCachedBlob` records the vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description
+diff --git a/docs/pso_cache.md b/docs/pso_cache.md
+index 1d3d448c5..81b06460e 100644
+--- a/docs/pso_cache.md
++++ b/docs/pso_cache.md
+@@ -240,3 +240,37 @@ python -I tools/psocache_usersig.py <cache> [--entry N] [--limit N] [--json]
+ 
+ It reuses the parser from `tools/psocache_inspect.py`, prints the aggregate over the first `--limit` graphics PSOs
+ (all by default) or one PSO with `--entry N`, and never prints a hash.
++
++## Runtime Vulkan pipeline cache
++
++The Vulkan backend uses the same device cache for graphics pipelines from slot 57 and for compute pipelines from
++slots 62 and 67. The hardware driver compiles each new combination of translated shaders, pipeline layout and
++pipeline state. A later launch can reuse the driver's compiled result. The first launch still pays for misses.
++
++By default the session file is `%LOCALAPPDATA%\Leonida\pipeline_cache.user.bin`. The runtime reads the
++`translation_sources.sha256` written by the shaders stage under the configured translated shader directory.
++A missing or malformed fingerprint disables the session file for that device. Regenerating the shaders with
++`make_game.py` produces the marker for older work folders. Vulkan continues to use its in-memory cache.
++
++| Setting | Behavior |
++| --- | --- |
++| `LEONIDA_PIPELINE_CACHE` | Set to `off` to disable session loads and writes, or to a filename in an existing work or cache directory. Paths inside the configured game directory and paths that alias the build seed are refused. |
++| `LEONIDA_PIPELINE_CACHE_SAVE_SECONDS` | Minimum time between checkpoint attempts after a successful pipeline creation. Defaults to 120 seconds. Set to 0 to save only at device teardown. |
++| `LEONIDA_PIPELINE_CACHE_MAX_MB` | Maximum session payload in MiB, default 1024. Vulkan snapshots the entire cache, including its seed. When a seed already exceeds the cap, persisting additions requires a cap above the combined size and sufficient memory and disk space. |
++
++A session file contains a versioned header, payload length and checksum, the Vulkan driver version and the
++translator fingerprint. Its Vulkan payload header must also match the vendor ID, device ID and pipeline cache
++UUID. The runtime falls back to the read-only offline seed `pipeline_cache.bin` beside the executable if the
++session file is stale, corrupt or incompatible, then to an empty cache if the seed is unavailable or rejected.
++A newer or newly rebuilt seed takes precedence. The runtime serializes writers, merges compatible intervening
++saves and replaces the file by renaming a completed staging file in the same directory.
++
++A checkpoint runs on the pipeline-creating thread and can take time for large files. A forced exit retains
++completed checkpoints. For a boot comparison, use the same runtime, translated shaders, device and driver in
++both runs. Record loaded and saved bytes, driver-reported application-cache hits, the time to the first visible
++frame and the number of completed draws at a fixed elapsed time. A file load alone does not establish a hit.
++
++The synthetic tests `d3d12_pipeline_cache_persist` and `d3d12_pipeline_cache_persist_periodic` cover fresh-process
++compute hits, invalidation, protected paths and checkpointing before teardown. To measure graphics, run
++`d3d12_slot57_draw_test --cache-file <scratch-file>` twice with the same initially absent path. Each run validates
++nine pixel probes and prints the number of creations, valid feedback records, cache hits and driver time.
+diff --git a/local/README.md b/local/README.md
+index bfd2924f9..dff8c1099 100644
+--- a/local/README.md
++++ b/local/README.md
+@@ -77,6 +77,8 @@ binaires locaux).
+ 
+ ## Construire et lancer
+ 
++Sur `codex-pso-cache`, les PR #7396 et #9467 enregistrent les pipelines des slots 57, 62 et 67 entre lancements. Utiliser `LEONIDA_PIPELINE_CACHE=off` pour désactiver la persistance. [Emplacement, limites et mesure](../docs/pso_cache.md#runtime-vulkan-pipeline-cache).
++
+ Prérequis : VS 2022 (C++), Python 3.12, Vulkan SDK, `llvm-mc` avec AMDGPU (`scripts/build_llvm_mc.ps1`), ta copie du
+ jeu.
+ 
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 5c6d66204..7ad4e7ace 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -3284,8 +3284,7 @@ if(WIN32 AND MSVC)
+   endforeach()
+ endif()
+ 
+-# A test that creates a D3D12 device would otherwise save pipeline_cache.user.bin beside its executable (and the next run
+-# would start from it). Only d3d12_pipeline_cache_persist chooses its own file, in a scratch folder it removes.
++# Keep the user cache out of tests. The persistence tests use private scratch files.
+ get_directory_property(_leonida_tests TESTS)
+ foreach(_test ${_leonida_tests})
+   if(NOT _test MATCHES "^d3d12_pipeline_cache_persist(_periodic)?$")
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 5b7a30a94..0d74c846a 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -28,6 +28,7 @@
+ #include "../src/pipeline_cache_file.h"
+ #include "../src/pipeline_cache_snapshot.h"
+ #include "../src/pipeline_cache_store.h"
++#include "file_system.h"
+ #include "../src/conservative_raster.h"
+ #include "../src/resource_detile.h"
+ #include "../src/shader_library.h"
+@@ -57,6 +58,7 @@
+ #include <memory>
+ #include <mutex>
+ #include <set>
++#include <shared_mutex>
+ #include <string>
+ #include <type_traits>
+ #include <cwchar>
+@@ -175,25 +177,64 @@ std::string display_name(const std::filesystem::path& path) noexcept {
+     }
+ }
+ 
+-// Where a session saves the pipelines it learned, and where the next one starts: LEONIDA_PIPELINE_CACHE, else a file
+-// beside the seed; "off" turns the session file off (nothing loaded, nothing saved). Resolved to an absolute path now,
+-// so a later change of working directory or of a link cannot move it. Empty without a place; never the seed itself.
++// Compare resolved components, including the volume, using Windows filename case rules.
++bool inside_game_directory(const std::filesystem::path& destination) {
++    namespace store = leonida::pipeline_cache_store;
++    const auto game = rt::fs::game_dir();
++    if (game.empty()) return false;
++    const auto root = store::resolved(game);
++    const auto path = store::resolved(destination);
++    auto part = path.begin();
++    for (const auto& component : root) {
++        if (component.empty()) continue;
++        if (part == path.end() ||
++            CompareStringOrdinal(part->c_str(), -1, component.c_str(), -1, TRUE) != CSTR_EQUAL) return false;
++        ++part;
++    }
++    return true;
++}
++
+ std::filesystem::path session_cache_path(const std::filesystem::path& seed) {
++    namespace store = leonida::pipeline_cache_store;
+     const std::wstring named = environment_value(L"LEONIDA_PIPELINE_CACHE");
+-    if (leonida::pipeline_cache_store::is_off(named)) return {};
+-    std::filesystem::path path;
+-    if (!named.empty()) {
+-        path = leonida::pipeline_cache_store::resolved(named);
+-    } else if (!seed.empty()) {
+-        path = seed.parent_path() / leonida::pipeline_cache_store::kSessionFileName;
+-    }
+-    if (!path.empty() && !seed.empty() && leonida::pipeline_cache_store::same_file(path, seed)) {
+-        std::fprintf(stderr, "[rt] d3d12: LEONIDA_PIPELINE_CACHE is the build's pipeline_cache.bin: not saving to it\n");
++    std::filesystem::path path = named;
++    if (path.empty()) {
++        const std::filesystem::path local = environment_value(L"LOCALAPPDATA");
++        if (!local.is_absolute()) return {};
++        path = local / L"Leonida" / store::kSessionFileName;
++    }
++    path = store::resolved(path);
++    if (inside_game_directory(path) || (!seed.empty() && store::same_file(path, seed))) {
++        std::fprintf(stderr, "[rt] d3d12: session cache destination is in the game directory or aliases the build seed\n");
+         return {};
+     }
++    if (named.empty()) {
++        std::error_code ec;
++        std::filesystem::create_directories(path.parent_path(), ec);
++        if (ec) return {};
++    }
+     return path;
+ }
+ 
++// Serialize the read/merge/replace transaction across overlapping sessions. Windows releases an abandoned mutex.
++class SessionCacheWriter {
++public:
++    SessionCacheWriter() {
++        if (mutex_) {
++            const DWORD result = WaitForSingleObject(mutex_, 5000);
++            acquired_ = result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
++        }
++    }
++    ~SessionCacheWriter() {
++        if (acquired_) ReleaseMutex(mutex_);
++        if (mutex_) CloseHandle(mutex_);
++    }
++    bool acquired() const { return acquired_; }
++private:
++    HANDLE mutex_ = CreateMutexW(nullptr, FALSE, L"Local\\LeonidaPipelineCacheWriter");
++    bool acquired_ = false;
++};
++
+ // A corpus cache may be several GiB. Keep the read-only view alive through vkCreatePipelineCache
+ // and deny writers while the view is in use.
+ class PipelineCacheSeed {
+@@ -266,13 +307,16 @@ bool read_whole_file(const std::filesystem::path& path, std::uint64_t max_size,
+ // The driver's cache data inside a session file: read, framed whole, and made on this GPU and driver. Null, with the
+ // reason logged, if it is none of those.
+ const char* read_session_payload(const std::filesystem::path& path, const leonida::cached_pso::Identity& identity,
++                                 const leonida::pipeline_cache_store::SessionKey& key,
+                                  std::vector<char>& file, std::size_t& payload_size) {
+     namespace store = leonida::pipeline_cache_store;
+-    if (!read_whole_file(path, session_cache_limit(), file)) return nullptr;
++    const auto limit = session_cache_limit();
++    if (!read_whole_file(path, (std::min)(limit, UINT64_MAX - store::kFrameBytes) + store::kFrameBytes, file))
++        return nullptr;
+     const std::string name = display_name(path);
+-    const char* payload = store::unframe(file.data(), file.size(), payload_size);
++    const char* payload = store::unframe(file.data(), file.size(), payload_size, key);
+     if (!payload) {
+-        std::fprintf(stderr, "[rt] d3d12: %s is damaged or not a session cache: ignored\n", name.c_str());
++        std::fprintf(stderr, "[rt] d3d12: %s is damaged or incompatible: ignored\n", name.c_str());
+         return nullptr;
+     }
+     if (!store::header_matches(payload, payload_size, identity)) {
+@@ -284,10 +328,11 @@ const char* read_session_payload(const std::filesystem::path& path, const leonid
+ 
+ VkPipelineCache create_cache_from_session(PFN_vkCreatePipelineCache create_cache, VkDevice device,
+                                           const leonida::cached_pso::Identity& identity,
++                                          const leonida::pipeline_cache_store::SessionKey& key,
+                                           const std::filesystem::path& path, std::size_t& loaded_bytes) {
+     std::vector<char> file;
+     std::size_t size = 0;
+-    const char* payload = read_session_payload(path, identity, file, size);
++    const char* payload = read_session_payload(path, identity, key, file, size);
+     if (!payload) return VK_NULL_HANDLE;
+     const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, size, payload};
+     VkPipelineCache cache = VK_NULL_HANDLE;
+@@ -329,10 +374,11 @@ VkPipelineCache create_cache_from_seed(PFN_vkCreatePipelineCache create_cache, V
+ VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_cache, VkDevice device,
+                                              const leonida::cached_pso::Identity& identity,
+                                              const std::filesystem::path& seed,
+-                                             const std::filesystem::path& session, std::size_t& loaded_bytes) {
++                                             const std::filesystem::path& session, const leonida::pipeline_cache_store::SessionKey& key,
++                                             std::size_t& loaded_bytes) {
+     namespace store = leonida::pipeline_cache_store;
+     if (!session.empty() && store::session_file_is_current(session, seed))
+-        if (const VkPipelineCache cache = create_cache_from_session(create_cache, device, identity, session, loaded_bytes))
++        if (const VkPipelineCache cache = create_cache_from_session(create_cache, device, identity, key, session, loaded_bytes))
+             return cache;
+     return create_cache_from_seed(create_cache, device, identity, seed, loaded_bytes);
+ }
+@@ -757,6 +803,8 @@ struct DeviceState {
+     std::size_t pipeline_cache_loaded_bytes = 0;  // what the cache started the session with
+     std::filesystem::path pipeline_cache_seed_path;     // resolved when the device was made
+     std::filesystem::path pipeline_cache_session_path;  // where save_pipeline_cache writes; empty: nowhere
++    leonida::pipeline_cache_store::SessionKey pipeline_cache_key;
++    std::shared_mutex pipeline_cache_access;  // exclusive destination access for vkMergePipelineCaches
+     bool pipeline_cache_paths_resolved = false;
+     leonida::pipeline_cache_store::Stamp seed_stamp_at_start, session_stamp_at_load;
+     leonida::pipeline_cache_store::Stats pipeline_stats;
+@@ -767,7 +815,23 @@ struct DeviceState {
+         if (pipeline_cache_paths_resolved) return;
+         pipeline_cache_paths_resolved = true;
+         pipeline_cache_seed_path = leonida::pipeline_cache_store::resolved(pipeline_cache_path());
+-        pipeline_cache_session_path = session_cache_path(pipeline_cache_seed_path);
++        if (leonida::pipeline_cache_store::is_off(environment_value(L"LEONIDA_PIPELINE_CACHE"))) return;
++        try {
++            const auto dir = info.shader_dir.empty() ? configured_shader_directory() : std::filesystem::path(info.shader_dir);
++            if (dir.empty()) return;
++            std::vector<char> marker;
++            if (!read_whole_file(dir / L"translation_sources.sha256", 66, marker)) return;
++            while (!marker.empty() && (marker.back() == '\r' || marker.back() == '\n')) marker.pop_back();
++            if (marker.size() != pipeline_cache_key.translator.size() ||
++                !std::all_of(marker.begin(), marker.end(), [](char c) {
++                    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
++                })) return;
++            pipeline_cache_key.driver = pso_identity.driver;
++            std::copy(marker.begin(), marker.end(), pipeline_cache_key.translator.begin());
++            pipeline_cache_session_path = session_cache_path(pipeline_cache_seed_path);
++        } catch (const std::exception& e) {
++            std::fprintf(stderr, "[rt] d3d12: session cache unavailable: %s\n", e.what());
++        }
+     }
+ 
+     VkPipelineCache pipeline_cache() {
+@@ -780,7 +844,7 @@ struct DeviceState {
+             session_stamp_at_load = store::stamp_of(pipeline_cache_session_path);
+             pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity,
+                                                                  pipeline_cache_seed_path, pipeline_cache_session_path,
+-                                                                 pipeline_cache_loaded_bytes);
++                                                                 pipeline_cache_key, pipeline_cache_loaded_bytes);
+             if (pipeline_cache_handle) return;
+             const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+             if (vk.vkCreatePipelineCache(info.device, &create, nullptr, &pipeline_cache_handle) != VK_SUCCESS)
+@@ -797,11 +861,12 @@ struct DeviceState {
+         if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache || !vk.vkMergePipelineCaches) return;
+         std::vector<char> file;
+         std::size_t size = 0;
+-        const char* payload = read_session_payload(pipeline_cache_session_path, pso_identity, file, size);
++        const char* payload = read_session_payload(pipeline_cache_session_path, pso_identity, pipeline_cache_key, file, size);
+         if (!payload) return;
+         const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, size, payload};
+         VkPipelineCache other = VK_NULL_HANDLE;
+         if (vk.vkCreatePipelineCache(info.device, &create, nullptr, &other) != VK_SUCCESS) return;
++        const std::unique_lock lock(pipeline_cache_access);
+         if (vk.vkMergePipelineCaches(info.device, pipeline_cache_handle, 1, &other) == VK_SUCCESS)
+             std::fprintf(stderr, "[rt] d3d12: merged %zu bytes saved by another session into the pipeline cache\n", size);
+         vk.vkDestroyPipelineCache(info.device, other, nullptr);
+@@ -818,11 +883,18 @@ struct DeviceState {
+         const auto& vk = context->vk;
+         const std::string name = display_name(pipeline_cache_session_path);
+         try {
++            const auto misses = pipeline_stats.misses.load();
++            if (misses == pipeline_cache_misses_at_last_save) return;
+             std::size_t size = 0;
+             if (vk.vkGetPipelineCacheData(info.device, pipeline_cache_handle, &size, nullptr) != VK_SUCCESS) return;
+             if (!store::learned_something(info.pipeline_creation_feedback, pipeline_stats.created, pipeline_stats.cache_hits,
+                                           size, pipeline_cache_loaded_bytes))
+                 return;
++            const SessionCacheWriter writer;
++            if (!writer.acquired()) {
++                std::fprintf(stderr, "[rt] d3d12: pipeline cache writer busy or unavailable\n");
++                return;
++            }
+             // The seed was rebuilt while this session ran: its pipelines are not in this cache, and a session file
+             // newer than the seed would hide them from the next start. Keep the old session file, which the new seed
+             // now outranks.
+@@ -830,8 +902,9 @@ struct DeviceState {
+                 std::fprintf(stderr, "[rt] d3d12: the build's pipeline_cache.bin changed during the session: not saving\n");
+                 return;
+             }
+-            if (store::same_file(pipeline_cache_session_path, pipeline_cache_seed_path)) {
+-                std::fprintf(stderr, "[rt] d3d12: %s is now the build's pipeline_cache.bin: not saving to it\n",
++            if (inside_game_directory(pipeline_cache_session_path) ||
++                store::same_file(pipeline_cache_session_path, pipeline_cache_seed_path)) {
++                std::fprintf(stderr, "[rt] d3d12: %s is now a protected path: not saving to it\n",
+                              name.c_str());
+                 return;
+             }
+@@ -852,13 +925,15 @@ struct DeviceState {
+             const std::vector<char> data = pipeline_cache_snapshot([&](std::size_t* bytes, void* out) {
+                 return vk.vkGetPipelineCacheData(info.device, pipeline_cache_handle, bytes, out);
+             });
+-            const auto frame = store::make_frame(data.data(), data.size());
++            if (data.size() > session_cache_limit()) return;
++            const auto frame = store::make_frame(data.data(), data.size(), pipeline_cache_key);
+             if (const std::error_code error = write_pipeline_cache_file(pipeline_cache_session_path, frame.data(),
+                                                                         frame.size(), data.data(), data.size())) {
+                 std::fprintf(stderr, "[rt] d3d12: could not save the pipeline cache to %s: %s\n", name.c_str(),
+                              error.message().c_str());
+                 return;
+             }
++            pipeline_cache_misses_at_last_save = misses;
+             // The file is this session's own now: a later save of this session must not take it for another's.
+             session_stamp_at_load = store::stamp_of(pipeline_cache_session_path);
+             std::fprintf(stderr, "[rt] d3d12: saved %zu bytes to %s in %.0f ms\n", data.size(), name.c_str(),
+@@ -893,10 +968,7 @@ struct DeviceState {
+         if (!lock.owns_lock()) return;
+         const auto now = std::chrono::steady_clock::now();
+         if (now - pipeline_cache_last_save < std::chrono::seconds(seconds)) return;
+-        const std::uint64_t misses = std::uint64_t(pipeline_stats.created) - std::uint64_t(pipeline_stats.cache_hits);
+         pipeline_cache_last_save = now;
+-        if (misses == pipeline_cache_misses_at_last_save) return;
+-        pipeline_cache_misses_at_last_save = misses;
+         save_pipeline_cache();
+     }
+ 
+@@ -4228,6 +4300,7 @@ public:
+             // The console makes this pipeline from native code at once; the driver's compile of the translated module
+             // is host-only time on the title's thread, which a guest Sleep sits out (src/host_stall.h).
+             const rt::host_stall::Scope compiling;
++            const std::shared_lock lock(device_.pipeline_cache_access);
+             created = vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
+                                                   &pipeline_.pipeline);
+         }
+@@ -4350,9 +4423,12 @@ private:
+         info.pDynamicState = &dynamic;
+         info.layout = graphics_.layout;
+         VkPipeline pipeline = VK_NULL_HANDLE;
+-        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
+-                                                          &info, nullptr, &pipeline) != VK_SUCCESS)
+-            return VK_NULL_HANDLE;
++        {
++            const std::shared_lock lock(device_.pipeline_cache_access);
++            if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
++                                                              &info, nullptr, &pipeline) != VK_SUCCESS)
++                return VK_NULL_HANDLE;
++        }
+         feedback.record(device_.pipeline_stats);
+         device_.save_pipeline_cache_if_due();
+         return pipeline;
+diff --git a/runtime/shims/file_system.cpp b/runtime/shims/file_system.cpp
+index bb15e7f3f..c6b7111c5 100644
+--- a/runtime/shims/file_system.cpp
++++ b/runtime/shims/file_system.cpp
+@@ -62,19 +62,6 @@ bool internal_dir(const wchar_t* name) {
+            _wcsicmp(name, kPersistentStorageDir) == 0;
+ }
+ 
+-std::mutex g_mutex;
+-std::filesystem::path g_game_dir;
+-std::filesystem::path g_overlay_dir;
+-
+-struct Roots {
+-    std::filesystem::path game, overlay;
+-};
+-
+-Roots roots() {
+-    std::lock_guard lock(g_mutex);
+-    return {g_game_dir, g_overlay_dir};
+-}
+-
+ std::wstring lower(std::wstring s) {
+     for (auto& c : s) c = static_cast<wchar_t>(std::towlower(c));
+     return s;
+@@ -620,22 +607,6 @@ void to_ansi(const WIN32_FIND_DATAW& wide, WIN32_FIND_DATAA* ansi) {
+ 
+ }  // namespace
+ 
+-void configure(const std::filesystem::path& game_dir, const std::filesystem::path& overlay_dir) {
+-    std::lock_guard lock(g_mutex);
+-    g_game_dir = game_dir;
+-    g_overlay_dir = overlay_dir;
+-}
+-
+-std::filesystem::path game_dir() {
+-    std::lock_guard lock(g_mutex);
+-    return g_game_dir;
+-}
+-
+-std::filesystem::path overlay_dir() {
+-    std::lock_guard lock(g_mutex);
+-    return g_overlay_dir;
+-}
+-
+ // gta6rt --trace FILE: a failed open of a guest path goes to the startup trace as a "file_open_failed" event (the
+ // path the title passed, the Win32 error, the caller as module+RVA), so a boot that stops on a missing or refused
+ // file names it. Failures only, and at most 256 of them, so a title probing many optional files can't fill the file.
+diff --git a/runtime/shims/file_system.h b/runtime/shims/file_system.h
+index d252bb1ce..7dee29cbe 100644
+--- a/runtime/shims/file_system.h
++++ b/runtime/shims/file_system.h
+@@ -17,17 +17,41 @@
+ #pragma once
+ 
+ #include <filesystem>
++#include <mutex>
+ 
+ namespace rt::fs {
+ 
+ inline constexpr wchar_t kPersistentStorageDir[] = L".gta6rt-persistent";
+ 
+-// Sets the roots. main.cpp calls this once, before anything is mapped; the test calls it per case. The overlay is
+-// created on the first write, not here.
+-void configure(const std::filesystem::path& game_dir, const std::filesystem::path& overlay_dir);
++struct Roots {
++    std::filesystem::path game, overlay;
++};
+ 
+-std::filesystem::path game_dir();
+-std::filesystem::path overlay_dir();
++namespace detail {
++inline Roots configured_roots;
++inline std::mutex roots_mutex;
++}
++
++// main.cpp sets both before anything is mapped. Standalone devices have empty roots.
++inline void configure(const std::filesystem::path& game_dir, const std::filesystem::path& overlay_dir) {
++    std::lock_guard lock(detail::roots_mutex);
++    detail::configured_roots = {game_dir, overlay_dir};
++}
++
++inline Roots roots() {
++    std::lock_guard lock(detail::roots_mutex);
++    return detail::configured_roots;
++}
++
++inline std::filesystem::path game_dir() {
++    std::lock_guard lock(detail::roots_mutex);
++    return detail::configured_roots.game;
++}
++
++inline std::filesystem::path overlay_dir() {
++    std::lock_guard lock(detail::roots_mutex);
++    return detail::configured_roots.overlay;
++}
+ 
+ // For tests: true makes the CopyFile2 shim use its CopyFileExW fallback even where the host has CopyFile2, so the
+ // path Wine 9 takes can be checked on Windows. Off by default; main.cpp never sets it.
+diff --git a/runtime/src/pipeline_cache_store.h b/runtime/src/pipeline_cache_store.h
+index aaa17c02a..c1677ea57 100644
+--- a/runtime/src/pipeline_cache_store.h
++++ b/runtime/src/pipeline_cache_store.h
+@@ -3,7 +3,7 @@
+ // (VK_EXT_pipeline_creation_feedback, core in Vulkan 1.3) that says whether the cache paid off.
+ //
+ // The build's pipelines stage writes pipeline_cache.bin beside gta6rt.exe: a seed, never written here. A session saves
+-// what it learned to a second file in the same folder, or to LEONIDA_PIPELINE_CACHE, and the next one starts from
++// what it learned to a file under the user cache directory, or to LEONIDA_PIPELINE_CACHE, and the next one starts from
+ // that, so it has every pipeline the game has already made.
+ #pragma once
+ 
+@@ -55,10 +55,14 @@ inline bool header_matches(const void* data, std::size_t size, const cached_pso:
+            std::memcmp(header.pipelineCacheUUID, identity.cache_uuid, VK_UUID_SIZE) == 0;
+ }
+ 
+-// The session file is the driver's cache data behind a 32-byte frame: the driver wants back exactly the bytes it gave
++// The session file is the driver's cache data behind a versioned frame: the driver wants back exactly the bytes it gave
+ // (VUID-VkPipelineCacheCreateInfo-initialDataSize-00768), and its own header says nothing about their count, so a
+ // file cut short, or with a flipped byte, would otherwise reach it with a matching header.
+-inline constexpr std::size_t kFrameBytes = 32;
++struct SessionKey {
++    std::uint32_t driver = 0;
++    std::array<char, 64> translator{};  // translation_sources.sha256 written by the shaders stage
++};
++inline constexpr std::size_t kFrameBytes = 32 + 64;
+ 
+ inline std::uint64_t payload_hash(const void* data, std::size_t size) {
+     const auto* bytes = static_cast<const unsigned char*>(data);
+@@ -74,27 +78,30 @@ inline std::uint64_t payload_hash(const void* data, std::size_t size) {
+     return h;
+ }
+ 
+-inline std::array<char, kFrameBytes> make_frame(const void* payload, std::size_t size) {
++inline std::array<char, kFrameBytes> make_frame(const void* payload, std::size_t size, const SessionKey& key) {
+     std::array<char, kFrameBytes> frame{};
+-    const std::uint32_t version = 1;
++    const std::uint32_t version = 2;
+     const std::uint64_t bytes = size, hash = payload_hash(payload, size);
+     std::memcpy(frame.data(), "LPCS", 4);
+     std::memcpy(frame.data() + 4, &version, 4);
+     std::memcpy(frame.data() + 8, &bytes, 8);
+     std::memcpy(frame.data() + 16, &hash, 8);
++    std::memcpy(frame.data() + 24, &key.driver, 4);
++    std::memcpy(frame.data() + 32, key.translator.data(), key.translator.size());
+     return frame;
+ }
+ 
+ // The driver's bytes inside a whole session file, or null: the frame, the length (the header of the driver's data is
+ // 32 bytes at least) and the hash all have to agree.
+-inline const char* unframe(const char* file, std::size_t file_size, std::size_t& payload_size) {
++inline const char* unframe(const char* file, std::size_t file_size, std::size_t& payload_size, const SessionKey& key) {
+     if (!file || file_size < kFrameBytes + sizeof(VkPipelineCacheHeaderVersionOne)) return nullptr;
+     std::uint32_t version;
+     std::uint64_t bytes, hash;
+     std::memcpy(&version, file + 4, 4);
+     std::memcpy(&bytes, file + 8, 8);
+     std::memcpy(&hash, file + 16, 8);
+-    if (std::memcmp(file, "LPCS", 4) != 0 || version != 1 || bytes != file_size - kFrameBytes ||
++    if (std::memcmp(file, "LPCS", 4) != 0 || version != 2 ||
++        std::memcmp(file + 24, &key.driver, 4) || std::memcmp(file + 32, key.translator.data(), key.translator.size()) || bytes != file_size - kFrameBytes ||
+         hash != payload_hash(file + kFrameBytes, std::size_t(bytes)))
+         return nullptr;
+     payload_size = std::size_t(bytes);
+@@ -213,6 +220,7 @@ inline bool session_file_is_current(const std::filesystem::path& session, const
+ // What the pipelines of one device took to create, from VK_EXT_pipeline_creation_feedback.
+ struct Stats {
+     std::atomic<std::uint32_t> created{0};     // every pipeline made, whatever its feedback says
++    std::atomic<std::uint32_t> misses{0};      // includes successful creations without valid feedback
+     std::atomic<std::uint32_t> pipelines{0};   // of those, with valid feedback
+     std::atomic<std::uint32_t> cache_hits{0};  // of those, found in the application's VkPipelineCache
+     std::atomic<std::uint64_t> nanoseconds{0}; // their total creation time
+@@ -247,7 +255,10 @@ public:
+     // Call after the pipeline was created.
+     void record(Stats& stats) const {
+         stats.created.fetch_add(1, std::memory_order_relaxed);
+-        if (!enabled_ || !(pipeline_.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT)) return;
++        const bool valid = enabled_ && (pipeline_.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT);
++        if (!valid || !(pipeline_.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT))
++            stats.misses.fetch_add(1, std::memory_order_relaxed);
++        if (!valid) return;
+         stats.pipelines.fetch_add(1, std::memory_order_relaxed);
+         stats.nanoseconds.fetch_add(pipeline_.duration, std::memory_order_relaxed);
+         if (pipeline_.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)
+diff --git a/runtime/test/d3d12_pipeline_cache_persist_test.cpp b/runtime/test/d3d12_pipeline_cache_persist_test.cpp
+index 46bff2c6d..7f91e594d 100644
+--- a/runtime/test/d3d12_pipeline_cache_persist_test.cpp
++++ b/runtime/test/d3d12_pipeline_cache_persist_test.cpp
+@@ -16,6 +16,7 @@
+ #include "test_temp_dir.h"
+ #include "vk_test_device.h"
+ #include "../shims/d3d12_com.h"
++#include "../shims/file_system.h"
+ #include "../src/pipeline_cache_store.h"
+ #include "../src/shader_library.h"
+ 
+@@ -165,7 +166,9 @@ bool write_library(const fs::path& dir) {
+     }
+     std::ofstream out(dir / "index.json", std::ios::binary);
+     out << index << "}";
+-    return bool(out);
++    std::ofstream marker(dir / "translation_sources.sha256");
++    marker << std::string(64, 'a') << '\n';
++    return bool(out) && bool(marker);
+ }
+ 
+ struct Setup {
+@@ -276,6 +279,26 @@ fs::path executable_dir() {
+     return fs::path(path).parent_path();
+ }
+ 
++// The child inherits LEONIDA_PIPELINE_CACHE, creates its own device and synthetic library, and checks driver feedback.
++bool check_fresh_process() {
++    wchar_t exe[32768]{};
++    const DWORD length = GetModuleFileNameW(nullptr, exe, DWORD(std::size(exe)));
++    if (!length || length >= std::size(exe)) return false;
++    std::wstring command = L"\"" + std::wstring(exe) + L"\" --warm";
++    STARTUPINFOW startup{sizeof(startup)};
++    PROCESS_INFORMATION process{};
++    if (!CreateProcessW(exe, command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process))
++        return false;
++    DWORD result = 1;
++    if (WaitForSingleObject(process.hProcess, 60000) == WAIT_OBJECT_0)
++        GetExitCodeProcess(process.hProcess, &result);
++    else
++        TerminateProcess(process.hProcess, 1);
++    CloseHandle(process.hThread);
++    CloseHandle(process.hProcess);
++    return result == 0;
++}
++
+ // Holds a file open for writing and mapped, as a process reading it through a view would, until released or destroyed.
+ class Holder {
+ public:
+@@ -350,7 +373,8 @@ int main(int argc, char** argv) {
+     const auto& dir = scratch.path();
+     REQUIRE(write_library(dir));
+     const fs::path session_file = dir / "session_cache.bin";
+-    REQUIRE(set_cache(session_file));
++    const bool warm_child = argc == 2 && !std::strcmp(argv[1], "--warm");
++    if (!warm_child) REQUIRE(set_cache(session_file));
+ 
+     // The console compute layout of d3d12_compute_test: two root constants, a root UAV and a one-CBV table.
+     D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
+@@ -367,6 +391,14 @@ int main(int argc, char** argv) {
+     Setup setup{d, dir, serialize(root_desc)};
+     REQUIRE(!setup.root_blob.empty());
+ 
++    if (warm_child) {
++        const auto warm = run_session(setup);
++        print("fresh process, saved cache", warm);
++        REQUIRE(warm.ok && warm.stats.loaded_bytes > 0 && warm.stats.created == pipeline_count);
++        if (warm.stats.pipelines == pipeline_count) REQUIRE(warm.stats.cache_hits == pipeline_count);
++        return 0;
++    }
++
+     if (periodic) {
+         // A session that is never torn down (a title that is killed, or ends through TerminateProcess) still leaves
+         // its pipelines behind: with a 1 s interval, the first pipeline created more than a second into the session
+@@ -404,6 +436,7 @@ int main(int argc, char** argv) {
+     const bool feedback_valid = first.stats.pipelines == pipeline_count;
+     CHECK(first.stats.created == pipeline_count);
+     const store::Stamp saved = store::stamp_of(session_file);
++    REQUIRE(check_fresh_process());
+     const Session second = run_session(setup);
+     REQUIRE(second.ok);
+     print("session 2, cache saved by session 1", second);
+@@ -435,6 +468,24 @@ int main(int argc, char** argv) {
+         const Session damaged = run_session(setup);
+         CHECK(damaged.ok && damaged.stats.loaded_bytes == 0);
+     }
++    // A translator change or a driver update invalidates even an otherwise intact cache.
++    const auto marker = dir / "translation_sources.sha256";
++    write_bytes(marker, std::string(64, 'b') + "\n");
++    const Session translated = run_session(setup);
++    print("translator changed", translated);
++    CHECK(translated.ok && translated.stats.loaded_bytes == 0 && translated.stats.cache_hits == 0);
++    write_bytes(marker, std::string(64, 'a') + "\n");
++    std::string other_driver = good;
++    other_driver[24] ^= 1;
++    write_bytes(session_file, other_driver);
++    const Session updated = run_session(setup);
++    print("driver changed", updated);
++    CHECK(updated.ok && updated.stats.loaded_bytes == 0 && updated.stats.cache_hits == 0);
++    write_bytes(marker, "incomplete\n");
++    write_bytes(session_file, good);
++    const Session missing_key = run_session(setup);
++    CHECK(missing_key.ok && missing_key.stats.loaded_bytes == 0 && read_bytes(session_file) == good);
++    write_bytes(marker, std::string(64, 'a') + "\n");
+     const Session again = run_session(setup);
+     CHECK(again.ok && again.stats.loaded_bytes > 0);
+     const std::string seed_payload = payload_of(session_file);  // pipelines 0 to 15, as the build would have made them
+@@ -586,6 +637,23 @@ int main(int argc, char** argv) {
+         restore_cwd();
+     }
+ 
++    // The default is a user cache directory. Neither a named file nor the default may be in the game tree.
++    {
++        const auto local = dir / "user";
++        REQUIRE(set_env(L"LOCALAPPDATA", local.c_str()));
++        REQUIRE(set_env(L"LEONIDA_PIPELINE_CACHE", nullptr));
++        REQUIRE(run_session(setup).ok);
++        CHECK(fs::is_regular_file(local / "Leonida" / store::kSessionFileName));
++        const auto game = dir / "package";
++        fs::create_directory(game);
++        rt::fs::configure(game, dir / "overlay");
++        REQUIRE(set_env(L"LOCALAPPDATA", game.c_str()));
++        CHECK(run_session(setup).ok && fs::is_empty(game));
++        REQUIRE(set_cache(game / "named.bin"));
++        CHECK(run_session(setup).ok && fs::is_empty(game));
++        rt::fs::configure({}, {});
++    }
++
+     // 9. A path nothing can be saved to costs the session nothing but the save.
+     {
+         const fs::path unwritable = dir / "a_directory";
+diff --git a/runtime/test/d3d12_slot57_draw_test.cpp b/runtime/test/d3d12_slot57_draw_test.cpp
+index 62bc4b733..51ef98ec6 100644
+--- a/runtime/test/d3d12_slot57_draw_test.cpp
++++ b/runtime/test/d3d12_slot57_draw_test.cpp
+@@ -147,7 +147,10 @@ using Rgba = std::array<std::uint8_t, 4>;
+ 
+ }  // namespace
+ 
+-int main() {
++int wmain(int argc, wchar_t** argv) {
++    const bool probe_cache = argc == 3 && std::wstring_view(argv[1]) == L"--cache-file";
++    EXPECT(argc == 1 || probe_cache);
++    EXPECT(SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE", probe_cache ? argv[2] : L"off"));
+     vktest::Device d;
+     const auto device_status = d.initialize();
+     if (device_status == vktest::DeviceStatus::unavailable) {
+@@ -162,6 +165,11 @@ int main() {
+     const testfiles::ScratchDir scratch("leonida_slot57_draw_test");
+     const auto& library = scratch.path();
+     std::filesystem::create_directories(library / "library");
++    if (probe_cache) {
++        std::ofstream marker(library / "translation_sources.sha256");
++        marker << std::string(64, 'a') << '\n';
++        EXPECT(marker.good());
++    }
+     EXPECT(write_module(library / "library" / "lib_vs_00001.spv", vertex_module()));
+     EXPECT(write_module(library / "library" / "lib_ps_00002.spv", fragment_module()));
+     {
+@@ -191,6 +199,7 @@ int main() {
+         info.buffer_device_address = true;
+         info.subgroup = d.subgroup;
+         info.shader_dir = library.string();
++        info.pipeline_creation_feedback = d.core_1_3();
+         ID3D12Device* inner = nullptr;
+         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
+         Ref<ID3D12Device> device;
+@@ -354,6 +363,13 @@ int main() {
+                                 static_cast<const std::uint8_t*>(mapped) + size * 256);
+         }
+ 
++        const auto stats = rt::d3d12::pipeline_cache_stats(device.p);
++        EXPECT(stats.created >= 3);
++        if (probe_cache) {
++            std::printf("slot 57: %u creations, %u valid, %u hits, %.2f ms, %llu bytes loaded\n",
++                        stats.created, stats.pipelines, stats.cache_hits, double(stats.create_nanoseconds) / 1e6,
++                        static_cast<unsigned long long>(stats.loaded_bytes));
++        }
+         for (auto* r : {&upload, &readback, &target}) r->reset();
+         for (auto& p : pso) p.reset();
+         root.reset();
+diff --git a/runtime/test/pipeline_cache_store_test.cpp b/runtime/test/pipeline_cache_store_test.cpp
+index b6ff8c45c..061843706 100644
+--- a/runtime/test/pipeline_cache_store_test.cpp
++++ b/runtime/test/pipeline_cache_store_test.cpp
+@@ -27,8 +27,10 @@ static std::string driver_data() {
+     return data + "the driver's own pipelines, however many";
+ }
+ 
++static const store::SessionKey key{21};
++
+ static std::string framed(const std::string& payload) {
+-    const auto frame = store::make_frame(payload.data(), payload.size());
++    const auto frame = store::make_frame(payload.data(), payload.size(), key);
+     return std::string(frame.data(), frame.size()) + payload;
+ }
+ 
+@@ -36,20 +38,27 @@ static int test_frame() {
+     const std::string payload = driver_data();
+     const std::string file = framed(payload);
+     std::size_t size = 0;
+-    const char* got = store::unframe(file.data(), file.size(), size);
++    const char* got = store::unframe(file.data(), file.size(), size, key);
+     CHECK(got && size == payload.size() && std::string(got, size) == payload);
+ 
++    auto changed_key = key;
++    ++changed_key.driver;
++    CHECK(!store::unframe(file.data(), file.size(), size, changed_key));
++    changed_key = key;
++    changed_key.translator[0] = 'f';
++    CHECK(!store::unframe(file.data(), file.size(), size, changed_key));
++
+     // Whatever is missing, added or changed, the driver is not handed the bytes.
+-    CHECK(!store::unframe(file.data(), file.size() - 1, size));
+-    CHECK(!store::unframe(file.data(), store::kFrameBytes + sizeof(VkPipelineCacheHeaderVersionOne) + 1, size));
+-    CHECK(!store::unframe(file.data(), store::kFrameBytes, size));
+-    CHECK(!store::unframe(payload.data(), payload.size(), size));  // a raw cache is not a session file
++    CHECK(!store::unframe(file.data(), file.size() - 1, size, key));
++    CHECK(!store::unframe(file.data(), store::kFrameBytes + sizeof(VkPipelineCacheHeaderVersionOne) + 1, size, key));
++    CHECK(!store::unframe(file.data(), store::kFrameBytes, size, key));
++    CHECK(!store::unframe(payload.data(), payload.size(), size, key));  // a raw cache is not a session file
+     std::string longer = file + "x";
+-    CHECK(!store::unframe(longer.data(), longer.size(), size));
++    CHECK(!store::unframe(longer.data(), longer.size(), size, key));
+     for (const std::size_t at : {std::size_t(0), store::kFrameBytes + 3, file.size() / 2, file.size() - 1}) {
+         std::string changed = file;
+         changed[at] ^= 1;
+-        CHECK(!store::unframe(changed.data(), changed.size(), size));
++        CHECK(!store::unframe(changed.data(), changed.size(), size, key));
+     }
+     leonida::cached_pso::Identity identity;
+     identity.vendor = 0x10de;
