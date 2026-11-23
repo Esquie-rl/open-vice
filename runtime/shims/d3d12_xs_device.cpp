@@ -407,7 +407,18 @@ unsigned long proxy_release(DeviceProxy* self) {
     return refs;
 }
 
+// The console's own ID3D12Device IID. The Xbox D3D12 headers give their interfaces IIDs of their own (their vtables
+// differ from the PC ones), and the game executable (1.0.2.1) passes this one to D3D12XboxCreateDevice; it is stored
+// in its .rdata. No PC interface has it, so a PC device is asked for ID3D12Device in its place
+// (pc_device_iid_for); the proxy vtable already presents the console's slot layout.
+constexpr IID kConsoleDeviceIid = {0x5405c344, 0xd457, 0x444e, {0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x39}};
+
+const IID& pc_device_iid_for(const IID& iid) {
+    return IsEqualIID(iid, kConsoleDeviceIid) ? __uuidof(ID3D12Device) : iid;
+}
+
 bool is_device_iid(const IID& iid) {
+    if (IsEqualIID(iid, kConsoleDeviceIid)) return true;
     if (IsEqualIID(iid, __uuidof(ID3D12Device))) return true;
 #ifdef __ID3D12Device14_INTERFACE_DEFINED__
     if (IsEqualIID(iid, __uuidof(ID3D12Device14))) return true;
@@ -458,7 +469,7 @@ HRESULT proxy_query_interface(DeviceProxy* self, const IID* riid, void** out) {
 
     // Only claim an interface the PC device really implements; the proxy vtable covers its slots.
     void* supported = nullptr;
-    HRESULT hr = self->real->QueryInterface(*riid, &supported);
+    HRESULT hr = self->real->QueryInterface(pc_device_iid_for(*riid), &supported);
     if (FAILED(hr)) return hr;
     if (!supported) return E_NOINTERFACE;
     static_cast<IUnknown*>(supported)->Release();
