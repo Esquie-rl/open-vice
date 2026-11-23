@@ -50,6 +50,31 @@ Corrections locales :
   `PresentX` (avant, elle était créée invisible) ;
 - `tests/semantic/test_image_atomics_guard.py` : accepte la valeur « active » mise en cache (#4473) comme garde.
 
+### PR du boot ajoutées sur `boot-prs` (23/11/2026)
+
+Toutes ouvertes en amont ; « partiel » = seulement le commit cité.
+
+- #2490 partiel (`ef9d0759d`, slot 139 de liste = `Reset`), #7880 partiel (`0aba6c361`, handles CPU slots 50-54) :
+  moins d'échecs de `Close` ;
+- #7330 (signature `DISPATCH_MESH`), #7111 (émulation Zen 2 sur Intel), #7448 (rect/quad list), #7099 (plus de
+  `FILE_FLAG_NO_BUFFERING`), #7417 (`LEONIDA_STUB_PIPELINES`, opt-in, incomplet sans #7007) ;
+- #8273 (doc du descripteur du slot 57), #7201 (slots 86, 101, 108 : repli du titre quand le slot 57 échoue),
+  #7759 partiel (`d80c40845`, slot 55) ;
+- #7746 (shaders embarqués de l'exe, chargés avec `fspx`/`bvh`/`library`), #7755 (A8_UNORM avec #7403) ;
+- #7858 partiel (`4a51079bb`, un `Sleep` du titre attend les compilations de pipelines : pas de watchdog) ;
+- #7180 partiel (`00551ba00`, requêtes DirectStorage zlib) ;
+- #6885 : son `acphal.cpp` remplace celui de #7009.
+
+Ajouts locaux : le présentateur de `PresentX` partage la source de jetons du device (#7685 dans #2490) ;
+`d3d12_xs_pso_stream.cpp` dans `build_runtime.ps1` ; portage de #7286 (slot 35 de queue → `ExecuteCommandLists`,
+listes déballées).
+
+Écartées : #6981 (doublon de #7009), #7949, #7218/#8304, #7411, #7240, #7516, #7937, #7490, #7125, #6964/#6954
+(couvertes par les slots 48/73 locaux), #7584/#7492 (Wine), #7653/#7821, #7396/#7384/#7586 (cache de PSO, A31).
+
+Compile entièrement (MSVC 14.44, 867/867). Les tests C++ n'ont pas été lancés ici (Smart App Control bloque les
+binaires locaux).
+
 ## Construire et lancer
 
 Prérequis : VS 2022 (C++), Python 3.12, Vulkan SDK, `llvm-mc` avec AMDGPU (`scripts/build_llvm_mc.ps1`), ta copie du
@@ -70,11 +95,14 @@ python -I make_game.py --game <ta copie> --out <port> --work <port>\work --stage
 
 ## Tâches lourdes à prendre
 
-1. **Suite de tests du traducteur complète** (`python -m unittest discover -s tests/semantic`, ~70 min) et liste des
-   échecs. Connus : 3 tests NaN min3/max3/med3 corrigés par #6685 ; à confirmer qu'il n'en reste aucun.
+1. ~~Suite du traducteur~~ : faite le 23/11 sur `dfe4e4a` (5 956 tests, 0 échec après correction d'un test
+   périmé ; 5 tests `llvm-mc` sautés). Les NaN min3/max3/med3 passent.
 2. **Traduction des shaders sur ta copie**, puis lancements avec `LEONIDA_SHADERS` : noter le dernier appel et
    l'exception (`tools/boot_trace.py startup.jsonl --d3d12 stderr.log`). Une carte AMD RDNA2/RDNA3 est la plus utile
    (wave64 natif).
-3. **Blocages suivants** : 19-25 sont couverts par les PR ci-dessus ; 26 (device slot 57, pipelines natifs) et la
-   boucle d'images sont ouverts. Intégrer les nouvelles PR du boot au fur et à mesure.
-4. **Rebase sur le `main` amont** quand il a intégré une partie de ces PR.
+3. **Blocages suivants** : 19-25 sont couverts ; **26 (device slot 57) n'a toujours aucune PR d'implémentation**
+   (revendiqué dans #8047, seule la doc #8273 existe) : il faut traduire les vs/ps de la bibliothèque (#7529 ne fait
+   que le cs) et décoder le blob d'état de 380-404 octets. Boucle d'images : fenêtre noire (compilations de pipelines
+   du slot 62 de 16 à 137 s, sans cache), encore 27-31 % de `Close` en échec, slots de liste 70/72/74/75/126/142 non
+   documentés, null dans le chargeur RSC8/PSIN.
+4. ~~Rebase sur le `main` amont~~ : fait le 23/11 (merge de `dfe4e4a`, branche `rebase-2026-11-23`).
