@@ -71,22 +71,14 @@ std::string module_name(std::string path) {
 }
 
 std::string host_module_name(HMODULE module) {
-    std::lock_guard lock(loader_mutex());
-    static auto* names = new std::map<HMODULE, std::string>;
-    if (auto it = names->find(module); it != names->end()) return it->second;
-
-    std::vector<wchar_t> path(MAX_PATH);
-    for (;;) {
-        const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
-        if (!length) return {};
-        if (length < path.size()) {
-            const std::string name = module_name(narrow(path.data()));
-            names->emplace(module, name);
-            return name;
-        }
-        if (path.size() == 32768) return {};
-        path.resize(path.size() > 16384 ? 32768 : path.size() * 2);
-    }
+    // May be called from DllMain or a TLS callback where the CRT heap is not initialised yet,
+    // so avoid any allocation that depends on the CRT heap (std::map, std::vector, std::string).
+    // Instead, always query the OS. The first call is during the mapped image's CRT init, so it
+    // will almost always be the first call.
+    wchar_t path[32768];
+    const DWORD length = GetModuleFileNameW(module, path, static_cast<DWORD>(std::size(path)));
+    if (!length) return {};
+    return module_name(narrow(path));
 }
 
 }  // namespace

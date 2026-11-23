@@ -108,6 +108,10 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/file_system.cpp
     shims/winhttp_offline.cpp
     shims/xmem.cpp
+    shims/chad.cpp
+    shims/xapu.cpp
+    shims/xg_xs.cpp
+    shims/acphal.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp

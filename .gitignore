@@ -25,6 +25,7 @@ carve/
 # ---- build output and caches ----
 build/
 build-*/
+.xwin-cache/
 bin/
 obj/
 __pycache__/
