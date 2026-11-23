@@ -105,7 +105,14 @@ int compare_cases(const std::vector<Case>& ours, const std::vector<Case>& host, 
     for (size_t i = 0; i < ours.size() && i < host.size(); ++i) {
         const D3D12_HEAP_DESC& a = ours[i].desc;
         const D3D12_HEAP_DESC& b = host[i].desc;
-        const bool same = ours[i].hr == host[i].hr && a.SizeInBytes == b.SizeInBytes && a.Alignment == b.Alignment &&
+        // The host's Alignment varies from run to run for the same allocation (64 KiB on some runs, 4 MiB on others,
+        // on an RX 9070 XT, an RTX 5090 and WARP; found in review), so it is not compared: the layer's must be 64 KiB
+        // for an opened heap, and the host's either of the two.
+        const bool alignment_ok =
+            !SUCCEEDED(ours[i].hr) ||
+            (a.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+             (b.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT || b.Alignment == 4ull * 1024 * 1024));
+        const bool same = ours[i].hr == host[i].hr && a.SizeInBytes == b.SizeInBytes && alignment_ok &&
                           a.Properties.Type == b.Properties.Type &&
                           a.Properties.CPUPageProperty == b.Properties.CPUPageProperty &&
                           a.Properties.MemoryPoolPreference == b.Properties.MemoryPoolPreference && a.Flags == b.Flags;
@@ -238,6 +245,36 @@ int check_title_placed_all(ID3D12Device* device) {
     failures += check_title_placed(device, "section view", view, size);
     UnmapViewOfFile(view);
     CloseHandle(section);
+
+    // Not imported: a write-combined range (an RTX 5090 imported it but read wrong bytes back, found in review)
+    // falls back to an ordinary buffer, so the resource exists but is not at the pages' address; a range only partly
+    // committed is E_INVALIDARG.
+    const char* who = "vulkan slot-133 buffer";
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* combined = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE);
+    EXPECT(combined != nullptr);
+    {
+        Ref<ID3D12Resource> fallback;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, combined, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
+        EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(combined));
+    }
+    VirtualFree(combined, 0, MEM_RELEASE);
+    char* partial = static_cast<char*>(VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE));
+    EXPECT(partial != nullptr && VirtualAlloc(partial, size / 2, MEM_COMMIT, PAGE_READWRITE) == partial);
+    {
+        Ref<ID3D12Resource> refused;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, partial, desc, IID_PPV_ARGS(&refused.p)),
+                  E_INVALIDARG);
+        EXPECT(refused.p == nullptr);
+    }
+    VirtualFree(partial, 0, MEM_RELEASE);
+    std::printf("%s: a write-combined range falls back to an ordinary buffer, a partly committed one is refused\n",
+                who);
     return failures;
 }
 

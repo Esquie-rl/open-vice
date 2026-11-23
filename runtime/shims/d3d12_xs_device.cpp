@@ -2894,7 +2894,9 @@ HRESULT proxy_create_buffer_at_va(DeviceProxy* self, void* va, const D3D12_RESOU
     if (!out || !xbox_desc || !riid) return E_POINTER;
     // An integer mask: a D3D12_RESOURCE_FLAGS constant past the SDK's last enumerator is not a constant expression
     // for clang-cl with SDK 10.0.26100 (found in review). The cast is applied to the masked value at run time.
-    constexpr std::uint32_t kPcResourceFlags = 0x7ff;
+    // The PC flags up to RAYTRACING_ACCELERATION_STRUCTURE (0x100) and USE_TIGHT_ALIGNMENT (0x400); 0x200 is
+    // dropped, as committed_resource_refusal says the host refuses it (found in review).
+    constexpr std::uint32_t kPcResourceFlags = 0x5ff;
     D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
