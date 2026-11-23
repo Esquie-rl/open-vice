@@ -90,7 +90,9 @@ struct Planes {
 
 // Clears a 4x target with three overlapping values and the 1x destination to values none of them have, resolves
 // `c` and reads every plane of the destination back. A list whose Close fails is executed only when `run_invalid`
-// (the layer runs what it recorded; the host runtime must not be given such a list).
+// (the host runtime must not be given such a list). The layer refuses a whole batch holding such a list (#6610), so
+// a refused list runs between a list of the same clears and a list that reads the destination back: a refused
+// resolve is checked against the destination the clears left.
 bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run_invalid,
                       const EdgeDraw* edge = nullptr) {
     Ref<ID3D12CommandQueue> queue;
@@ -146,11 +148,6 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     device->CreateDepthStencilView(target.p, &view, target_view);
     const auto flags = static_cast<D3D12_CLEAR_FLAGS>(D3D12_CLEAR_FLAG_DEPTH | (c.stencil ? D3D12_CLEAR_FLAG_STENCIL : 0));
-    // No 0.5: it is a 24-bit rounding tie that drivers break differently (docs/d3d12_vulkan.md, D24 clears).
-    list->ClearDepthStencilView(source_view, flags, 0.25f, 0x11, 0, nullptr);
-    list->ClearDepthStencilView(source_view, flags, 0.75f, 0x22, 1, &clear_a);
-    list->ClearDepthStencilView(source_view, flags, 1.0f, 0x33, 1, &clear_b);
-    list->ClearDepthStencilView(target_view, flags, 0.0f, 0x5a, 0, nullptr);
     Ref<ID3D12RootSignature> root;
     Ref<ID3D12PipelineState> pso;
     if (c.edge) {
@@ -175,17 +172,27 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
         pd.DSVFormat = c.view ? c.view : c.format;
         pd.SampleDesc = {4, 0};
         CHECK(SUCCEEDED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p))));
+    }
+    // The clears, then the edge draw over the source.
+    const auto prepare = [&](ID3D12GraphicsCommandList* l) {
+        // No 0.5: it is a 24-bit rounding tie that drivers break differently (docs/d3d12_vulkan.md, D24 clears).
+        l->ClearDepthStencilView(source_view, flags, 0.25f, 0x11, 0, nullptr);
+        l->ClearDepthStencilView(source_view, flags, 0.75f, 0x22, 1, &clear_a);
+        l->ClearDepthStencilView(source_view, flags, 1.0f, 0x33, 1, &clear_b);
+        l->ClearDepthStencilView(target_view, flags, 0.0f, 0x5a, 0, nullptr);
+        if (!c.edge) return;
         const D3D12_VIEWPORT viewport{0, 0, float(width), float(height), 0, 1};
         const D3D12_RECT scissor{0, 0, LONG(width), LONG(height)};
-        list->SetGraphicsRootSignature(root.p);
-        list->SetPipelineState(pso.p);
-        list->OMSetRenderTargets(0, nullptr, FALSE, &source_view);
-        list->OMSetStencilRef(0x44);
-        list->RSSetViewports(1, &viewport);
-        list->RSSetScissorRects(1, &scissor);
-        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        list->DrawInstanced(3, 1, 0, 0);
-    }
+        l->SetGraphicsRootSignature(root.p);
+        l->SetPipelineState(pso.p);
+        l->OMSetRenderTargets(0, nullptr, FALSE, &source_view);
+        l->OMSetStencilRef(0x44);
+        l->RSSetViewports(1, &viewport);
+        l->RSSetScissorRects(1, &scissor);
+        l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        l->DrawInstanced(3, 1, 0, 0);
+    };
+    prepare(list.p);
 
     D3D12_RESOURCE_BARRIER barriers[2]{};
     for (auto& barrier : barriers) {
@@ -206,27 +213,54 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     list->ResourceBarrier(1, &barriers[1]);
-    for (UINT i = 0; i < planes; ++i) {
-        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-        src.pResource = target.p;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex = i;
-        dst.pResource = readback.p;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint = placed[i];
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    }
+    const auto copy_out = [&](ID3D12GraphicsCommandList* l) {
+        for (UINT i = 0; i < planes; ++i) {
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.pResource = target.p;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = i;
+            dst.pResource = readback.p;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = placed[i];
+            l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+    };
+    copy_out(list.p);
     out.close = list->Close();
     if (FAILED(out.close) && !run_invalid) return true;
-    ID3D12CommandList* lists[] = {list.p};
-    queue->ExecuteCommandLists(1, lists);
-    CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
-    Event event;
-    CHECK(event.handle);
-    CHECK(SUCCEEDED(fence->SetEventOnCompletion(1, event.handle)));
-    // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
-    // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
-    CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
+    UINT64 fence_value = 0;
+    const auto submit = [&](ID3D12GraphicsCommandList* l) -> bool {
+        ID3D12CommandList* lists[] = {l};
+        queue->ExecuteCommandLists(1, lists);
+        CHECK(SUCCEEDED(queue->Signal(fence.p, ++fence_value)));
+        Event event;
+        CHECK(event.handle);
+        CHECK(SUCCEEDED(fence->SetEventOnCompletion(fence_value, event.handle)));
+        // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
+        // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
+        CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
+        return true;
+    };
+    if (SUCCEEDED(out.close)) {
+        CHECK(submit(list.p));
+    } else {
+        // The refused list runs none of its commands (#6610): the clears go before it and the copies after it.
+        Ref<ID3D12CommandAllocator> side_allocator;
+        Ref<ID3D12GraphicsCommandList> side;
+        CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                       IID_PPV_ARGS(&side_allocator.p))));
+        CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, side_allocator.p, nullptr,
+                                                 IID_PPV_ARGS(&side.p))));
+        prepare(side.p);
+        CHECK(SUCCEEDED(side->Close()));
+        CHECK(submit(side.p) && submit(list.p));
+        CHECK(SUCCEEDED(side_allocator->Reset()) && SUCCEEDED(side->Reset(side_allocator.p, nullptr)));
+        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;  // the refused barriers did not run
+        side->ResourceBarrier(1, &barriers[1]);
+        copy_out(side.p);
+        CHECK(SUCCEEDED(side->Close()));
+        CHECK(submit(side.p));
+    }
     void* mapped = nullptr;
     const D3D12_RANGE range{0, SIZE_T(total)};
     CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
