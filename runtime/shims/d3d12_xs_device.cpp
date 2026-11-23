@@ -253,7 +253,7 @@ const char* slot_name(unsigned slot) {
         case 24: return "CopyDescriptorsSimple (CPU handles translated)";
         case 25: return "GetResourceAllocationInfo (C or PC form)";
         case 26: return "GetCustomHeapProperties (C or PC form)";
-        case 27: return "CreateCommittedResource (PC slot 27)";
+        case 27: return "CreateCommittedResource (initial state mapped)";
         case 31: return "CreateSharedHandle (proxies unwrapped)";
         case 32: return "OpenSharedHandle (a fence comes back wrapped)";
         case 34: return "MakeResident (proxies unwrapped)";
@@ -265,6 +265,7 @@ const char* slot_name(unsigned slot) {
         case 46: return "SetResidencyPriority (proxies unwrapped)";
         case 48: return "Xbox CreateCommandQueueX (32-byte desc) -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+        case 53: return "CreateCommittedResource1 (initial state mapped)";
         case 56: return "GetResourceAllocationInfo1 (C or PC form)";
         case 61: return "Xbox CreateSamplerX -> PC CreateSampler";
         case 62: return "Xbox CreateComputePipelineState";
@@ -2669,6 +2670,45 @@ void lease_title_resource_memory(DeviceProxy* self, void* created, const D3D12_R
                      static_cast<unsigned long long>(size));
 }
 
+// The console creates its render-target and depth textures with initial state 0x6; the PC runtime refuses that state
+// for a texture (reported by rafaelpssz from a retail exe integration run). A texture whose flags name the use gets
+// that use's state: ALLOW_RENDER_TARGET -> RENDER_TARGET, ALLOW_DEPTH_STENCIL -> DEPTH_WRITE. Every other state and
+// every buffer goes on unchanged. The description is only read; the title's words are never written.
+constexpr std::uint32_t kConsoleTextureInitialState = 0x6;
+
+std::uint64_t pc_initial_state_word(std::uint64_t desc_word, std::uint64_t state_word) {
+    if (static_cast<std::uint32_t>(state_word) != kConsoleTextureInitialState || !desc_word) return state_word;
+    const auto* desc = reinterpret_cast<const D3D12_RESOURCE_DESC*>(desc_word);
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return state_word;
+    if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) return D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    return state_word;
+}
+
+D3D12_RESOURCE_STATES pc_initial_state(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state) {
+    return static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(
+        pc_initial_state_word(reinterpret_cast<std::uint64_t>(desc), static_cast<std::uint32_t>(state))));
+}
+
+// Device slots 27 CreateCommittedResource(props, heap_flags, desc, state, clear, riid, out) and 53
+// CreateCommittedResource1 (a protected session before riid): the PC call with the initial state mapped above. The PC
+// method is called by its table entry with the caller's words, so a null riid or output reaches the real device as it did.
+template <unsigned Slot>
+std::uint64_t proxy_create_committed_resource(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                              std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
+                                              std::uint64_t a8) {
+    const std::uint64_t state = pc_initial_state_word(a3, a4);
+    if constexpr (Slot == 27) {
+        using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                          std::uint64_t, std::uint64_t, std::uint64_t);
+        return reinterpret_cast<Fn>(self->real_vtable[27])(self->real, a1, a2, a3, state, a5, a6, a7);
+    } else {
+        using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                          std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+        return reinterpret_cast<Fn>(self->real_vtable[53])(self->real, a1, a2, a3, state, a5, a6, a7, a8);
+    }
+}
+
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
                               D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
                               D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
@@ -2693,8 +2733,9 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                      "[rt] d3d12_xs: slot 76 resource: dimension=%d xbox layout=0x%x -> PC layout=0x%x\n",
                      static_cast<int>(pc_desc.Dimension), xbox_layout, static_cast<unsigned>(pc_desc.Layout));
     }
-    const HRESULT hr = self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, initial_state,
-                                                           clear_value, *riid, out);
+    const HRESULT hr = self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc,
+                                                           pc_initial_state(&pc_desc, initial_state), clear_value,
+                                                           *riid, out);
     if (SUCCEEDED(hr)) lease_title_resource_memory(self, *out, pc_desc);
     return hr;
 }
@@ -3188,7 +3229,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         std::uint64_t routed = 0;
         if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
-
+        if constexpr (Slot == 27 || Slot == 53) {
+            return proxy_create_committed_resource<Slot>(self, a1, a2, a3, a4, a5, a6, a7, a8);
+        } else {
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
         // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
         using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
@@ -3197,6 +3240,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                  std::uint64_t, std::uint64_t, std::uint64_t);
         auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
         return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+        }
     }
 }
 
@@ -3480,9 +3524,10 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 26) || slot == 31 ||
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 27) || slot == 31 ||
         slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 ||
-        slot == 56 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 74 || slot == 75 || slot == 76 ||
+        slot == 53 || slot == 56 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 74 || slot == 75 ||
+        slot == 76 ||
         slot == 86 || slot == 101 || slot == 108 || slot == kCreateCommittedResource3X || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();

@@ -102,6 +102,8 @@ struct Mock {
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
     D3D12_COMMAND_QUEUE_DESC queue_desc;  // device: the description of its last CreateCommandQueue (slot 8)
     IUnknown* held;                      // ID3D12Object::SetPrivateDataInterface (slot 5): one reference, until destroyed
+    std::uint64_t tail[kMockSlots][3];   // device slots 27/53: the words after the fifth (a6..a8), as received
+    bool words_only;                     // device slot 27: record the words and return S_OK, creating nothing
 };
 
 Mock g_pool[256];
@@ -433,7 +435,11 @@ HRESULT WINAPI mock_create_committed_resource(Mock* self, const D3D12_HEAP_PROPE
                                     reinterpret_cast<std::uint64_t>(desc), static_cast<std::uint64_t>(state),
                                     reinterpret_cast<std::uint64_t>(clear), reinterpret_cast<std::uint64_t>(riid)};
     std::memcpy(self->args[27], words, 5 * sizeof(words[0]));
+    const std::uint64_t rest[3] = {reinterpret_cast<std::uint64_t>(riid), reinterpret_cast<std::uint64_t>(out), 0};
+    std::memcpy(self->tail[27], rest, sizeof(rest));
     if (self->kind != Kind::device) return static_cast<HRESULT>(mock_call(self, 27, words));
+    // The initial-state checks pass made-up words for the clear value, riid and output: nothing is read or created.
+    if (self->words_only) return S_OK;
     g_committed = CommittedCall{};
     if (heap) g_committed.heap = *heap;
     g_committed.heap_flags = heap_flags;
@@ -479,6 +485,20 @@ HRESULT WINAPI mock_create_committed_resource3(Mock* self, const D3D12_HEAP_PROP
 }
 #endif
 
+// PC CreateCommittedResource (27) and CreateCommittedResource1 (53) take seven and eight words after `this`; the generic
+// thunk keeps five, so these two record the rest as well (a6..a8 in tail).
+template <unsigned Slot>
+std::uint64_t WINAPI mock_committed_resource(Mock* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                             std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
+                                             std::uint64_t a8) {
+    ++self->calls[Slot];
+    const std::uint64_t head[] = {a1, a2, a3, a4, a5};
+    const std::uint64_t rest[] = {a6, a7, a8};
+    std::memcpy(self->args[Slot], head, sizeof(head));
+    std::memcpy(self->tail[Slot], rest, sizeof(rest));
+    return S_OK;
+}
+
 template <std::size_t... I>
 void fill_mock_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&mock_slot<static_cast<unsigned>(I)>)), ...);
@@ -493,6 +513,7 @@ void** mock_vtable() {
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
         table[76] = reinterpret_cast<void*>(&mock_create_committed_resource3);
 #endif
+        table[53] = reinterpret_cast<void*>(&mock_committed_resource<53>);
         return true;
     }();
     (void)filled;
@@ -576,6 +597,9 @@ unsigned long release(void* object) {
 }
 
 // ---- 1. Device interface levels ----
+
+// D3D12_RESOURCE_STATES is a 32-bit enum: MSVC stores only the low half of its 8-byte stack slot.
+std::uint32_t state_of(std::uint64_t word) { return static_cast<std::uint32_t>(word); }
 
 int check_levels() {
     struct Level { int level; unsigned slots; } const levels[] = {{0, 44}, {1, 47}, {3, 51}, {9, 76}};
@@ -1611,6 +1635,84 @@ int check_xbox_slots() {
 #endif
 }
 
+// ---- 7b. Console initial state 0x6 on a committed texture (slots 27, 53 and 76) ----
+//
+// The console creates render-target and depth textures with state 0x6, which the PC runtime refuses for a texture. The
+// mock device records the state it was given (slot 27's fourth word, a4 in args[27][3] / args[53][3]).
+D3D12_RESOURCE_DESC resource_desc(D3D12_RESOURCE_DIMENSION dimension, D3D12_RESOURCE_FLAGS flags) {
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = dimension;
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = flags;
+    return desc;
+}
+
+std::uint64_t raw8(const void* object, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                   std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7, std::uint64_t a8 = 0) {
+    void* const* vtable = *reinterpret_cast<void* const* const*>(object);
+    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, a6, a7, a8, 0, 0, 0,
+                                                  0, 0, 0);
+}
+
+int check_committed_resource_states() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device && xs::device_proxy_slot_count(device) == 76);
+    mock->words_only = true;  // slot 27 has the creating mock entry (slots 76/133 need it); here only the words count
+    const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_RESOURCE_DESC rt = resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    const D3D12_RESOURCE_DESC ds = resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    const D3D12_RESOURCE_DESC plain = resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_NONE);
+    const D3D12_RESOURCE_DESC buffer = resource_desc(D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    const std::uint64_t kConsole = 0x6;
+    const std::uint64_t kRender = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    const std::uint64_t kDepth = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+
+    // Slot 27 (the title's CreateCommittedResource) and slot 53 (CreateCommittedResource1): the real device sees
+    // the mapped state; the description and the other words arrive as they were.
+    // The words after the state (clear value, protected session, riid, out) are distinct, so their positions show.
+    for (const unsigned slot : {27u, 53u}) {
+        const std::uint64_t before = mock->calls[slot];
+        const std::uint64_t clear = 0xC1EA, session = 0x5E55, riid = 0x41D, out = 0x0B7;
+        const std::uint64_t first = slot == 27 ? riid : session;
+        EXPECT(hr_of(raw8(device, slot, word(&props), 0x40, word(&rt), kConsole, clear, first, slot == 27 ? out : riid,
+                          slot == 27 ? 0 : out)) == S_OK);
+        EXPECT(mock->args[slot][1] == 0x40 && mock->args[slot][4] == clear);
+        EXPECT(mock->tail[slot][0] == first && mock->tail[slot][1] == (slot == 27 ? out : riid));
+        EXPECT(slot == 27 || mock->tail[slot][2] == out);
+        EXPECT(mock->calls[slot] == before + 1 && state_of(mock->args[slot][3]) == kRender);
+        EXPECT(mock->args[slot][0] == word(&props) && mock->args[slot][2] == word(&rt));
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&ds), kConsole)) == S_OK);
+        EXPECT(state_of(mock->args[slot][3]) == kDepth);
+        // Left alone: a buffer with 0x6, a render target with state 0, a texture without a use flag, any other state.
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&buffer), kConsole)) == S_OK && state_of(mock->args[slot][3]) == kConsole);
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt), 0)) == S_OK && state_of(mock->args[slot][3]) == 0);
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&plain), kConsole)) == S_OK && state_of(mock->args[slot][3]) == kConsole);
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt), 0x4)) == S_OK && state_of(mock->args[slot][3]) == 0x4);
+    }
+    EXPECT(rt.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET && ds.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+
+    // Slot 76 (the Xbox resource creation) reaches the PC device's slot 27 with the same mapping.
+    const IID resource_iid = __uuidof(ID3D12Resource);
+    void* resource = nullptr;
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&rt), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
+    EXPECT(state_of(mock->args[27][3]) == kRender);
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&ds), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
+    EXPECT(state_of(mock->args[27][3]) == kDepth);
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&buffer), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
+    EXPECT(state_of(mock->args[27][3]) == kConsole);
+
+    EXPECT(xs::device_slot_overridden(27) && xs::device_slot_overridden(53));
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: committed textures with state 0x6 reach the PC device as RENDER_TARGET or DEPTH_WRITE; buffers and "
+                "other states are unchanged\n", g_label);
+    return 0;
+}
+
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
 
 int run_env_slots(bool valid, bool on_slot70 = false, bool on_slot74 = false) {
@@ -2449,7 +2551,7 @@ int main(int argc, char** argv) {
         check_allocation_descriptions_cleaned() || check_render_target_layout() || check_xbox_slots() || check_lists() ||
         check_signalx_detection() || check_list_tail_names() || check_custom_heap_properties() ||
         check_descriptor_heap_hooks() || check_slot70() || check_slot74() || check_committed_resource3_x() ||
-        check_committed_resource_leases())
+        check_committed_resource_leases() || check_committed_resource_states())
         return 1;
     if (check_placed_resource_x()) return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
