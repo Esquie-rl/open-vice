@@ -77,7 +77,11 @@ def find_guarded_texel_block(spv):
     """Verify every OpImageTexelPointer sits inside a basic block entered via an OpSelectionMerge
     conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions."""
     blocks = parse_blocks(spv)
+    # The active-lane value: a load of %active, a value just stored to it (the translator caches the block's active
+    # value instead of reloading it, #4473), or the constant %true where no lane can be inactive yet.
     active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
+    active_loads |= set(re.findall(r"^\s*OpStore %active (%\w+)\b", spv, re.M))
+    active_loads.add("%true")
     guarded_targets = set()
     for insns in blocks.values():
         for i, ln in enumerate(insns):
