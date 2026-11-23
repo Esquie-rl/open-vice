@@ -2290,63 +2290,6 @@ class Gen:
         self.emit(f"{res} = OpPhi %uint {val} {lbl_do} {self.cu(0)} {pre_label}")
         self.dst(vd, res)
 
-    BUFFER_STORE_SUB = {  # op: (bytes, VGPR half the data comes from)
-        "buffer_store_byte": (1, 0), "buffer_store_byte_d16_hi": (1, 1),
-        "buffer_store_short": (2, 0), "buffer_store_short_d16_hi": (2, 1),
-    }
-
-    def buffer_store_sub(self, op, a, mods):
-        """buffer_store_{byte,short}[_d16_hi] vD, vaddr, s[V#], soffset [offen|idxen] offset:N.
-        Stores the low 8 or 16 bits of vD (the _d16_hi forms take them from vD's high half) at the same
-        address as buffer_load_{u,s}byte/short (buffer_address with element size 1 or 2: the OOB_SELECT end check
-        covers the whole access, and an out-of-range or inactive lane writes nothing). Each byte is merged into its
-        dword with atomic and / or, as the 8/16-bit format stores and global_store_byte do, so neighbouring bytes (maybe
-        another lane's) are kept; a short at byte 3 of a dword puts its second byte in byte 0 of the next dword (the
-        next one in memory, or `step` bytes on in a scratch-swizzled buffer, as buffer_load_ushort reads it)."""
-        if any(m in mods for m in ("lds", "tfe", "d16")):
-            raise Unsupported(op + " form")
-        nbytes, half = self.BUFFER_STORE_SUB[op]
-        vd = a[0]
-        if vd["k"] != "vgpr" or vd.get("n", 1) != 1:
-            raise Unsupported(op + " data")
-        addr, _, in_b, step = self.buffer_address(a, mods, elem=nbytes)
-        data = self.load_reg("vgpr", vd["r"])
-        cond = self.tmp()
-        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {in_b}")
-        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
-        self.emit(f"OpSelectionMerge {lbl_end} None")
-        self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
-        self.emit(f"{lbl_do} = OpLabel")
-        alo, b3, b64, aligned, sh = (self.tmp() for _ in range(5))
-        self.emit(f"{alo} = OpUConvert %uint {addr}")
-        self.emit(f"{b3} = OpBitwiseAnd %uint {alo} {self.cu(3)}")
-        self.emit(f"{b64} = OpUConvert %ulong {b3}")
-        self.emit(f"{aligned} = OpISub %ulong {addr} {b64}")
-        self.emit(f"{sh} = OpShiftLeftLogical %uint {b3} {self.cu(3)}")
-        arr, host = self.tmp(), self.host_addr(aligned)
-        self.emit(f"{arr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
-        for k in range(nbytes):
-            if k == 0:
-                dword_ix, byte_sh = 0, sh
-            else:                              # byte 1 of a short: byte b3 + 1, in the next dword when b3 == 3
-                cross, dword_ix, nb3, byte_sh = (self.tmp() for _ in range(4))
-                self.emit(f"{cross} = OpIEqual %bool {b3} {self.cu(3)}")
-                self.emit(f"{dword_ix} = OpSelect %uint {cross} {self.cu(1)} {self.cu(0)}")
-                self.emit(f"{nb3} = OpIAdd %uint {b3} {self.cu(1)}")
-                nb3m = self.tmp()
-                self.emit(f"{nb3m} = OpBitwiseAnd %uint {nb3} {self.cu(3)}")
-                self.emit(f"{byte_sh} = OpShiftLeftLogical %uint {nb3m} {self.cu(3)}")
-            p = self.buf_dword_ptr(arr, host, step, dword_ix)
-            byte, mk, inv, vs, t1, t2 = (self.tmp() for _ in range(6))
-            self.emit(f"{byte} = OpBitFieldUExtract %uint {data} {self.cu(16 * half + 8 * k)} {self.cu(8)}")
-            self.emit(f"{mk} = OpShiftLeftLogical %uint {self.cu(0xFF)} {byte_sh}")
-            self.emit(f"{inv} = OpNot %uint {mk}")
-            self.emit(f"{vs} = OpShiftLeftLogical %uint {byte} {byte_sh}")
-            self.emit(f"{t1} = OpAtomicAnd %uint {p} {self.cu(1)} {self.cu(0)} {inv}")
-            self.emit(f"{t2} = OpAtomicOr %uint {p} {self.cu(1)} {self.cu(0)} {vs}")
-        self.emit(f"OpBranch {lbl_end}")
-        self.emit(f"{lbl_end} = OpLabel")
-
     # GFX10 buffer formats (from Mesa src/amd/registers/gfx10-rsrc.json, GFX10_FORMAT):
     #   code: (bytes, kind, component bit widths from bit 0)
     # The names list the widths from the top bit down, so 2_10_10_10 (50) is R10G10B10A2.
@@ -8076,8 +8019,6 @@ class Gen:
             self.buffer_load(op, a, mods)
         elif op in self.BUFFER_SUB:
             self.buffer_load_sub(op, a, mods)
-        elif op in self.BUFFER_STORE_SUB:
-            self.buffer_store_sub(op, a, mods)
         elif op in ("buffer_load_format_x", "buffer_load_format_xy", "buffer_load_format_xyz",
                     "buffer_load_format_xyzw", "buffer_load_format_d16_x", "buffer_load_format_d16_xy",
                     "buffer_load_format_d16_xyz", "buffer_load_format_d16_xyzw"):
