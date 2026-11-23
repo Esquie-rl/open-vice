@@ -7,8 +7,9 @@ hold counts, offsets, chunk names and module identifiers.
 
 ## 1. Why they matter
 
-`make_game.py`'s `shaders` stage carves `shaders.rpf` only (`make_game.py`:655). Two DLLs in the same package
-carry compute programs of their own:
+`tools/shader_carve.py` carves `shaders.rpf` only. Two DLLs in the same package carry compute programs of their
+own, and `make_game.py`'s `shaders` stage translates both sets after the game's shaders (section 7 for the
+builder, [fspx.md](fspx.md) for FidelityFX):
 
 * `XboxBvhBuilder.dll`, Microsoft's XDXR acceleration-structure builder. Its constructor creates compute PSOs
   through device slot 62, and the builder is on the critical path for ray tracing.
@@ -177,6 +178,8 @@ python -I tools/shader_disasm.py <work>/embedded/dxbc/fssm --out <work>/embedded
 python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/spirv
 ```
 
+`make_game.py` runs the same four tools as a build step (section 7).
+
 ## 5. What this changes
 
 * **The RT builder does not need a DXIL path for the console code.** Its programs are RDNA2 `FSSM`, and 51 of
@@ -212,7 +215,8 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
   * the wave64 bitonic sorts (`BitonicPreSort64CS`, `BitonicInnerSort64CS`) declare 32,780 bytes of workgroup memory
     with the translator's default cap, 12 over the 32 KiB AMD's Windows driver allows
     (`VUID-RuntimeSpirv-Workgroup-06530`). Their highest LDS offset is 8192, and `--max-shared-memory 32768` shrinks
-    the array to what they use;
+    the array to what they use. That was before SHADER-579 moved the barrier-round counts into the LDS array: today
+    both declare 32,768 bytes with the default cap, and section 7 has what the cap still changes;
   * with every table word 0 instead, the descriptors point at the table itself, and `RadixCount` then writes into the
     table that other waves are reading, so its output differs between runs. That is the test input, not the
     translator; the tool's default avoids it.
@@ -236,3 +240,95 @@ container only when the chunk table is sorted, 4-byte aligned, entirely inside t
 chunk ends exactly at that total; that is what rejects the FSR DLL's `DXBC` immediate. The synthetic tests in
 `tests/test_pe_shader_containers.py` build containers by hand (no game data) and cover the accepted layout, a
 bare magic, a truncated chunk, an `ACCC`/`FSPX` container, the `ILDN` name and the extraction index.
+
+## 7. Build step and run-time lookup
+
+**Build (D3D-557).** `make_game.py`'s `shaders` stage, after the game's own shaders and the FidelityFX step, runs
+`bvh_shaders()` on the package's `XboxBvhBuilder.dll`. It is the recipe of section 4, with the extraction index
+passed along so that each tool reads only what the one before it wrote:
+
+```sh
+python -I tools/pe_shader_containers.py <game>/XboxBvhBuilder.dll --extract <work>/shaders/bvh
+python -I tools/fssm_unpack.py <work>/shaders/bvh --carve-index <work>/shaders/bvh/index.json
+python -I tools/shader_disasm.py <work>/shaders/bvh/fssm --unpack-index <work>/shaders/bvh/fssm_index.json --out <work>/shaders/bvh/disasm --mcpu gfx1013
+python -I tools/rdna2spirv.py <work>/shaders/bvh/disasm --out <work>/shaders/spirv/bvh --no-asm --max-shared-memory 32768
+```
+
+The last line also gets `--wave64-emulate` and the fallback flags of the build, like the game's shaders.
+
+* **The key is the game shaders' key.** The programs are `FSSM` (section 4), so each index entry gets
+  `fssm_sha256`, the SHA-256 of the blob `fssm_unpack.py` inflates from the container's `XBCH` record. That is what
+  the runtime computes from the container the DLL passes to slot 62, as it does for a shader of `shaders.rpf`. No
+  second key or name table was added. The 52 blobs are 52 different programs, and none of them is in a translated
+  1.0.2.1 corpus of `shaders.rpf` (0 of 52 hashes among its 26,501 index entries), so the two indexes do not meet;
+  if a program were in both, both entries would be candidates, the game's first.
+* **One folder, redone as a whole.** The step is reused only when both indexes, every module the translation index
+  names and a matching `bvh_build.json` (written last) are there. It runs again when the DLL, one of the three
+  tools before the translator, the translator, `llvm-mc`, the wave64 mode, the flags or the memory cap change, and
+  it never makes the game's shaders translate again. Before it runs, it removes the containers, blobs, listings and modules of the run before:
+  `pe_shader_containers.py` never overwrites a container, so a second extraction into the same folder would write
+  `<module>_NN.dxbc` beside the first and those would be translated as more programs. A package without the DLL
+  skips the step.
+* **A program without a rule is reported, not skipped.** There is no skip list. After the translation the step
+  compares the extraction index with the translation index and logs the counts and the name of every program the
+  runtime cannot find (no entry with an `fssm_sha256`, which includes an entry whose metadata failed). It logs them
+  on every run, also when the step is reused. Today that is one line: 51 of 52, `Box16Rehydration`
+  (`buffer_store_short`, #1864). The other 51 are published. When no program translates the step fails and keeps
+  no index.
+* **`--max-shared-memory 32768`.** The constructor creates a pipeline for every program and throws at the first
+  failure, and the runtime refuses a module over the device's `maxComputeSharedMemorySize` (`E_NOTIMPL`,
+  [design.md](design.md), "Workgroup memory limit"). 32,768 is what the AMD Windows and Intel drivers report.
+  Measured on `main` `3faac557`, by `lds_bytes` and by comparing the modules byte for byte:
+
+  | translation | default cap (65,536) | `--max-shared-memory 32768` |
+  |---|---|---|
+  | native | largest 32,768 B (`BitonicPreSort64CS`, `BitonicInnerSort64CS`, `RadixAlloc`), none over | all 51 modules identical |
+  | `--wave64-emulate` | `RadixAlloc` 37,084 B, the others at most 32,768 B | `RadixAlloc` 22,236 B, the other 50 modules identical |
+
+  So the cap changes one module, and only in an emulated build; the same 51 programs translate with and without
+  it. Without it that build stops on a 32,768-byte device at creation #29: measured on the Radeon below with the
+  emulated modules made at the default cap, `RadixAlloc` is refused (`declares 37084 bytes of workgroup memory`,
+  `0x80004001`) after 28 creations.
+
+**Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json`, then
+`<dir>/fspx/index.json` and `<dir>/bvh/index.json` when they are there. The builder's entries are named
+`bvh/<name>`, the path of their module below `<dir>`, and go into the table of the game's shaders, so
+`create_compute` finds them through the lookup it already had (`compute_program()` gives an `FSSM` program, looked up
+by `(cs, fssm_sha256)`). A missing or unreadable `bvh/index.json` leaves the other indexes loaded, and the main
+index is still required. `bvh_size()` counts the entries, which `shader_library_corpus_test` leaves out of the
+entries a carved container must reach, like the FSPX ones.
+
+**Measured: `LEONIDA_BVH_DEVICE=vulkan bvh_builder_test`** (package 1.0.2.1, `LEONIDA_BVH_RECORD62=1`,
+`LEONIDA_SHADERS` on a folder holding this step's output and an empty main index, since only this step was run).
+Before the step, on `main` `3faac557`, creation #1 failed on both GPUs: `0x80004005` with no library, `0x80070057`
+with a translated corpus of 26,521 entries, none of them the builder's.
+
+| GPU | translation | result |
+|---|---|---|
+| RTX 3070, NVIDIA 610.74 (subgroups 32..32, limit 49,152) | `--wave64-emulate` | 49 of 50 creations `S_OK`; #50 `Box16Rehydration` has no module, `E_INVALIDARG`, and the constructor throws `0x80070057` |
+| same | native | the same 49 of 50; the runtime warns that this device cannot require 64-wide subgroups |
+| Radeon integrated (Ryzen 7 9700X), AMD 32.0.21042.62 (subgroups 32..64, limit 32,768) | `--wave64-emulate` | 49 of 50 `S_OK`, stops at #50 the same way |
+| same | native | 48 creations `S_OK`; #49 `LeafRehydration` did not come back from the driver's pipeline compile in 16 minutes, and the run was stopped there |
+
+With #1864's translator change applied to a local copy of the tools (not part of this step), 52 of 52 translate
+and pass `spirv-val`, and with the emulated modules all 53 creations return `S_OK` on both GPUs: the constructor
+and the destructor return and the test passes. So with the emulated modules the one thing between this step and a
+constructed builder on the Vulkan device is `buffer_store_short`. The PC-device run of the test (WARP) is
+unchanged: 53 of 53.
+
+The Radeon's native stop is that driver's compile time for one module, not the lookup. `vk_pipeline_check` creates
+the same pipelines without the D3D12 layer: all 51 on the RTX 3070 (native and emulated) and on the Radeon
+(emulated), and on the Radeon with the native modules 50 of 51, while `LeafRehydration`, a 1.66 MB wave64 module
+that asks for 64-wide subgroups, was still compiling when the check was stopped after 15 minutes. The same
+program's emulated module is created in 12 s on that driver, and its native module in 11 s on the RTX 3070. Why the
+native module costs the AMD compiler that much has not been looked into.
+
+Still open: nothing has dispatched one of these pipelines through the D3D12 layer, so this shows that the
+constructor's pipelines are created, not that a build produces the right tree (section 5).
+
+`tests/test_bvh_shaders_stage.py` runs the step on a synthetic DLL (hand-built containers around a made-up `FSSM`
+blob, no game data): the key the extracted layout gives the translator, the tools and arguments, reuse and each
+reason to run again, a second run that leaves no duplicate containers, the report of an untranslated program on
+every run and the failure when nothing translates. `shader_library_test` covers the `bvh/` index (found by the
+container's program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test`
+creates a pipeline through slot 62 whose only translation is in `<shaders>/bvh/index.json`.
