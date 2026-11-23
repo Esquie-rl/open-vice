@@ -1952,7 +1952,26 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     auto* allocator = allocator_proxy_real_allocator(reinterpret_cast<void*>(allocator_word));
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
-    return self->real->CreateCommandList(0, type, allocator, initial_state, *riid, out);
+    // local (retail boot chain, stop 9): the retail title asks for a console command-list IID that is not in the PC
+    // SDK. Create a PC graphics list and hand out the console-shaped list proxy (#2490) for it.
+    void* created = nullptr;
+    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
+                                                     __uuidof(ID3D12GraphicsCommandList), &created);
+    if (FAILED(hr)) return hr;
+    if (!created) return E_FAIL;
+    if (!self->console_lists) {
+        *out = created;
+        return S_OK;
+    }
+    const IID* want = riid;
+    if (!is_list_iid(*riid)) {
+        static std::atomic<bool> iid_logged{false};
+        if (first_call(iid_logged))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 73 asks for a list IID outside the PC SDK; answering with the "
+                                 "console list proxy\n");
+        want = &__uuidof(ID3D12GraphicsCommandList);
+    }
+    return wrap_list(static_cast<IUnknown*>(created), self, want, out);
 }
 
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
@@ -2339,8 +2358,29 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         }
         if (Slot == routes.queue_x) {
             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
-                                                        reinterpret_cast<const IID*>(a2),
+            // local (retail boot chain, stop 8): the Xbox desc is a PC D3D12_COMMAND_QUEUE_DESC prefix followed by
+            // Xbox words, and its Flags/Priority carry console bits the PC runtime refuses. Keep the PC prefix with
+            // the one PC flag, a PC priority and node 0.
+            const auto* xdesc = reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1);
+            D3D12_COMMAND_QUEUE_DESC pc{};
+            const D3D12_COMMAND_QUEUE_DESC* use = xdesc;
+            if (xdesc) {
+                pc = *xdesc;
+                pc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(pc.Flags & D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT);
+                if (pc.Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL && pc.Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH)
+                    pc.Priority = pc.Priority > D3D12_COMMAND_QUEUE_PRIORITY_NORMAL ? D3D12_COMMAND_QUEUE_PRIORITY_HIGH
+                                                                                     : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+                if (pc.NodeMask > 1) pc.NodeMask = 0;
+                if (pc.Flags != xdesc->Flags || pc.Priority != xdesc->Priority || pc.NodeMask != xdesc->NodeMask)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: CreateCommandQueueX type %d: flags 0x%x -> 0x%x, priority %d -> %d, "
+                                 "node 0x%x -> 0x%x\n",
+                                 static_cast<int>(xdesc->Type), static_cast<unsigned>(xdesc->Flags),
+                                 static_cast<unsigned>(pc.Flags), xdesc->Priority, pc.Priority, xdesc->NodeMask,
+                                 pc.NodeMask);
+                use = &pc;
+            }
+            return hr_to_u64(proxy_create_command_queue(self, use, reinterpret_cast<const IID*>(a2),
                                                         reinterpret_cast<void**>(a3)));
         }
         if (Slot == routes.list_x) {
