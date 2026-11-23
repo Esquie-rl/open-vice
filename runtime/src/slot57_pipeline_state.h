@@ -16,7 +16,10 @@
 //            118 (D16_UNORM_S8_UINT). Stencil is enabled only with the two formats that have stencil, bar 12 records.
 //     +0x25  the render-target count, equal to the number of non-zero format bytes in every record.
 //     +0x26  the primitive topology type: 3 (triangle) in 25,062 records, 2 (line) in one, and 19 in 408 vertex
-//            pipelines. 19 is not a D3D12_PRIMITIVE_TOPOLOGY_TYPE; what it draws is not known, so it is refused.
+//            pipelines. 19 is not a D3D12_PRIMITIVE_TOPOLOGY_TYPE: it is the console's rectangle-list PSO type, which
+//            the Vulkan device already builds (src/rect_list_geometry.h, docs/d3d12_vulkan.md "Console rectangle and
+//            quad lists"), so it is passed on as it is. ASSUMPTION: the library byte uses the same value space as the
+//            PSO type the title's PC-form descriptions carry; that 19 here means a rectangle list is not measured.
 //     +0x28  four words, (1, 0, 0, 0) in all but 21 distinct blobs. HYPOTHESIS: the sample description; the other
 //            form is refused.
 //     +0x04, +0x0c, +0x1c: 0x1000, 0 or 1, and 0xffffffff in all (0x0c has two other values in 6 records). Their
@@ -80,6 +83,8 @@ struct PipelineState {
 inline constexpr std::size_t kPipelineHeadBytes = 80;
 inline constexpr std::size_t kStateBlobMinBytes = 0x124;  // through +0x120, the last word checked
 inline constexpr std::uint32_t kVertexLayout = 4, kMeshLayout = 6;
+// The console's rectangle-list PSO topology type (leonida::topology_type_rect_list in src/rect_list_geometry.h).
+inline constexpr std::uint32_t kTopologyTypeRectList = 19;
 
 namespace detail {
 
@@ -155,8 +160,9 @@ inline bool decode_pipeline_head(std::span<const std::uint8_t> blob, PipelineSta
     out.render_targets = blob[0x25];
     if (out.render_targets != formats) return fail(why, "the render-target count is not the number of formats");
     const std::uint32_t topology = blob[0x26];
-    if (topology == 19) return fail(why, "topology type 19 is a console value whose primitive is not known");
-    if (topology < 1 || topology > 3) return fail(why, "the topology type is not point, line or triangle");
+    // ASSUMPTION (see the header comment): 19 is the console's rectangle-list type, topology_type_rect_list.
+    if ((topology < 1 || topology > 3) && topology != kTopologyTypeRectList)
+        return fail(why, "the topology type is not point, line, triangle or the console's rectangle list (19)");
     out.topology_type = topology;
     if (blob[0x27]) return fail(why, "the byte after the topology type is not 0 (unread state)");
     if (u32(blob, 0x28) != 1 || u32(blob, 0x2c) || u32(blob, 0x30) || u32(blob, 0x34))

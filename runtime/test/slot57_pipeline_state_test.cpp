@@ -2,6 +2,7 @@
 // into D3D12-level values, and the refusals for state the reading does not cover. No game data: every word below is
 // written here from the register layouts the header names.
 #include "../src/slot57_pipeline_state.h"
+#include "../src/rect_list_geometry.h"
 #include "slot57_fixture.h"
 
 #include <cstdio>
@@ -14,6 +15,9 @@
         return 1;                                                    \
     }                                                                \
 } while (0)
+
+// Topology type 19 is passed on as the rectangle-list type the Vulkan device builds (ASSUMPTION in the header).
+static_assert(leonida::slot57::kTopologyTypeRectList == leonida::topology_type_rect_list);
 
 namespace {
 
@@ -43,9 +47,14 @@ int main() {
         longer.resize(152, 0x41);
         CHECK(decode_pipeline_head(longer, s, &why));
         CHECK(s.render_targets == 0 && s.dsv_format == 118 && s.topology_type == 2);
+        // The console's topology type 19 (408 vertex records of 1.0.2.1, the title's first slot-57 calls among them)
+        // is the rectangle-list PSO type, passed on as it is.
+        CHECK(decode_pipeline_head(head({}, 55, 19), s, &why));
+        CHECK(s.topology_type == 19 && s.render_targets == 0 && s.dsv_format == 55);
     }
-    // Head refusals: too short, a count that is not the number of formats, a gap, the console topology value, the
-    // other sample form, and the words whose other values are not read.
+    // Head refusals: too short, a count that is not the number of formats, a gap, topology values that are neither
+    // D3D12 types nor the console's rectangle list, the other sample form, and the words whose other values are not
+    // read.
     {
         PipelineState s;
         const Bytes good = head({28}, 0);
@@ -57,7 +66,7 @@ int main() {
         bad[0x12] = 28;  // target 2 without target 1
         bad[0x25] = 2;
         CHECK(!decode_pipeline_head(bad, s, &why));
-        for (const std::uint8_t topology : {std::uint8_t(0), std::uint8_t(4), std::uint8_t(19)}) {
+        for (const std::uint8_t topology : {std::uint8_t(0), std::uint8_t(4), std::uint8_t(18), std::uint8_t(20)}) {
             bad = good;
             bad[0x26] = topology;
             CHECK(!decode_pipeline_head(bad, s, &why));

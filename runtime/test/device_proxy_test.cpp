@@ -774,8 +774,16 @@ int main(int argc, char** argv) {
             };
             const Bytes topology19 = pipeline_blob({28, 10}, 40, 19, {{"POSITION", 0, 16, 0, 0, 0, 0},
                                                                        {"COLOR", 0, 28, 0, 8, 0, 0}});
-            check(refused(desc(ia_root.Get(), state, topology19, ps_bytes, vs_bytes), E_NOTIMPL),
-                  "slot 57 refuses the console topology type 19 with E_NOTIMPL");
+            {
+                // Topology type 19 is the console's rectangle list, which the Vulkan device builds; the proxy hands it
+                // on instead of refusing it as unread state. The host runtime here has no such type, so the call is
+                // only checked to reach it (not E_NOTIMPL) and to keep the output consistent with the result.
+                Desc d19 = desc(ia_root.Get(), state, topology19, ps_bytes, vs_bytes);
+                ComPtr<ID3D12PipelineState> pso19;
+                const HRESULT hr19 = slot57(device.Get(), &d19, &iid_pso, reinterpret_cast<void**>(pso19.GetAddressOf()));
+                check(hr19 != E_NOTIMPL && SUCCEEDED(hr19) == (pso19 != nullptr),
+                      "slot 57 hands the console topology type 19 (rectangle list) on to the device");
+            }
             Bytes mesh_state = state;
             put(mesh_state, 0x004, 6u);
             check(refused(desc(ia_root.Get(), mesh_state, pipeline, ps_bytes, vs_bytes), E_NOTIMPL),
