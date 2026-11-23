@@ -229,6 +229,36 @@ with a blob holding the dword 0, so the DLL creates no compute scratch buffer; w
 Not done here: using kind 0 at run time beyond what the translated module already carries (its thread-group size
 and `RSRC2`).
 
+**Slot 57 (graphics).** The retail executable calls device slot 57 about 10,000 times during the boot, after the first
+slot-67 calls (exotiquee's finding in #8047). On `main` the proxy forwards it to the PC slot 57,
+`ID3D12Device5::CreateLifetimeTracker`, which refuses it; the riid it passes is not that interface's. Measured on
+Linux, Wine 11.22, RTX 3060 (driver 580.178.04), `main` plus the boot stack of #7154 and #7180 (the title fills these
+buffers from its DirectStorage zlib reads; without #7180 every blob is zero-filled and only the sizes below match),
+with a temporary probe over 10,000 calls (counts and sizes only):
+
+| Where in the description | What | Sizes over the 10,000 calls |
+|---|---|---|
+| `+0x00` | a pointer (the root signature, as at slot 67) | |
+| `+0x08`, `+0x10` | pair 0, a state blob | 380 B (103 calls), 388 (3,484), 396 (6,125), 404 (288); never empty |
+| `+0x18`, `+0x20` | pair 1 | 80 B (1,065), 120 (687), 152 (5,466), 156 (144), 188 (2,566), 224 (72); never empty |
+| `+0x28`, `+0x30` | pair 2, a program | 33 distinct sizes from 256 B to over 640 B (modes 448, 512, 576); **empty in 4 calls** |
+| `+0x38`, `+0x40` | pair 3, records | 17 distinct sizes, 48 B to over 240 B (modes 176 and 240); empty in the same 4 calls |
+| `+0x48`, `+0x50` | pair 4, a program | 10 distinct sizes from 320 B to 768 B (modes 448 to 704); never empty |
+| `+0x58`, `+0x60` | pair 5, records | 112 B in 8,853 calls, 176 B (1,126), 48 B (7), 240 B (4), 752 B (8), 496 B (1), 784 B (1) |
+
+The words after `+0x68` are zero. Pairs 2 and 4 are RDNA2 programs under the bare kind-6 rule above (a multiple of
+4 bytes, at least 36, prologue words 0, 3 and 6 with bits 31..16 = `0xD580`): **9,996 of the 9,996 non-empty pair-2
+blobs and 10,000 of 10,000 pair-4 blobs pass it**, and no blob of pairs 0, 1, 3 or 5 does. So the description reads
+as slot 67's (kind 0, kind 1, program, records) once, then a second (program, records), two programs per call with
+the first one optional.
+
+Hypotheses, not confirmed: pairs 0 and 1 are kind 0 and kind 1 of a graphics program; pairs 3 and 5 are kind-7
+records; the two programs are two stages of one graphics pipeline (which one is which is not measured). Not read: the
+380 to 404 B state blob (rasterizer, blend, depth and render-target state would have to come from it) and the 80 to
+224 B pair. Not done: a slot-57 handler. It needs the library's graphics programs translated and indexed by their
+kind-6 keys (`tools/shader_library.py` takes `--stages`; #7529 runs `cs` only) and the state blob decoded; without
+both a handler can only refuse.
+
 ## Translation status
 
 With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 programs (`main` at `aa2988cc` with the
