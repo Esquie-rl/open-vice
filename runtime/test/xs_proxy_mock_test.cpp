@@ -101,6 +101,7 @@ struct Mock {
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
     D3D12_COMMAND_QUEUE_DESC queue_desc;  // device: the description of its last CreateCommandQueue (slot 8)
+    IUnknown* held;                      // ID3D12Object::SetPrivateDataInterface (slot 5): one reference, until destroyed
 };
 
 Mock g_pool[256];
@@ -234,6 +235,8 @@ D3D12_RESOURCE_DESC g_seen_descs[4];  // the first descriptions the mock device'
 std::uint32_t g_seen_desc_count = 0;
 std::uint32_t g_seen_calls = 0;  // slot 25 calls since the test cleared it; only the first is recorded
 
+std::uint64_t g_texture_size_bias = 0;  // added to each texture's answer: a driver that pads more than the console
+
 std::uint64_t mock_allocation_info(std::uint64_t ret, std::uint64_t count, std::uint64_t descs_word,
                                    D3D12_RESOURCE_ALLOCATION_INFO1* each = nullptr) {
     const auto* descs = reinterpret_cast<const D3D12_RESOURCE_DESC*>(descs_word);
@@ -245,7 +248,9 @@ std::uint64_t mock_allocation_info(std::uint64_t ret, std::uint64_t count, std::
     D3D12_RESOURCE_ALLOCATION_INFO total{0, 1};
     bool refused = false;
     for (std::uint32_t i = 0; descs && i < static_cast<std::uint32_t>(count); ++i) {
-        const D3D12_RESOURCE_ALLOCATION_INFO one = mock_one_allocation(descs[i]);
+        D3D12_RESOURCE_ALLOCATION_INFO one = mock_one_allocation(descs[i]);
+        if (descs[i].Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && one.SizeInBytes != UINT64_MAX)
+            one.SizeInBytes += g_texture_size_bias;
         refused = refused || one.SizeInBytes == UINT64_MAX;
         const std::uint64_t offset = mock_align(total.SizeInBytes, one.Alignment);
         if (each) each[i] = {offset, one.Alignment, one.SizeInBytes};
@@ -329,7 +334,20 @@ std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, s
     } else if constexpr (Slot == 1) {
         return static_cast<std::uint64_t>(++self->refs);
     } else if constexpr (Slot == 2) {
-        return static_cast<std::uint64_t>(--self->refs);
+        const long left = --self->refs;
+        if (left == 0 && self->held) {  // destroyed: private data goes with it
+            IUnknown* const held = self->held;
+            self->held = nullptr;
+            held->Release();
+        }
+        return static_cast<std::uint64_t>(left);
+    } else if constexpr (Slot == 5) {  // SetPrivateDataInterface(guid, object): keeps one reference
+        ++self->calls[5];
+        auto* const object = reinterpret_cast<IUnknown*>(a2);
+        if (object) object->AddRef();
+        if (self->held) self->held->Release();
+        self->held = object;
+        return S_OK;
     } else {
         // A caller may pass fewer words than this thunk declares (OpenSharedHandle passes three), so its frame
         // has no room past the four register homes. The words are copied into this frame and passed by pointer:
@@ -378,6 +396,13 @@ HRESULT WINAPI mock_create_committed_resource(Mock* self, const D3D12_HEAP_PROPE
                                               D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
                                               const IID* riid, void** out) {
     ++self->calls[27];
+    // The first words are kept as every other slot's are (the lease checks read them), and the table is shared by
+    // every mock kind: only a device creates a resource here.
+    const std::uint64_t words[6] = {reinterpret_cast<std::uint64_t>(heap), static_cast<std::uint64_t>(heap_flags),
+                                    reinterpret_cast<std::uint64_t>(desc), static_cast<std::uint64_t>(state),
+                                    reinterpret_cast<std::uint64_t>(clear), reinterpret_cast<std::uint64_t>(riid)};
+    std::memcpy(self->args[27], words, 5 * sizeof(words[0]));
+    if (self->kind != Kind::device) return static_cast<HRESULT>(mock_call(self, 27, words));
     g_committed = CommittedCall{};
     if (heap) g_committed.heap = *heap;
     g_committed.heap_flags = heap_flags;
@@ -1774,6 +1799,92 @@ int check_descriptor_heap_hooks() {
     return 0;
 }
 
+// ---- Committed resources lease their size through the title's XMem hooks (RT-5 stop 17) ----
+// Slots 76 and 127 allocate the slot-25 size of the resource through the installed hooks with page-size field 2, the
+// resource holds the lease, and the hooks' free runs once, when the resource is destroyed.
+int check_committed_resource_leases() {
+    g_heap_hook = {};
+    xs::set_descriptor_heap_allocator(&mock_heap_alloc, &mock_heap_free);
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 10, true);
+    EXPECT(device);
+    constexpr std::uint64_t kLeaseAttributes = (0x80ULL << 16) | (2ULL << 14);
+    static std::uint8_t lease_memory[64];
+    g_heap_hook.next_ptr = lease_memory;
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 1920;
+    desc.Height = 1080;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    // Slot 76: the lease is the console tile size (135 tiles), not the PC one.
+    void* resource = nullptr;
+    std::uint64_t words76[10] = {word(&heap), 0, word(&desc), 0, 0, word(&kResourceIid), word(&resource), 0, 0, 0};
+    EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource);
+    EXPECT(g_heap_hook.alloc_calls == 1 && g_heap_hook.last_alloc_size == 8847360);
+    EXPECT(g_heap_hook.last_alloc_attr == kLeaseAttributes);
+    EXPECT(g_heap_hook.free_calls == 0 && reinterpret_cast<Mock*>(resource)->held);
+    EXPECT(release(resource) == 0);
+    EXPECT(g_heap_hook.free_calls == 1 && g_heap_hook.last_free_ptr == lease_memory &&
+           g_heap_hook.last_free_attr == kLeaseAttributes);
+
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    // Slot 127, a buffer: its PC size, leased the same way.
+    D3D12_RESOURCE_DESC1 buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = 3 * 65536;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    resource = nullptr;
+    std::uint64_t words127[10] = {word(&heap), 0, word(&buffer), 0xFFFFFFFFu, 0, 0, 0, 0, word(&kResourceIid),
+                                  word(&resource)};
+    EXPECT(hr_of(raw10(device, 127, words127)) == S_OK && resource);
+    EXPECT(g_heap_hook.alloc_calls == 2 && g_heap_hook.last_alloc_size == 3 * 65536);
+    EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 2);
+#endif
+
+    // A driver whose PC answer is above the console tiles (AMD's Windows driver: 513 x 64 KiB for a 3840 x 2160 RGBA8
+    // target, 510 tiles on the console) still leases the tiles: the title's 64 MiB range holds two of those and no more.
+    desc.Width = 3840;
+    desc.Height = 2160;
+    g_texture_size_bias = 6 * 65536;  // the mock's 507 x 64 KiB becomes 513 x 64 KiB
+    resource = nullptr;
+    EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource);
+    EXPECT(g_heap_hook.last_alloc_size == 30ull * 17 * 65536);
+    EXPECT(release(resource) == 0);
+    g_texture_size_bias = 0;
+    desc.Width = 1920;
+    desc.Height = 1080;
+
+    // Hooks that return null: the resource is still created, and nothing is freed later.
+    g_heap_hook.next_ptr = nullptr;
+    resource = nullptr;
+    EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource && !reinterpret_cast<Mock*>(resource)->held);
+    const unsigned frees = g_heap_hook.free_calls;
+    EXPECT(release(resource) == 0 && g_heap_hook.free_calls == frees);
+
+    // No hooks: no lease.
+    xs::set_descriptor_heap_allocator(nullptr, nullptr);
+    const unsigned allocs = g_heap_hook.alloc_calls;
+    resource = nullptr;
+    EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource && g_heap_hook.alloc_calls == allocs);
+    EXPECT(release(resource) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: committed resources lease their slot-25 size through the title's XMem hooks until destroyed\n",
+                g_label);
+    return 0;
+}
+
 // ---- Guard-region setup failures: this executable's import table, patched before the first proxy table ----
 
 std::atomic<int> g_injected{0};
@@ -2046,7 +2157,8 @@ int main(int argc, char** argv) {
         check_open_shared() || check_alloc_failures() || check_allocators() || check_render_target_sizes() ||
         check_allocation_descriptions_cleaned() || check_render_target_layout() || check_xbox_slots() || check_lists() ||
         check_signalx_detection() || check_list_tail_names() || check_custom_heap_properties() ||
-        check_descriptor_heap_hooks() || check_slot70() || check_committed_resource3_x())
+        check_descriptor_heap_hooks() || check_slot70() || check_committed_resource3_x() ||
+        check_committed_resource_leases())
         return 1;
     if (check_placed_resource_x()) return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
