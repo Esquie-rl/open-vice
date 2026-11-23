@@ -1341,7 +1341,9 @@ PresentState* present_state_for(DeviceProxy* device) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
         return state;
     }
-    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter));
+    // local (#7685 + #2490): the queue's pacer shares the device's token source, so a token handed out by device
+    // WaitFrameEventX (slot 80) is one this pacer has issued. With its own source every PresentX is E_INVALIDARG.
+    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), nullptr, device->frame_tokens);
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(state->window));
     return state;
 }
