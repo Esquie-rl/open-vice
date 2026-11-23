@@ -247,6 +247,33 @@ class Main(unittest.TestCase):
                              ["lib_cs_00003.code", "lib_cs_00003.json", "lib_cs_00003.state", "lib_vs_00001.code",
                               "lib_vs_00001.json"])
 
+    def test_vertex_and_pixel_keys_are_the_bytes_slot_57_passes(self):
+        """make_game's library step unpacks make_game.LIBRARY_STAGES. A graphics record's vertex and pixel programs
+        get fspx/<name>.code, so the index's fspx_code_sha256 is the SHA-256 of the whole program as the program table
+        gives it (prologue and padding included): the bytes device slot 57 receives and hashes. They get no state key,
+        and the mesh program, which is not one of those stages, is not written."""
+        sys.path.insert(0, ROOT)
+        import make_game  # noqa: E402
+        lib = sample()
+        parsed = sl.parse(lib)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(lib)
+            out = os.path.join(tmp, "out")
+            rc, _ = self.run_main(src, "--out", out, "--stages", make_game.LIBRARY_STAGES)
+            self.assertEqual(rc, 0)
+            for name, i in (("lib_ps_00000", 0), ("lib_vs_00001", 1)):
+                disasm_file = os.path.join(out, "disasm", name + ".s")   # the key helpers resolve from there
+                program = sl.program(lib, parsed, i)
+                self.assertTrue(program.startswith(prologue(0x11112222 if i == 0 else 0x33334444)))
+                self.assertEqual(len(program) % 256, 0)   # padded, as the table gives it
+                self.assertEqual(shader_meta.fspx_code_sha256_file(disasm_file, name),
+                                 hashlib.sha256(program).hexdigest())
+                self.assertIsNone(shader_meta.fspx_state_sha256_file(disasm_file, name))
+            self.assertTrue(os.path.isfile(os.path.join(out, "fspx", "lib_cs_00003.state")))
+            self.assertFalse(os.path.exists(os.path.join(out, "fspx", "lib_ms_00002.code")))
+
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")

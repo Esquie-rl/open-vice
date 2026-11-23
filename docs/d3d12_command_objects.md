@@ -536,8 +536,9 @@ vtable pointer of a public object.
   - **A refused or failed call does not stop the title.** Read statically, its pipeline job skips a record whose
     creation fails and builds that pipeline from its PC-form description through slot 86 when it is first needed.
   - **What it needs from the build.** The library's vertex and pixel programs translated into
-    `<shaders>/library` with `fspx_code_sha256` in the index (`tools/shader_library.py --stages vs,ps`;
-    `make_game.py` runs `cs` only today). Without them every call misses and the device answers `E_INVALIDARG`.
+    `<shaders>/library` with `fspx_code_sha256` in the index, which `make_game.py`'s `shaders` stage does next to
+    the compute programs (`tools/shader_library.py --stages cs,vs,ps`). A program the translator has no rule for
+    yet has no module: its pipelines miss and the device answers `E_INVALIDARG`.
   - **Not read:** the stage records (pairs 3 and 5), and whatever the unread words of the two blobs hold. Which
     program is which stage follows the library record's slot order (#8890 matched the title's first three calls to
     library records that way). Those three pipelines have topology value 19, so the title's first calls are among

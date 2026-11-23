@@ -1,5 +1,6 @@
-"""make_game.py's pipeline-library step (library_shaders): the compute pipelines of the library in shaders.rpf, which
-the executable creates with Xbox device slot 67 (docs/shader_library.md, docs/fspx.md).
+"""make_game.py's pipeline-library step (library_shaders): the compute, vertex and pixel programs of the library in
+shaders.rpf, which the executable creates pipelines from with Xbox device slots 67 and 57 (docs/shader_library.md,
+docs/fspx.md).
 
     python -I tests/test_library_shaders_stage.py
 
@@ -32,6 +33,7 @@ class LibraryStage(unittest.TestCase):
         self.carve = os.path.join(self.work, "shaders", "dxbc")
         self.calls = []
         self.translations = {"lib_cs_00007": ("c" * 64, "s" * 64, b"synthetic module")}
+        self.graphics = {}   # name: (stage, fspx_code_sha256, module) of vertex and pixel programs
 
     def write_archive(self, data):
         with open(self.archive, "wb") as f:
@@ -45,8 +47,12 @@ class LibraryStage(unittest.TestCase):
         elif tool == "rdna2spirv.py":
             os.makedirs(self.spirv, exist_ok=True)
             index = {}
-            for name, (code, state, module) in self.translations.items():
-                index[name] = {"stage": "cs", "fspx_code_sha256": code, "fspx_state_sha256": state}
+            entries = [(name, {"stage": "cs", "fspx_code_sha256": code, "fspx_state_sha256": state}, module)
+                       for name, (code, state, module) in self.translations.items()]
+            entries += [(name, {"stage": stage, "fspx_code_sha256": code}, module)   # no state key for graphics
+                        for name, (stage, code, module) in self.graphics.items()]
+            for name, meta, module in entries:
+                index[name] = meta
                 with open(os.path.join(self.spirv, name + ".spv"), "wb") as f:
                     f.write(module)
             with open(os.path.join(self.spirv, "index.json"), "w") as f:
@@ -62,8 +68,8 @@ class LibraryStage(unittest.TestCase):
         os.makedirs(self.carve)
         self.assertEqual(self.run_step(), ["shader_library.py", "rdna2spirv.py"])
         (_, unpack), (_, translate) = self.calls
-        self.assertEqual(unpack, (self.archive, "--out", self.unpacked, "--stages", "cs", "--disasm", "--jobs", "4",
-                                  "--carve", self.carve))
+        self.assertEqual(unpack, (self.archive, "--out", self.unpacked, "--stages", "cs,vs,ps", "--disasm", "--jobs",
+                                  "4", "--carve", self.carve))
         self.assertEqual(translate, (os.path.join(self.unpacked, "disasm"), "--out", self.spirv, "--no-asm"))
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "library_build.json")))
         self.assertEqual(self.run_step(), [])
@@ -112,6 +118,28 @@ class LibraryStage(unittest.TestCase):
             self.run_step()
         self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
         self.assertFalse(os.path.exists(os.path.join(self.spirv, "library_build.json")))
+
+    def test_graphics_programs_with_the_same_code_and_different_modules_do_not_stop_the_build(self):
+        """A vertex or pixel program has no state key. The run time refuses the one slot-57 lookup whose modules
+        differ (ShaderLibrary::program_candidates), so the build keeps the index; a compute pair still fails above."""
+        self.graphics = {"lib_ps_00000": ("ps", "d" * 64, b"module B"), "lib_ps_00009": ("ps", "d" * 64, b"module C"),
+                         "lib_vs_00001": ("vs", "e" * 64, b"module D")}
+        self.assertEqual(self.run_step(), ["shader_library.py", "rdna2spirv.py"])
+        with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(sorted(json.load(f)), ["lib_cs_00007", "lib_ps_00000", "lib_ps_00009", "lib_vs_00001"])
+        self.assertTrue(os.path.isfile(os.path.join(self.spirv, "library_build.json")))
+        # The shared helper still reports the pair when asked about every stage.
+        self.assertEqual(make_game.fspx_key_clash(self.spirv), ("lib_ps_00000", "lib_ps_00009"))
+        self.assertIsNone(make_game.fspx_key_clash(self.spirv, skip_stages=make_game.LIBRARY_GRAPHICS_STAGES))
+
+    def test_stages_are_part_of_the_cache_key(self):
+        """An index built for other stages (the compute-only one of #7529) is not reused."""
+        self.assertEqual(self.run_step(), ["shader_library.py", "rdna2spirv.py"])
+        self.assertEqual(self.run_step(), [])
+        with mock.patch.object(make_game, "LIBRARY_STAGES", "cs"):
+            self.assertEqual(self.run_step(), ["shader_library.py", "rdna2spirv.py"])
+            self.assertEqual(self.calls[0][1][4], "cs")
+        self.assertEqual(self.run_step(), ["shader_library.py", "rdna2spirv.py"])
 
 
 if __name__ == "__main__":

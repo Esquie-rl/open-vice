@@ -186,9 +186,11 @@ the DLL skips it.
 The executable calls slot 67 itself, for the compute pipelines of the pipeline library in `shaders.rpf`
 ([shader_library.md](shader_library.md)): a compute record's state blob, blob, program and layout blob have the sizes
 and shapes of kinds 0, 1, 6 and 7. The next step of the same stage, `library_shaders`, unpacks those programs with
-`tools/shader_library.py --stages cs` (which writes each one's `.code` and its record's state as `.state`) and
-translates them into `<work>/shaders/spirv/library/`, with the same keys, the same clash check and its own
-`library_build.json`.
+`tools/shader_library.py --stages cs,vs,ps` (which writes each one's `.code` and, for a compute program, its record's
+state as `.state`) and translates them into `<work>/shaders/spirv/library/`, with the same keys, the same clash check
+and its own `library_build.json`. The vertex and pixel programs are there for device slot 57 (below), which finds them
+by `fspx_code_sha256` alone; they have no kind-0 entry, so the clash check does not compare them and the run time
+refuses a lookup whose modules differ.
 
 **Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when they
 are there, `<dir>/fspx/index.json` and `<dir>/library/index.json` (and `bvh/`, [embedded_shaders.md](embedded_shaders.md)),
@@ -255,9 +257,9 @@ the first one optional.
 Hypotheses, not confirmed: pairs 0 and 1 are kind 0 and kind 1 of a graphics program; pairs 3 and 5 are kind-7
 records; the two programs are two stages of one graphics pipeline (which one is which is not measured). Not read: the
 380 to 404 B state blob (rasterizer, blend, depth and render-target state would have to come from it) and the 80 to
-224 B pair. Not done: a slot-57 handler. It needs the library's graphics programs translated and indexed by their
-kind-6 keys (`tools/shader_library.py` takes `--stages`; #7529 runs `cs` only) and the state blob decoded; without
-both a handler can only refuse.
+224 B pair. Later work read both blobs and wrote a handler; it is described in
+[d3d12_command_objects.md](d3d12_command_objects.md) ("Device slot 57") and [shader_library.md](shader_library.md) §2,
+and `make_game.py` now translates the library's vertex and pixel programs for it.
 
 ## Translation status
 

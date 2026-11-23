@@ -1398,29 +1398,36 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
 
 LIBRARY_ARCHIVE = "shaders.rpf"
 LIBRARY_TOOLS = ("shader_library.py", "fspx_unpack.py", "shader_disasm.py")  # with TRANSLATION_SOURCES
+# The stages of the pipeline library the build translates: the compute programs device slot 67 creates pipelines
+# from, and the vertex and pixel programs device slot 57 does (docs/d3d12_command_objects.md, docs/fspx.md "Slot 57").
+# The mesh programs (7,498 of the 21,522 in 1.0.2.1) are left out: no device slot is known to look them up yet.
+LIBRARY_STAGES = "cs,vs,ps"
+LIBRARY_GRAPHICS_STAGES = ("vs", "ps")
 
 
 def library_settings(archive: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
-    """What the pipeline library's compute translations depend on, as one line: shaders.rpf, the unpacking and
-    translating tools, llvm-mc, the wave64 mode and the fallback flags."""
+    """What the pipeline library's translations depend on, as one line: shaders.rpf, the stages translated, the
+    unpacking and translating tools, llvm-mc, the wave64 mode and the fallback flags."""
     tools = hashlib.sha256()
     for name in LIBRARY_TOOLS:
         tools.update(f"{name}\0".encode() + bytes.fromhex(file_sha256(os.path.join(TOOLS, name))))
-    return json.dumps({"archive": file_sha256(archive), "tools": tools.hexdigest(),
+    return json.dumps({"archive": file_sha256(archive), "stages": LIBRARY_STAGES, "tools": tools.hexdigest(),
                        "translator": translation_sources_digest(), "llvm_mc": mc_signature,
                        "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)}, sort_keys=True)
 
 
 def library_shaders(game: str, work: str, mc_signature: str, jobs: int, emulate: bool = False,
                     fallbacks: tuple[str, ...] = ()) -> None:
-    """The compute pipelines of the pipeline library in shaders.rpf (docs/shader_library.md). The executable reads
-    the library through DirectStorage and creates each compute pipeline with Xbox device slot 67
-    (DeserializeComputePipelineStateX), passing the record's four parts as FSPX kinds 0, 1, 6 and 7 (docs/fspx.md).
-    tools/shader_library.py unpacks the compute programs with their kind-0 state into <work>/shaders/library, and
-    rdna2spirv.py translates them into <work>/shaders/spirv/library, where the runtime's shader library finds them by
-    fspx_code_sha256 and fspx_state_sha256 as it finds the FidelityFX DLL's. Graphics pipelines are not translated
-    here. The game's own shaders neither feed nor depend on this step, apart from the carve that names each program's
-    source container (the translator reads its signatures).
+    """The compute, vertex and pixel programs (LIBRARY_STAGES) of the pipeline library in shaders.rpf
+    (docs/shader_library.md). The executable reads the library through DirectStorage and creates each compute
+    pipeline with Xbox device slot 67 (DeserializeComputePipelineStateX), passing the record's four parts as FSPX
+    kinds 0, 1, 6 and 7 (docs/fspx.md), and each graphics pipeline with device slot 57, passing its two programs bare.
+    tools/shader_library.py unpacks the programs (the compute ones with their kind-0 state) into
+    <work>/shaders/library, and rdna2spirv.py translates them into <work>/shaders/spirv/library, where the runtime's
+    shader library finds a compute program by fspx_code_sha256 and fspx_state_sha256 as it finds the FidelityFX DLL's,
+    and a vertex or pixel program by fspx_code_sha256 under its stage. The game's own shaders neither feed nor depend
+    on this step, apart from the carve that names each program's source container: the translator reads its
+    signatures, so without the carve the pixel programs do not translate.
 
     The step runs whole. Reuse requires the translation index, its named modules and a matching library_build.json
     (library_settings)."""
@@ -1435,7 +1442,8 @@ def library_shaders(game: str, work: str, mc_signature: str, jobs: int, emulate:
     settings = library_settings(archive, mc_signature, emulate, fallbacks)
     if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
         return
-    log(f"shaders: unpacking and translating the compute pipelines of the pipeline library in {LIBRARY_ARCHIVE}")
+    log(f"shaders: unpacking and translating the compute, vertex and pixel programs of the pipeline library in "
+        f"{LIBRARY_ARCHIVE}")
     drop(translated, settings_file)
     # A program that no longer translates must not keep a module from the run before.
     for folder, suffixes in ((os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
@@ -1445,11 +1453,11 @@ def library_shaders(game: str, work: str, mc_signature: str, jobs: int, emulate:
                     if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
                         os.unlink(entry.path)
     carve = os.path.join(work, "shaders", "dxbc")
-    py("shader_library.py", archive, "--out", unpacked, "--stages", "cs", "--disasm", "--jobs", str(jobs),
+    py("shader_library.py", archive, "--out", unpacked, "--stages", LIBRARY_STAGES, "--disasm", "--jobs", str(jobs),
        *(["--carve", carve] if os.path.isdir(carve) else []))
     extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
     py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
-    clash = fspx_key_clash(spirv)
+    clash = fspx_key_clash(spirv, skip_stages=LIBRARY_GRAPHICS_STAGES)
     if clash:
         drop(translated)   # the runtime must not load an index whose keys pick between different modules
         fail(f"shaders: pipeline library programs {clash[0]} and {clash[1]} have the same kind-6 and kind-0 bytes "
@@ -1459,16 +1467,18 @@ def library_shaders(game: str, work: str, mc_signature: str, jobs: int, emulate:
         f.write(settings + "\n")
 
 
-def fspx_key_clash(spirv: str):
+def fspx_key_clash(spirv: str, skip_stages: tuple[str, ...] = ()):
     """Two entries of <spirv>/index.json with the same fspx_code_sha256 and fspx_state_sha256 whose .spv files
     differ, as (name, name), or None. The same kind-6 bytes with different kind-0 entries is allowed: the run time
-    picks by both keys when the bytecode carries kind 0, and refuses a bare kind-6 program whose modules differ."""
+    picks by both keys when the bytecode carries kind 0, and refuses a bare kind-6 program whose modules differ.
+    Entries of `skip_stages` are not compared: a graphics program has no kind-0 entry to tell two builds apart, and
+    the run time refuses only the one lookup whose modules differ, so such a pair must not stop the build."""
     with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
         index = json.load(f)
     first = {}
     for name in sorted(index):
         meta = index[name]
-        if not isinstance(meta, dict) or "fspx_code_sha256" not in meta:
+        if not isinstance(meta, dict) or "fspx_code_sha256" not in meta or meta.get("stage") in skip_stages:
             continue
         key = (meta["fspx_code_sha256"], meta.get("fspx_state_sha256"))
         if key not in first:

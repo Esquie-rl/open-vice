@@ -174,8 +174,8 @@ The output is game data and must stay in your work folder. `tests/test_shader_li
 archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest
 walk. It also checks the `--carve` copy, the translator's reads of the compute sidecar and the compute `.state`.
 
-**In the build.** `make_game.py`'s `shaders` stage runs this for the compute stage after the FSPX step
-(`library_shaders`): `--stages cs --disasm --carve` into `<work>/shaders/library`, then `rdna2spirv.py` into
+**In the build.** `make_game.py`'s `shaders` stage runs this for the compute, vertex and pixel stages after the FSPX
+step (`library_shaders`): `--stages cs,vs,ps --disasm --carve` into `<work>/shaders/library`, then `rdna2spirv.py` into
 `<work>/shaders/spirv/library` with the stage's `--wave64-emulate` and fallback flags. The runtime's shader library
 reads that index next to `fspx/` and finds its entries by `fspx_code_sha256` and `fspx_state_sha256`
 ([fspx.md](fspx.md), "Build and run-time lookup"). That is how the executable creates these pipelines: it reads the
@@ -183,7 +183,11 @@ library through DirectStorage zlib requests and passes each compute record's fou
 `DeserializeComputePipelineStateX`, as kinds 0, 1, 6 and 7, so the code key is the program's bytes as the table gives
 them and the state key is the record's state blob. The step is redone as a whole when `shaders.rpf`, the tools,
 `llvm-mc`, the wave64 mode or the flags change (`library_build.json`, written last), and a clash of both keys between
-different modules fails it, as for the FSPX step. Graphics pipelines are not translated by the build.
+different modules fails it, as for the FSPX step. The vertex and pixel programs are there for device slot 57
+([d3d12_command_objects.md](d3d12_command_objects.md)), which passes each graphics record's programs bare, so their
+only key is `fspx_code_sha256`, the program's bytes as the table gives them; the clash check skips them. A pixel
+program needs its source container (`--carve`) for its signatures. The stages are part of `library_build.json`, so a
+compute-only index from before is translated again. The mesh programs are not translated (`LIBRARY_STAGES`).
 
 ## 5. Translation
 
