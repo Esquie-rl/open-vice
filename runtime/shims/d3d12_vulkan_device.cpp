@@ -1693,6 +1693,9 @@ public:
         return {in_arena_ ? UINT64(arena_offset_) : 0};
     }
 
+    const D3D12_DESCRIPTOR_HEAP_DESC& raw_desc() const { return desc_; }
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_base() const { return in_arena_ ? UINT64(arena_offset_) : 0; }
+
 private:
     DeviceState& device_;
     D3D12_DESCRIPTOR_HEAP_DESC desc_;
@@ -5639,8 +5642,8 @@ public:
     HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
                                                  D3D12_COMMAND_LIST_FLAGS, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device4::CreateCommandList1";
-        // The host runtime's order ("command list1:" cases): one node and a type up to VIDEO_ENCODE, then a null
-        // output is E_UNEXPECTED.
+        // The host runtime's order ("command list1:" cases): one node and a type up to VIDEO_ENCODE (non-zero
+        // D3D12_COMMAND_LIST_FLAGS are ignored by the host runtime), then a null output is E_UNEXPECTED.
         if (out) *out = nullptr;
         if ((node_mask & ~1u) || UINT(type) > UINT(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE))
             return d3d12_trace::result(method, E_INVALIDARG);
@@ -5921,6 +5924,7 @@ public:
         if (!compute.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
         RootArgumentLayout layout;
+        layout.flags = parsed.sig.flags;
         layout.graphics_ok = packed.ok;
         layout.compute_ok = compute.ok;
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
@@ -6977,7 +6981,26 @@ public:
 
     // create_buffer_at_host_address (Xbox device slot 133). The heap the resource reports is CUSTOM / WRITE_BACK / L0,
     // what OpenExistingHeapFromAddress gives the same pages, since the CPU keeps writing them.
-    HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out) {
+    // A D3D12_BARRIER_LAYOUT (what Xbox slot 133 passes, as PC CreatePlacedResource2 does) as the legacy initial state
+    // of an equivalent committed resource. UNDEFINED (0xFFFFFFFF) and anything unlisted give COMMON.
+    static D3D12_RESOURCE_STATES state_for_barrier_layout(std::uint32_t layout) {
+        switch (layout) {
+            case 1: return D3D12_RESOURCE_STATE_GENERIC_READ;
+            case 2: return D3D12_RESOURCE_STATE_RENDER_TARGET;
+            case 3: return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            case 4: return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            case 5: return D3D12_RESOURCE_STATE_DEPTH_READ;
+            case 6: return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            case 7: return D3D12_RESOURCE_STATE_COPY_SOURCE;
+            case 8: return D3D12_RESOURCE_STATE_COPY_DEST;
+            case 9: return D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+            case 10: return D3D12_RESOURCE_STATE_RESOLVE_DEST;
+            default: return D3D12_RESOURCE_STATE_COMMON;
+        }
+    }
+
+    HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout, REFIID riid,
+                                   void** out) {
         constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
             // A texture is not placed on the title's pages yet: it gets an ordinary committed DEFAULT texture of the
@@ -6986,9 +7009,15 @@ public:
             log_once("a title-placed texture (device slot 133) is an ordinary committed texture, not the title's pages; "
                      "dimension",
                      int(desc.Dimension));
+            // The initial state follows the title's barrier layout (slot 133's third argument, measured by
+            // @dracbat); a state the description refuses (or UNDEFINED) gives COMMON, so the title still gets it.
             const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
-            return d3d12_trace::result(method, create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc,
-                                                                D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out));
+            const D3D12_RESOURCE_STATES initial = state_for_barrier_layout(layout);
+            HRESULT hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, initial, 0, nullptr, riid, out);
+            if (FAILED(hr) && initial != D3D12_RESOURCE_STATE_COMMON)
+                hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, 0, nullptr,
+                                      riid, out);
+            return d3d12_trace::result(method, hr);
         }
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_CUSTOM;
@@ -8640,6 +8669,17 @@ const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12Pi
     return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
 }
 
+IUnknown* descriptor_heap_info(ID3D12DescriptorHeap* heap, D3D12_DESCRIPTOR_HEAP_DESC& desc,
+                               D3D12_GPU_VIRTUAL_ADDRESS& gpu_base) {
+    if (!heap) return nullptr;
+    if (ID3D12DescriptorHeap* real = rt::d3d12_xs::heap_proxy_real_heap(heap)) heap = real;
+    const DescriptorHeap* d = DescriptorHeap::from<DescriptorHeap>(heap);
+    if (!d) return nullptr;
+    desc = d->raw_desc();
+    gpu_base = d->gpu_base();
+    return d->attached_device();
+}
+
 VkImage vulkan_image(ID3D12Resource* resource) {
     const Resource* r = Resource::from<Resource>(resource);
     return r ? r->image() : VK_NULL_HANDLE;
@@ -8663,13 +8703,13 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
 }
 
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
-                                      REFIID riid, void** out) {
+                                      std::uint32_t layout, REFIID riid, void** out) {
     if (out) *out = nullptr;
     if (!device || !out) return E_POINTER;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_NOTIMPL;
-    return d->create_at_host_address(address, desc, riid, out);
+    return d->create_at_host_address(address, desc, layout, riid, out);
 }
 
 bool device_supports_ray_tracing(ID3D12Device* device) {

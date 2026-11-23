@@ -2912,7 +2912,7 @@ HRESULT proxy_create_buffer_at_va(DeviceProxy* self, void* va, const D3D12_RESOU
                      va, static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
                      xbox_flags, state);
     }
-    return handler(self->real, va, pc_desc, *riid, out);
+    return handler(self->real, va, pc_desc, state, *riid, out);
 }
 
 // Slot 133 with both of its paths. The buffer on the title's own pages (proxy_create_buffer_at_va) is tried first: it
