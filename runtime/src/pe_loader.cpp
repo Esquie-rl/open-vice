@@ -1012,8 +1012,7 @@ void __cdecl on_host_thread_event(DWORD reason) {
         try {
             forget_ended_thread_id();
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "[rt] loader: thread attach: %s
-", e.what());
+            std::fprintf(stderr, "[rt] loader: thread attach: %s\n", e.what());
         }
         std::array<Module*, kTlsSlotCount> installed{};
         for (size_t slot = 0; slot < kTlsSlotCount; ++slot) {
@@ -1044,8 +1043,7 @@ void __cdecl on_host_thread_event(DWORD reason) {
         try {
             release_existing_blocks_of_this_thread();
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "[rt] loader: thread detach: %s
-", e.what());
+            std::fprintf(stderr, "[rt] loader: thread detach: %s\n", e.what());
         }
         for (size_t step = 0; step < kTlsSlotCount; ++step) {
             const size_t i = step < kMaxMappedTlsModules ? kMaxMappedTlsModules - 1 - step : kMainImageSlot;
