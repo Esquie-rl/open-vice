@@ -534,7 +534,8 @@ void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true
     mock->full_chain_lists = full_chain_lists;
     mock->refs = 1;
     void* device = nullptr;
-    if (FAILED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), __uuidof(ID3D12Device), &device)))
+    if (FAILED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), __uuidof(ID3D12Device), &device,
+                                       /*console_lists=*/true)))
         return nullptr;
     return device;
 }
@@ -1287,7 +1288,9 @@ int check_render_target_layout() {
 int check_xbox_slots() {
 #ifdef __ID3D12Device11_INTERFACE_DEFINED__
     Mock* mock = nullptr;
-    void* device = make_device(mock, 11, true);
+    // Full-chain lists: the console IID maps to ID3D12GraphicsCommandList6, which a command_list-kind mock
+    // does not answer.
+    void* device = make_device(mock, 11, true, true, true);
     EXPECT(device && xs::device_proxy_slot_count(device) == 80);
     xs::reset_device_proxy_stats();
 
@@ -1328,13 +1331,26 @@ int check_xbox_slots() {
     const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
     void* list = nullptr;
     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
-    // The list is slot 12's console list proxy over the PC list the mock made.
+    // The list is the console list proxy over the PC list the mock made (slot 12's path); the mock's kind depends on
+    // full_chain_lists.
     EXPECT(xs::is_list_proxy(list) && word(xs::list_proxy_real_list(list)) == word(mock->last_child));
-    EXPECT(mock->last_child->kind == Kind::command_list);
+    EXPECT(mock->last_child->kind == Kind::command_list || mock->last_child->kind == Kind::list);
     EXPECT(mock->calls[73] == 0 && mock->calls[12] == 1 && xs::device_slot_hits(73) == 1);
     EXPECT(mock->args[12][0] == 0 && mock->args[12][1] == D3D12_COMMAND_LIST_TYPE_DIRECT);
     EXPECT(mock->args[12][2] == word(real_allocator) && mock->args[12][3] == 0);
     EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), list_iid));
+
+    // The measured console list IID (the 1.0.2.1 executable's only GUID of that form) maps to
+    // ID3D12GraphicsCommandList6: slot 73 answers it, and a QueryInterface for it on the proxy returns the proxy.
+    const IID console_list_iid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+    void* console_list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&console_list_iid),
+                     word(&console_list))) == S_OK);
+    EXPECT(xs::is_list_proxy(console_list));
+    EXPECT(mock->calls[12] == 2);
+    void* asked = nullptr;
+    EXPECT(hr_of(raw(console_list, 0, word(&console_list_iid), word(&asked))) == S_OK && asked == console_list);
+    EXPECT(release(asked) == 1 && release(console_list) == 0);
 
     // Release the list before the refusal calls below: the COM convention (and the handler) nulls the caller's
     // output on failure, so an invalid call would clear this pointer.
@@ -1512,6 +1528,10 @@ int check_lists() {
     EXPECT(release(found) >= 1);
     // A forwarded console slot: Dispatch is console 14 (PC slot 14 too — order holds through 26).
     EXPECT(hr_of(raw(list, 14, 1, 1, 1)) == S_OK && real->calls[14] == 1);
+    // Console slot 139 is the retail title's Reset(allocator, pso) (Pipodi measured it on 1.0.2.1): the allocator
+    // proxy unwraps and the call reaches the real list's PC slot 10.
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK && real->calls[10] == 1 &&
+           real->args[10][0] == word(real_allocator));
     // Console-only extras (27-30) and the unmeasured tail are recorded and return 0, never forwarded.
     EXPECT(raw(list, 27, 1, 2, 3, 4) == 0 && real->calls[27] == 0);
     EXPECT(raw(list, 148, 0, 16) == 0);  // AllocateUploadMemory(0, ...) refuses
@@ -1548,6 +1568,22 @@ int check_lists() {
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);
     EXPECT(release(device) == 0 && mock->refs == 0);
+
+    // A PC caller (console_lists=false — the default, what the GPU harnesses use) gets the real list back:
+    // slot 12 returns the mock, not a proxy, so its PC vtable indices stay valid.
+    Mock* pc_mock = new_mock(Kind::device);
+    pc_mock->device_level = 9;
+    pc_mock->refs = 1;
+    void* pc_device = nullptr;
+    EXPECT(SUCCEEDED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(pc_mock), __uuidof(ID3D12Device),
+                                           &pc_device)));
+    void* pc_list = nullptr;
+    EXPECT(hr_of(raw(pc_device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 0, 0, word(&gcl_iid),
+                     word(&pc_list))) == S_OK);
+    EXPECT(pc_list && !xs::is_list_proxy(pc_list) &&
+           reinterpret_cast<Mock*>(pc_list)->kind == Kind::command_list);
+    EXPECT(release(pc_list) == 0);
+    EXPECT(release(pc_device) == 0 && pc_mock->refs == 0);
     std::printf("%s: lists come back console-shaped (cursor pinned, GetDevice, Dispatch forwarded, extras "
                 "recorded); AllocateUploadMemory hands out arena pointers a root SRV receives\n", g_label);
     return 0;
