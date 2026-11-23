@@ -305,8 +305,11 @@ void test_first_run(const fs::path& exe, const fs::path& dll, EarlyThread& early
         WaitForSingleObject(early.done, INFINITE);
         check(early.host == 1234 && early.host_at_home,
               "a thread that existed before the reservation finds a fresh copy of this EXE's TLS at the home index");
-        check(early.block_in_slot0 && early.ga_installed == 42 && early.ga_after_set == 5,
-              "install_tls_for_thread gives that thread its own copy in slot 0");
+        // With main's install_on_existing_threads, load() itself gave this already-running thread its copy in slot 0
+        // (the executable's slot included), so install_tls_for_thread is a no-op there and slot 0 does not change
+        // across the call. Without that, install_tls_for_thread puts the copy in. Either way the thread reads its own.
+        check(early.ga_installed == 42 && early.ga_after_set == 5,
+              "that thread has its own copy in slot 0 (from load(), or from install_tls_for_thread)");
         check(early.slot0_restored, "uninstall_tls_for_thread puts that thread's slot 0 back");
 
         loader.initialise();
