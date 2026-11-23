@@ -66,6 +66,15 @@ The state blob is 388 to 472 bytes (5,680 distinct). The pipeline blob holds the
 names such as `POSITION`, `COLOR`, `TEXCOORD`, `NORMAL`, `TANGENT`, `BLENDWEIGHT` and `BLENDINDICES` for vertex
 pipelines (80 bytes, with no elements, for mesh pipelines).
 
+The input element count is a little-endian word at byte 76 of the input-layout blob, followed at byte 80 by the
+elements in declaration order. In each element a little-endian word gives the semantic name length including
+the NUL. The name bytes are followed immediately, without alignment padding, by six little-endian words:
+semantic index, DXGI format, input slot, aligned byte offset, input classification and instance step rate.
+Zero padding rounds the full blob up to four bytes. In the 1.0.2.1 library this framing holds for all 25,229
+distinct input-layout blob references across graphics records. The checked parser in
+[`slot57_input_layout.h`](../runtime/src/slot57_input_layout.h) decodes this list for slot 57. The rest of the
+80-byte prefix is outside the parser's scope.
+
 **Compute record** (24 bytes): u64 hash, u32 state blob, u32 blob, u32 program, u32 layout blob. The four parts
 have the sizes and shapes of the four [FSPX](fspx.md) kinds:
 

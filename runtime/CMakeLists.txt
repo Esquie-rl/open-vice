@@ -1024,6 +1024,8 @@ if(BUILD_TESTING)
   add_test(NAME descriptor_table COMMAND descriptor_table_test)
   add_executable(shader_library_test test/shader_library_test.cpp)
   add_test(NAME shader_library COMMAND shader_library_test)
+  add_executable(slot57_input_layout_test test/slot57_input_layout_test.cpp)
+  add_test(NAME slot57_input_layout COMMAND slot57_input_layout_test)
   add_executable(spirv_f16_halves_test test/spirv_f16_halves_test.cpp)
   add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
   # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
