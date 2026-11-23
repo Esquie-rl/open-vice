@@ -126,6 +126,8 @@ public:
     leonida::SubgroupSizeCaps subgroup;
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
     bool custom_border_color_without_format = false;
+    // A Vulkan 1.3 device: VK_EXT_pipeline_creation_feedback is core there, so pipeline creations can ask for it.
+    bool core_1_3() const { return v13_.core; }
 
     Device() = default;
     Device(const Device&) = delete;
