@@ -421,6 +421,23 @@ int check_slots(const Backend& b) {
         // The objects still work after the console-only calls.
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 10)));
         if (wait_for(label, fence.p, 10)) return 1;
+
+        // Fence slot 12 (value, descriptor, flags): the address of the completed value, which follows a queue's
+        // signal without another call (a wait on the real fence refreshes it). #7290's check, after the tail here so
+        // SignalX above still proves its forward by moving the fence to 9, and with 11 so no signal repeats a value.
+        {
+            before = fhits(12);
+            const auto* completed = reinterpret_cast<const volatile UINT64*>(raw_call(fence.p, 12, 11, 0, 0));
+            EXPECT(completed && *completed == fence->GetCompletedValue() && fhits(12) == before + 1);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 11)));
+            bool seen = false;
+            for (int i = 0; i < 5000 && !seen; ++i) {
+                seen = completed && *completed == 11;
+                if (!seen) Sleep(1);
+            }
+            EXPECT(seen);
+            EXPECT(raw_call(fence.p, 12, 11, 0, 0) == reinterpret_cast<std::uint64_t>(completed));
+        }
         EXPECT(xs::command_object_proxy_ref_count(queue.p) == 1 && xs::command_object_proxy_ref_count(fence.p) == 1);
     }
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);  // every queue and fence gave its reference back
