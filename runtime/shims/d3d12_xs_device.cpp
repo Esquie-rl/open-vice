@@ -1333,13 +1333,22 @@ PresentState* present_state_for(DeviceProxy* device) {
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
         return state;
     }
-    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
+    // local: a visible 1600x900 window (client area), placed near the top-left of the desktop. The window used to be
+    // created hidden and never shown, so nothing a title presented could be seen.
+    RECT frame{0, 0, 1600, 900};
+    AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, 80, 60,
+                                  frame.right - frame.left, frame.bottom - frame.top, nullptr, nullptr,
                                   window_class.hInstance, nullptr);
     if (!state->window) {
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
         return state;
     }
+    // Twice: the first ShowWindow of a process can be replaced by the show state its parent asked for.
+    ShowWindow(state->window, SW_SHOWNORMAL);
+    ShowWindow(state->window, SW_SHOWNORMAL);
+    SetForegroundWindow(state->window);
+    UpdateWindow(state->window);
     auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
     if (!presenter) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
@@ -1353,6 +1362,15 @@ PresentState* present_state_for(DeviceProxy* device) {
 std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64_t planes,
                               std::uint64_t params) {
     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
+    // local: pump the presentation window's messages, so Windows does not mark it "not responding". Only that
+    // window's messages: a title's own thread messages stay in its queue.
+    if (state && state->window) {
+        MSG msg;
+        for (int i = 0; i < 64 && PeekMessageW(&msg, state->window, 0, 0, PM_REMOVE); ++i) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
     return hr_to_u64(state->xbox->PresentX(
         static_cast<UINT>(plane_count),
