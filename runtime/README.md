@@ -307,6 +307,13 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   dispatch each that reads its kind-6 program as the code base; malformed directories and untranslated programs
   are refused with `E_INVALIDARG`. Also slot 67 with all four pairs (picked by kind 0), refused pairs, and the
   pipeline's console slot 11.
+- `d3d12_slot57_draw_test` — console device slot 57 (`docs/d3d12_command_objects.md`): three graphics pipelines
+  from a hand-built state blob, pipeline blob and two bare kind-6 programs found by `fspx_code_sha256` in
+  `<shaders>/library/index.json`. Two triangles of opposite winding are drawn with each and read back, which checks
+  the write mask, culling, the front-face bit and blending the state blob asks for. Programs without a translation
+  create nothing. Its SPIR-V is written word by word in the test, so it needs no shader compiler.
+- `slot57_pipeline_state_test`, `slot57_input_layout_test` — the readers of slot 57's two blobs on hand-built
+  bytes, with their refusals. No device.
 - `d3d12_set0_compute_test` — set 0 from the compute bind point: a compute PSO whose index entry lists set-0
   bindings, and four dispatches that sample two SRVs, bytes no view was made for and a clamping sampler through
   the bindless set the layer binds.

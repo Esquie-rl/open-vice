@@ -518,6 +518,33 @@ vtable pointer of a public object.
   PC device stops. The Vulkan device (`LEONIDA_D3D12=vulkan`) takes the container: it hashes the kind-6 bytes of the
   `ACCC` part and creates the pipeline from the translated module, for the programs the build translated; others,
   and a malformed `FSPX` directory, are refused with `E_INVALIDARG`.
+- **Device slot 57** is slot 67's graphics counterpart, called by the retail title about 10,000 times at boot
+  (not by this DLL): `(desc, riid, out)`, the description a root signature and six pointer and size pairs
+  ([fspx.md](fspx.md)). The pairs line up with a graphics record of the pipeline library in `shaders.rpf`
+  ([shader_library.md](shader_library.md) §2): the state blob, the pipeline blob, the pixel program and its stage
+  records, the vertex program and its stage records. The proxy reads the two blobs into a PC
+  `D3D12_GRAPHICS_PIPELINE_STATE_DESC` (`runtime/src/slot57_pipeline_state.h`, `runtime/src/slot57_input_layout.h`):
+  render-target and depth formats, topology type and input elements from the pipeline blob; blend, write masks,
+  depth, stencil, culling, front face, depth clip and depth bias from the state blob's register values. The two
+  programs go on as the description's VS and PS, bare, and `CreateGraphicsPipelineState` on the Vulkan device finds
+  each one's translation by `fspx_code_sha256` under its stage, as it finds a slot-67 compute program. The PC slot 57
+  is `ID3D12Device5::CreateLifetimeTracker`; a call that asks for `ID3D12LifetimeTracker` is forwarded to it.
+  - **What it refuses.** State the reading does not cover is `E_NOTIMPL` (the answer the title got before): topology
+    value 19, the second sample form, a mesh-layout state blob, and words with unread values. A malformed
+    description is `E_INVALIDARG`. Each reason is logged once, with the number of the call that first hit it; a
+    running total is logged at each power of two from 256 calls on.
+  - **A refused or failed call does not stop the title.** Read statically, its pipeline job skips a record whose
+    creation fails and builds that pipeline from its PC-form description through slot 86 when it is first needed.
+  - **What it needs from the build.** The library's vertex and pixel programs translated into
+    `<shaders>/library` with `fspx_code_sha256` in the index (`tools/shader_library.py --stages vs,ps`;
+    `make_game.py` runs `cs` only today). Without them every call misses and the device answers `E_INVALIDARG`.
+  - **Not read:** the stage records (pairs 3 and 5), and whatever the unread words of the two blobs hold. Which
+    program is which stage follows the library record's slot order (#8890 matched the title's first three calls to
+    library records that way). Those three pipelines have topology value 19, so the title's first calls are among
+    the refused ones until that value is identified.
+  - `d3d12_slot57_draw_test` creates three pipelines this way from hand-built blobs and SPIR-V and reads back what
+    they draw; `device_proxy_test` passes a description with host DXBC programs through the proxy, so the host
+    runtime checks the description the proxy builds.
 - **Pipeline slot 11 sizes the compute scratch.** After either path succeeds (slot 67 jumps to `0x5833`), the DLL
   calls the new pipeline's slot 11 as `(0, 0, &obj)` (`0x586d`); the public `ID3D12PipelineState` ends at slot 8, so
   this is a console-only method. On success it reads a dword through `obj`'s slot 3 (`0x5881`), multiplies it by

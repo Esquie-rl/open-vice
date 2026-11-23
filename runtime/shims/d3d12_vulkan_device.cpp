@@ -3356,8 +3356,14 @@ public:
                                                 desc.RasterizerState.DepthBiasClamp};
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
-            stage.fssm = leonida::fssm_program(
-                {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength});
+            const std::span<const std::uint8_t> bytecode{static_cast<const std::uint8_t*>(stage.code.pShaderBytecode),
+                                                         stage.code.BytecodeLength};
+            stage.fssm = leonida::fssm_program(bytecode);
+            // A bare kind-6 program: a pipeline-library build of the stage, what console device slot 57 passes
+            // (docs/fspx.md, "Slot 57"). It is found like a slot-67 compute program, by the SHA-256 of its bytes
+            // (fspx_code_sha256), and those bytes are its code base.
+            const bool native = stage.fssm.empty() && leonida::fspx_bare_program(bytecode);
+            if (native) stage.fssm.assign(bytecode.begin(), bytecode.end());
             if (stage.fssm.empty()) {
                 log_once("shader bytecode holds no FSSM program; bytes", int(stage.code.BytecodeLength));
                 return E_INVALIDARG;
@@ -3366,11 +3372,31 @@ public:
             // Containers with the same program can differ in their input signature or bindings: a VS must have its
             // inputs fed by this input layout (else the layout check below reports it).
             const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
-            stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
-                return !vertex || layout_feeds(e, desc.InputLayout);
-            });
+            const auto fits = [&](const leonida::ShaderEntry& e) { return !vertex || layout_feeds(e, desc.InputLayout); };
+            if (native) {
+                leonida::ComputeProgram program;  // the lookup key of a kind-6 program, whatever its stage
+                program.kind = leonida::ComputeProgram::Kind::fspx;
+                program.bytes = stage.fssm;
+                bool ambiguous = false;
+                stage.entry = pick_entry(library->program_candidates(stage.name, program, &ambiguous), fits);
+                if (ambiguous) {  // translations exist and differ: refused even with LEONIDA_STUB_PIPELINES
+                    std::fprintf(stderr, "[rt] d3d12: pipeline-library %s program sha256 %s is ambiguous: its "
+                                         "translations differ\n", stage.name, hash.c_str());
+                    return E_INVALIDARG;
+                }
+            } else {
+                stage.entry = pick_entry(library->candidates(stage.name, hash), fits);
+            }
             if (!stage.entry) {
-                std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                // A title creates its library pipelines by the thousand: the misses are counted, and named at the
+                // first few and at each power of two.
+                static std::atomic<unsigned> native_misses{0};
+                const unsigned n = native ? ++native_misses : 0;
+                if (!native)
+                    std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                else if (n <= 4 || (n & (n - 1)) == 0)
+                    std::fprintf(stderr, "[rt] d3d12: no translated %s for pipeline-library program sha256 %s "
+                                         "(%u such so far)\n", stage.name, hash.c_str(), n);
                 return stub_or(E_INVALIDARG, "graphics");
             }
             if (stage.entry->binding_count) {

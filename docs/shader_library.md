@@ -75,6 +75,44 @@ distinct input-layout blob references across graphics records. The checked parse
 [`slot57_input_layout.h`](../runtime/src/slot57_input_layout.h) decodes this list for slot 57. The rest of the
 80-byte prefix is outside the parser's scope.
 
+**The 80-byte head of the input-layout ("pipeline") blob** holds the rest of what a D3D12 pipeline description has
+and the state blob's registers lack. Read from the data, over all 25,471 graphics records:
+
+| offset | size | what | checked |
+|---|---:|---|---|
+| `0x00` | 4 | a word that differs in every blob (not read) | |
+| `0x04` | 4 | `0x1000` | every blob |
+| `0x0c` | 4 | 1 with input elements, 0 without; `0x10f` and `0x15f` in 6 records (not read) | |
+| `0x10` | 8 | one `DXGI_FORMAT` byte per render target, non-zero from target 0 upwards | every record |
+| `0x1c` | 4 | `0xffffffff` (probably the sample mask) | every blob |
+| `0x24` | 1 | the depth-stencil `DXGI_FORMAT`: 0, 20, 40, 55, or the console's 118 (`D16_UNORM_S8_UINT`) | every record |
+| `0x25` | 1 | the render-target count, equal to the number of non-zero format bytes | every record |
+| `0x26` | 1 | the primitive topology type: 3 (triangle) in 25,062 records, 2 (line) in 1, **19 in 408** vertex pipelines | |
+| `0x28` | 16 | `(1, 0, 0, 0)`; another form in 21 blobs, probably a multisample description (not read) | |
+| `0x38` | 4 | the byte length of the element list, its count word included | |
+| `0x4c` | 4 | the element count | every blob (above) |
+
+The format bytes agree with the state blob in every (record, target) pair whose pixel program exports that target:
+`R16G16B16A16_FLOAT` goes with the `FP16_ABGR` export, `R10G10B10A2_UNORM` with the `2_10_10_10` down-convert class,
+`R11G11B10_FLOAT` with `10_11_11`, `R9G9B9E5` with `9_9_9_E5`, the 8-bit formats with `8_8_8_8`, `R16_UINT` and
+`R8_UINT` with the `UINT16` export. Stencil is enabled only with the two depth formats that have stencil, bar 12
+records. Topology value 19 is not a `D3D12_PRIMITIVE_TOPOLOGY_TYPE`; what it draws is not established.
+
+Three more words of the **state blob** (vertex layout offsets; the mesh layout has them `0x54` later), read by their
+RDNA2 field layouts as the colour and depth registers were:
+
+| offset | register | values |
+|---|---|---|
+| `0x09c` | `PA_CL_CLIP_CNTL` | `0x80000`, or `0xc080000` (near and far Z clip disabled) in 960 records |
+| `0x0a0` | `PA_SU_SC_MODE_CNTL` | `0x201a40` plus `CULL_FRONT` (bit 0), `CULL_BACK` (bit 1), `FACE` (bit 2): no culling in 13,534 records, back in 11,875 (11,126 of the 12,062 mesh pipelines), front in 62, `FACE` set in 2 |
+| `0x0ac`–`0x0b4` | `PA_SU_POLY_OFFSET_CLAMP`, `_SCALE`, `_OFFSET` (floats) | all 0 in 23,987 records; else a clamp near 0.003, a scale of 16 × a slope of 0.2 to 2.5, an offset of 0, 1 or 5 |
+
+`runtime/src/slot57_pipeline_state.h` reads the head and a vertex-layout state blob into D3D12 values for device
+slot 57 ([d3d12_command_objects.md](d3d12_command_objects.md)), and refuses what is marked "not read" above. With
+these rules it reads 12,966 of the 13,409 vertex records (408 have topology 19, 17 the other sample form, 12 another
+word at state `+0x120`, 6 another word at head `+0x0c`). Assumed, not established: `FACE` = 0 is a counter-clockwise
+front face, alpha-to-coverage is off and the strip-cut value is disabled.
+
 **Compute record** (24 bytes): u64 hash, u32 state blob, u32 blob, u32 program, u32 layout blob. The four parts
 have the sizes and shapes of the four [FSPX](fspx.md) kinds:
 

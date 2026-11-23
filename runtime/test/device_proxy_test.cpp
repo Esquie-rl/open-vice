@@ -29,6 +29,7 @@
 #include "d3d12_xs_device.h"
 #include "shims.h"
 #include "../src/frame_pacer.h"
+#include "slot57_fixture.h"
 
 namespace {
 
@@ -295,6 +296,25 @@ void check_derived_states(ID3D12Device* device, void** proxy_vtbl, ID3D12RootSig
     check(SUCCEEDED(hr) && chained, "slot 55 derives from a derived PSO (its stream is kept too)");
 }
 
+// A vertex and a pixel shader for the slot-57 pipeline: POSITION and COLOR in, the colour out.
+bool load_draw_shaders(ComPtr<ID3DBlob>& vs, ComPtr<ID3DBlob>& ps) {
+    HMODULE compiler = LoadLibraryExA("d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    auto compile = compiler ? reinterpret_cast<pD3DCompile>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+    if (!compile) return false;
+    static const char kSource[] =
+        "struct V { float4 position : SV_Position; float4 color : COLOR; };\n"
+        "V vs(float2 position : POSITION, float4 color : COLOR) {\n"
+        "    V v; v.position = float4(position, 0, 1); v.color = color; return v; }\n"
+        "float4 ps(V v) : SV_Target { return v.color; }\n";
+    ComPtr<ID3DBlob> errors;
+    const HRESULT vs_hr = compile(kSource, sizeof(kSource) - 1, "device_proxy_test.hlsl", nullptr, nullptr, "vs",
+                                  "vs_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, vs.GetAddressOf(), errors.GetAddressOf());
+    const HRESULT ps_hr = compile(kSource, sizeof(kSource) - 1, "device_proxy_test.hlsl", nullptr, nullptr, "ps",
+                                  "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, ps.GetAddressOf(), errors.GetAddressOf());
+    check(SUCCEEDED(vs_hr) && SUCCEEDED(ps_hr) && vs && ps, "the slot-57 vertex and pixel shaders compile");
+    return SUCCEEDED(vs_hr) && SUCCEEDED(ps_hr) && vs && ps;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -351,6 +371,8 @@ int main(int argc, char** argv) {
     check(rt::d3d12_xs::device_slot_overridden(86), "device slot 86 is the CreatePipelineState override");
     check(rt::d3d12_xs::device_slot_overridden(101), "device slot 101 is the CreateStateObject override");
     check(rt::d3d12_xs::device_slot_overridden(108), "device slot 108 is the GetResourceAllocationInfo2 override");
+    check(rt::d3d12_xs::device_slot_overridden(57),
+          "device slot 57 is the native graphics pipeline override (not PC CreateLifetimeTracker)");
     check(rt::d3d12_xs::device_slot_overridden(67),
           "device slot 67 is the DeserializeComputePipelineStateX override (console native-code compute pipeline, not PC CreateProtectedResourceSession1)");
 
@@ -677,6 +699,106 @@ int main(int argc, char** argv) {
         check(rt::d3d12_xs::device_slot_hits(67) == 1, "slot 67 hit counter is 1");
         check(rt::d3d12_xs::device_slot_first_call_seen(67), "slot 67 first-call flag is set");
 
+        // Slot 57: a graphics pipeline from the pipeline library's native records. The proxy reads the state blob and
+        // the pipeline blob into a PC D3D12_GRAPHICS_PIPELINE_STATE_DESC and calls CreateGraphicsPipelineState with
+        // the two programs as VS and PS. Here the programs are host DXBC, so the host runtime checks the description
+        // the proxy built: an invalid enum, format or input layout would fail the call. The PC entry at slot 57 is
+        // CreateLifetimeTracker, which takes none of this.
+        ComPtr<ID3DBlob> draw_vs, draw_ps, ia_root_blob;
+        D3D12_ROOT_SIGNATURE_DESC ia_root_desc{};
+        ia_root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        ComPtr<ID3D12RootSignature> ia_root;
+        if (SUCCEEDED(D3D12SerializeRootSignature(&ia_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                                  ia_root_blob.GetAddressOf(), nullptr)))
+            device->CreateRootSignature(0, ia_root_blob->GetBufferPointer(), ia_root_blob->GetBufferSize(),
+                                        IID_PPV_ARGS(ia_root.GetAddressOf()));
+        check(ia_root != nullptr, "a root signature with the input-assembler flag is created");
+        if (ia_root && load_draw_shaders(draw_vs, draw_ps)) {
+            using namespace slot57test;
+            using Slot57Fn = HRESULT(WINAPI*)(void*, const void*, const IID*, void**);
+            const auto slot57 = reinterpret_cast<Slot57Fn>(proxy_vtbl[57]);
+            const auto bytes = [](ID3DBlob* blob) {
+                const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
+                return Bytes(p, p + blob->GetBufferSize());
+            };
+            const Bytes vs_bytes = bytes(draw_vs.Get()), ps_bytes = bytes(draw_ps.Get());
+            // POSITION float2 at 0, COLOR R8G8B8A8_UNORM at 8 of slot 0; R8G8B8A8_UNORM and R16G16B16A16_FLOAT
+            // targets with D32_FLOAT.
+            const Bytes pipeline = pipeline_blob({28, 10}, 40, 3, {{"POSITION", 0, 16, 0, 0, 0, 0},
+                                                                    {"COLOR", 0, 28, 0, 8, 0, 0}});
+            Bytes state = state_blob();
+            put(state, kRasterMode, 0x201a40u | kCullBack);
+            put(state, kClip, 0xc080000u);                     // depth clip off
+            put(state, kOffsetClamp, 0.0025f);
+            put(state, kOffsetScale, 24.0f);                   // slope factor 1.5
+            put(state, kOffset, 2.0f);
+            put(state, kDepth, 1u | 2u | 4u | (6u << 4) | 0x80u | (2u << 8) | (5u << 20));  // GREATER_EQUAL; stencil
+            put(state, kStencilOps, (3u << 4) | (8u << 20));   // front REPLACE on pass, back INCR on depth fail
+            put(state, kStencilMasks, 0x01f00f00u);
+            put(state, kStencilMasksBack, 0x01f00f00u);
+            put(state, kTargetMask, 0x7fu);                    // target 0 RGBA, target 1 RGB
+            put(state, kBlend0, 0xe5010504u);                  // SRC_ALPHA, INV_SRC_ALPHA; alpha ONE, INV_SRC_ALPHA
+            put(state, kBlend0 + 4, 0xe1010101u);              // additive on target 1: independent blend
+
+            const std::uint64_t hits_before = rt::d3d12_xs::device_slot_hits(57);
+            Desc d57 = desc(ia_root.Get(), state, pipeline, ps_bytes, vs_bytes);
+            ComPtr<ID3D12PipelineState> pso57;
+            hr = slot57(device.Get(), &d57, &iid_pso, reinterpret_cast<void**>(pso57.GetAddressOf()));
+            check(SUCCEEDED(hr) && pso57 != nullptr, "slot 57 creates a graphics PSO from a state and a pipeline blob");
+            check(rt::d3d12_xs::device_slot_hits(57) == hits_before + 1, "slot 57 hit counter counts the call");
+            check(rt::d3d12_xs::device_slot_first_call_seen(57), "slot 57 first-call flag is set");
+
+            // Depth only: no pixel program (pair 2 empty), no render target, a D16_UNORM depth target.
+            const Bytes depth_pipeline = pipeline_blob({}, 55, 3, {{"POSITION", 0, 16, 0, 0, 0, 0},
+                                                                    {"COLOR", 0, 28, 0, 8, 0, 0}});
+            Bytes depth_state = state_blob();
+            put(depth_state, kDepth, 2u | 4u | (1u << 4) | 0x80u | (7u << 8) | (7u << 20));  // LESS, writes
+            Desc depth57 = desc(ia_root.Get(), depth_state, depth_pipeline, {}, vs_bytes);
+            ComPtr<ID3D12PipelineState> depth_pso;
+            hr = slot57(device.Get(), &depth57, &iid_pso, reinterpret_cast<void**>(depth_pso.GetAddressOf()));
+            check(SUCCEEDED(hr) && depth_pso != nullptr, "slot 57 creates a depth-only PSO without a pixel program");
+
+            // The host runtime does read what the proxy passes: the same description without the COLOR element
+            // leaves a vertex input unfed, which CreateGraphicsPipelineState rejects.
+            const Bytes unfed_pipeline = pipeline_blob({28, 10}, 40, 3, {{"POSITION", 0, 16, 0, 0, 0, 0}});
+            Desc unfed57 = desc(ia_root.Get(), state, unfed_pipeline, ps_bytes, vs_bytes);
+            void* unfed_out = reinterpret_cast<void*>(0x1111);
+            hr = slot57(device.Get(), &unfed57, &iid_pso, &unfed_out);
+            check(FAILED(hr) && unfed_out == nullptr, "slot 57 passes on the device's refusal of an unfed vertex input");
+
+            // Refusals before the device: state the reading does not cover is E_NOTIMPL, a malformed description
+            // E_INVALIDARG; the output is nulled either way.
+            const auto refused = [&](const Desc& d, HRESULT want) {
+                void* out57 = reinterpret_cast<void*>(0x1111);
+                return slot57(device.Get(), &d, &iid_pso, &out57) == want && out57 == nullptr;
+            };
+            const Bytes topology19 = pipeline_blob({28, 10}, 40, 19, {{"POSITION", 0, 16, 0, 0, 0, 0},
+                                                                       {"COLOR", 0, 28, 0, 8, 0, 0}});
+            check(refused(desc(ia_root.Get(), state, topology19, ps_bytes, vs_bytes), E_NOTIMPL),
+                  "slot 57 refuses the console topology type 19 with E_NOTIMPL");
+            Bytes mesh_state = state;
+            put(mesh_state, 0x004, 6u);
+            check(refused(desc(ia_root.Get(), mesh_state, pipeline, ps_bytes, vs_bytes), E_NOTIMPL),
+                  "slot 57 refuses a mesh-layout state blob with E_NOTIMPL");
+            Bytes unread_state = state;
+            put(unread_state, kUnread120, 0xe00441u);
+            check(refused(desc(ia_root.Get(), unread_state, pipeline, ps_bytes, vs_bytes), E_NOTIMPL),
+                  "slot 57 refuses a state word it does not read with E_NOTIMPL");
+            Bytes cut_elements = pipeline;
+            cut_elements.resize(cut_elements.size() - 4);
+            check(refused(desc(ia_root.Get(), state, cut_elements, ps_bytes, vs_bytes), E_NOTIMPL),
+                  "slot 57 refuses a pipeline blob whose element list is cut short");
+            check(refused(desc(ia_root.Get(), state, pipeline, ps_bytes, {}), E_INVALIDARG),
+                  "slot 57 refuses a description without a vertex program");
+            check(refused(desc(ia_root.Get(), {}, pipeline, ps_bytes, vs_bytes), E_INVALIDARG),
+                  "slot 57 refuses a description without a state blob");
+            Desc torn = d57;
+            torn.pairs[2].size = 0;  // a pointer without a size
+            check(refused(torn, E_INVALIDARG), "slot 57 refuses a pointer without a size");
+            torn = d57;
+            torn.pairs[0].size = std::uint64_t(1) << 40;
+            check(refused(torn, E_INVALIDARG), "slot 57 refuses a state blob size no library blob has");
+        }
         // Slot 86: CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**), forwarded to PC
         // ID3D12Device2::CreatePipelineState (PC slot 47).
         if (slots > 47) {
@@ -795,6 +917,29 @@ int main(int argc, char** argv) {
         proxy_out = reinterpret_cast<void*>(0x1111);
         hr = reinterpret_cast<Slot67Fn>(proxy_vtbl[67])(device.Get(), &root_desc, nullptr, &proxy_out);
         check(FAILED(hr) && proxy_out == nullptr, "slot 67 nulls its output for a null IID");
+        // Slot 57 takes the same three arguments; a null description is E_INVALIDARG, which is also what the PC
+        // method this slot displaces (CreateLifetimeTracker) answers for a null owner.
+        proxy_out = reinterpret_cast<void*>(0x1111);
+        hr = reinterpret_cast<Slot67Fn>(proxy_vtbl[57])(device.Get(), nullptr, &iid_pso, &proxy_out);
+        check(hr == E_INVALIDARG && proxy_out == nullptr, "slot 57 nulls its output for a null description");
+        proxy_out = reinterpret_cast<void*>(0x1111);
+        hr = reinterpret_cast<Slot67Fn>(proxy_vtbl[57])(device.Get(), &root_desc, nullptr, &proxy_out);
+        check(FAILED(hr) && proxy_out == nullptr, "slot 57 nulls its output for a null IID");
+        // A call that asks for ID3D12LifetimeTracker is the PC method's and gets the PC device's own answer.
+        ComPtr<ID3D12Device5> real5;
+        if (slots > 57 && real && SUCCEEDED(real->QueryInterface(IID_PPV_ARGS(real5.GetAddressOf())))) {
+            const IID iid_tracker = __uuidof(ID3D12LifetimeTracker);
+            void* direct_out = nullptr;
+            const HRESULT direct = real5->CreateLifetimeTracker(nullptr, iid_tracker, &direct_out);
+            const std::uint64_t before57 = rt::d3d12_xs::device_slot_hits(57);
+            proxy_out = nullptr;
+            hr = reinterpret_cast<Slot67Fn>(proxy_vtbl[57])(device.Get(), nullptr, &iid_tracker, &proxy_out);
+            check(hr == direct && (proxy_out != nullptr) == (direct_out != nullptr),
+                  "slot 57 forwards a lifetime-tracker request to PC CreateLifetimeTracker");
+            check(rt::d3d12_xs::device_slot_hits(57) == before57 + 1, "slot 57 counts the forwarded call");
+            if (proxy_out) static_cast<IUnknown*>(proxy_out)->Release();
+            if (direct_out) static_cast<IUnknown*>(direct_out)->Release();
+        }
         using Slot76Fn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
                                           const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
                                           const D3D12_CLEAR_VALUE*, const IID*, void**);

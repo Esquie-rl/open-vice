@@ -31,6 +31,8 @@
 
 #include "d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
+#include "../src/slot57_input_layout.h"    // slot 57: the pipeline blob's input elements
+#include "../src/slot57_pipeline_state.h"  // slot 57: the state blob and the pipeline blob's head
 
 #ifdef LEONIDA_VULKAN_DEVICE
 // PresentX wiring: the queue's console slots land on the Xbox presentation core, which needs the Vulkan layer's
@@ -55,6 +57,8 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -264,6 +268,7 @@ const char* slot_name(unsigned slot) {
         case 46: return "SetResidencyPriority (proxies unwrapped)";
         case 48: return "Xbox CreateCommandQueueX -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+        case 57: return "Xbox graphics pipeline from the library's native records";
         case 61: return "Xbox CreateSamplerX -> PC CreateSampler";
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
@@ -2800,6 +2805,198 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     return hr;
 }
 
+// The Xbox slot 57 creates a graphics pipeline from the pipeline library's native records: (desc, riid, out), the
+// graphics counterpart of slot 67 (docs/fspx.md, "Slot 57"; measured over 10,000 calls of the retail title in #8273).
+// The description is the root signature and six (pointer, size) pairs, which line up with a graphics record of the
+// library in shaders.rpf (docs/shader_library.md sections 2 and 7):
+//   +0x08 pair 0  the state blob: blend, depth, stencil and rasterizer state as GPU register values
+//   +0x18 pair 1  the pipeline blob: render-target and depth formats, topology type, then the input elements
+//   +0x28 pair 2  the pixel program (bare kind 6); empty for a depth-only pipeline
+//   +0x38 pair 3  the pixel stage's records
+//   +0x48 pair 4  the vertex program (bare kind 6)
+//   +0x58 pair 5  the vertex stage's records
+// Which program is which stage follows the library record's order (slot 0 pixel, slot 1 vertex): the title's calls
+// leave pair 2 empty in a few calls and never pair 4, as the library has vertex-only records and no pixel-only ones,
+// and #8890 matched the title's first three calls to library records with the pixel program in pair 2. The same
+// measurement has the title pass IID_ID3D12PipelineState, and topology value 19 in those first three pipelines.
+// The two blobs are read into a PC D3D12_GRAPHICS_PIPELINE_STATE_DESC (src/slot57_pipeline_state.h,
+// src/slot57_input_layout.h) whose VS and PS are the bare programs, and the PC device's CreateGraphicsPipelineState
+// makes the pipeline: the Vulkan device finds each program's translation by the SHA-256 of its bytes, as for slot 67.
+// The stage records (pairs 3 and 5) are not read. The PC slot 57 is ID3D12Device5::CreateLifetimeTracker; a call
+// that asks for that interface is forwarded to it (proxy_slot), every other call comes here.
+//
+// A description whose state this reading does not cover is refused with E_NOTIMPL, the answer the title got from the
+// forwarder before; each reason is logged once. A failed call is not fatal to the title: read statically (#8186), its
+// pipeline job skips a record whose creation fails and builds that pipeline from its PC-form description (slot 86)
+// when a draw first needs it.
+struct XboxNativeGraphicsPipelineStateDesc {
+    ID3D12RootSignature* root_signature;  // +0x00
+    struct Pair {
+        const void* data;
+        std::uint64_t size;
+    } pairs[6];                           // +0x08 .. +0x67
+};
+static_assert(sizeof(XboxNativeGraphicsPipelineStateDesc) == 0x68);
+
+// One line per distinct refusal reason of slot 57 (the reasons are string literals of the two decoders and of the
+// handler), with the number of the call that first hit it.
+void log_slot57_refusal(const char* reason, std::uint64_t call) {
+    static std::mutex mutex;
+    static std::vector<const char*> seen;
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (std::find(seen.begin(), seen.end(), reason) != seen.end()) return;
+    seen.push_back(reason);
+    std::fprintf(stderr, "[rt] d3d12_xs: slot 57 refused (first at call %llu): %s\n",
+                 static_cast<unsigned long long>(call), reason);
+}
+
+HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, const void* desc, const IID* riid,
+                                                        void** out) {
+    note_slot(57);
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!desc) return E_INVALIDARG;
+    if (!riid) return E_POINTER;
+    const auto* xbox_desc = static_cast<const XboxNativeGraphicsPipelineStateDesc*>(desc);
+
+    static std::atomic<std::uint64_t> calls{0}, created{0}, refused{0}, failed{0};
+    const std::uint64_t call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto finish = [&](HRESULT hr) {
+        // A title creates these by the thousand: a running total at each power of two from 256 calls on.
+        if (call >= 256 && (call & (call - 1)) == 0)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 57: %llu calls, %llu pipelines created, %llu refused before the device, "
+                         "%llu failed in the device\n",
+                         static_cast<unsigned long long>(call),
+                         static_cast<unsigned long long>(created.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(refused.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(failed.load(std::memory_order_relaxed)));
+        return hr;
+    };
+    const auto refuse = [&](HRESULT hr, const char* reason) {
+        refused.fetch_add(1, std::memory_order_relaxed);
+        log_slot57_refusal(reason, call);
+        return finish(hr);
+    };
+
+    // Every pair is a pointer with a size or neither, and no larger than a blob or program of the library can be
+    // (the largest program of 1.0.2.1 is under 256 KiB); nothing is read from an inconsistent description.
+    constexpr std::uint64_t kBlobLimit = 1u << 16, kProgramLimit = leonida::kFspxPartLimit;
+    std::span<const std::uint8_t> parts[6];
+    for (int i = 0; i < 6; ++i) {
+        const auto& pair = xbox_desc->pairs[i];
+        if (!pair.data && !pair.size) continue;
+        if (!pair.data || !pair.size || pair.size > (i < 2 ? kBlobLimit : kProgramLimit))
+            return refuse(E_INVALIDARG, "a pointer/size pair is inconsistent or too large");
+        parts[i] = {static_cast<const std::uint8_t*>(pair.data), static_cast<std::size_t>(pair.size)};
+    }
+    const std::span<const std::uint8_t> state_blob = parts[0], pipeline_blob = parts[1], ps = parts[2], vs = parts[4];
+    if (state_blob.empty() || pipeline_blob.empty())
+        return refuse(E_INVALIDARG, "the description has no state blob or no pipeline blob");
+    if (vs.empty()) return refuse(E_INVALIDARG, "the description has no vertex program (pair 4)");
+
+    leonida::slot57::PipelineState state;
+    const char* why = nullptr;
+    if (!leonida::slot57::decode_pipeline_head(pipeline_blob, state, &why) ||
+        !leonida::slot57::decode_state_blob(state_blob, state, &why))
+        return refuse(E_NOTIMPL, why ? why : "the description could not be read");
+    std::optional<std::vector<leonida::Slot57InputElement>> elements;
+    try {
+        elements = leonida::parse_slot57_input_layout(pipeline_blob);
+    } catch (...) {
+        return finish(E_OUTOFMEMORY);
+    }
+    if (!elements) return refuse(E_NOTIMPL, "the pipeline blob's input elements could not be read");
+    if (elements->size() > 32)  // D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT
+        return refuse(E_INVALIDARG, "the pipeline blob has more than 32 input elements");
+
+    D3D12_INPUT_ELEMENT_DESC input[32] = {};
+    for (std::size_t i = 0; i < elements->size(); ++i) {
+        const leonida::Slot57InputElement& e = (*elements)[i];
+        if (e.input_slot_class > D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA)
+            return refuse(E_NOTIMPL, "an input element's classification is not per-vertex or per-instance");
+        input[i].SemanticName = e.semantic_name.c_str();
+        input[i].SemanticIndex = e.semantic_index;
+        input[i].Format = static_cast<DXGI_FORMAT>(e.format);
+        input[i].InputSlot = e.input_slot;
+        input[i].AlignedByteOffset = e.aligned_byte_offset;
+        input[i].InputSlotClass = static_cast<D3D12_INPUT_CLASSIFICATION>(e.input_slot_class);
+        input[i].InstanceDataStepRate = e.instance_data_step_rate;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pc{};
+    pc.pRootSignature = xbox_desc->root_signature;
+    pc.VS = {vs.data(), vs.size()};
+    pc.PS = {ps.data(), ps.size()};  // empty: depth only
+    // ASSUMED off: alpha to coverage, whose register is not identified in the state blob.
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        const leonida::slot57::BlendTarget& from = state.blend[i];
+        D3D12_RENDER_TARGET_BLEND_DESC& to = pc.BlendState.RenderTarget[i];
+        to.BlendEnable = from.enable;
+        to.SrcBlend = static_cast<D3D12_BLEND>(from.src);
+        to.DestBlend = static_cast<D3D12_BLEND>(from.dest);
+        to.BlendOp = static_cast<D3D12_BLEND_OP>(from.op);
+        to.SrcBlendAlpha = static_cast<D3D12_BLEND>(from.src_alpha);
+        to.DestBlendAlpha = static_cast<D3D12_BLEND>(from.dest_alpha);
+        to.BlendOpAlpha = static_cast<D3D12_BLEND_OP>(from.op_alpha);
+        to.LogicOp = D3D12_LOGIC_OP_NOOP;
+        to.RenderTargetWriteMask = from.write_mask;
+        // The registers hold one blend state per target; D3D12 reads target 0's for all unless told otherwise.
+        if (i > 0 && i < state.render_targets &&
+            std::memcmp(&to, &pc.BlendState.RenderTarget[0], sizeof(to)) != 0)
+            pc.BlendState.IndependentBlendEnable = TRUE;
+    }
+    pc.SampleMask = state.sample_mask;
+    pc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pc.RasterizerState.CullMode = static_cast<D3D12_CULL_MODE>(state.cull_mode);
+    pc.RasterizerState.FrontCounterClockwise = state.front_counter_clockwise;
+    pc.RasterizerState.DepthBias = state.depth_bias;
+    pc.RasterizerState.DepthBiasClamp = state.depth_bias_clamp;
+    pc.RasterizerState.SlopeScaledDepthBias = state.slope_scaled_depth_bias;
+    pc.RasterizerState.DepthClipEnable = state.depth_clip;
+    pc.DepthStencilState.DepthEnable = state.depth_enable;
+    pc.DepthStencilState.DepthWriteMask = state.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    pc.DepthStencilState.DepthFunc = static_cast<D3D12_COMPARISON_FUNC>(state.depth_func);
+    pc.DepthStencilState.StencilEnable = state.stencil_enable;
+    pc.DepthStencilState.StencilReadMask = state.stencil_read_mask;
+    pc.DepthStencilState.StencilWriteMask = state.stencil_write_mask;
+    const auto face = [](const leonida::slot57::StencilFace& from) {
+        D3D12_DEPTH_STENCILOP_DESC to{};
+        to.StencilFailOp = static_cast<D3D12_STENCIL_OP>(from.fail);
+        to.StencilDepthFailOp = static_cast<D3D12_STENCIL_OP>(from.depth_fail);
+        to.StencilPassOp = static_cast<D3D12_STENCIL_OP>(from.pass);
+        to.StencilFunc = static_cast<D3D12_COMPARISON_FUNC>(from.func);
+        return to;
+    };
+    pc.DepthStencilState.FrontFace = face(state.front);
+    pc.DepthStencilState.BackFace = face(state.back);
+    pc.InputLayout = {input, static_cast<UINT>(elements->size())};
+    pc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;  // ASSUMED: not found in either blob
+    pc.PrimitiveTopologyType = static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(state.topology_type);
+    pc.NumRenderTargets = state.render_targets;
+    for (std::uint32_t i = 0; i < 8; ++i) pc.RTVFormats[i] = static_cast<DXGI_FORMAT>(state.rtv_formats[i]);
+    pc.DSVFormat = static_cast<DXGI_FORMAT>(state.dsv_format);
+    pc.SampleDesc.Count = state.sample_count;
+
+    const HRESULT hr = self->real->CreateGraphicsPipelineState(&pc, *riid, out);
+    if (SUCCEEDED(hr)) {
+        created.fetch_add(1, std::memory_order_relaxed);
+        return finish(hr);
+    }
+    // The first failures and each power of two are named with the sizes that tell the calls apart.
+    const std::uint64_t n = failed.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 4 || (n & (n - 1)) == 0)
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 57 call %llu failed with 0x%08lx (%llu so far; state %llu B, pipeline %llu "
+                     "B, %u elements, %u targets, PS %llu B, VS %llu B)\n",
+                     static_cast<unsigned long long>(call), static_cast<unsigned long>(hr),
+                     static_cast<unsigned long long>(n), static_cast<unsigned long long>(state_blob.size()),
+                     static_cast<unsigned long long>(pipeline_blob.size()), static_cast<unsigned>(elements->size()),
+                     static_cast<unsigned>(state.render_targets), static_cast<unsigned long long>(ps.size()),
+                     static_cast<unsigned long long>(vs.size()));
+    return finish(hr);
+}
+
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
                               D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
                               D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
@@ -3239,6 +3436,19 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_command_signature(
             self, reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1), a2, reinterpret_cast<const IID*>(a3),
             reinterpret_cast<void**>(a4)));
+    } else if constexpr (Slot == 57) {
+        // The console call asks for a pipeline state. A PC caller of the method this slot displaces,
+        // ID3D12Device5::CreateLifetimeTracker(owner, riid, out), asks for a lifetime tracker and is forwarded, so
+        // its owner is never read as a description.
+        const auto* const iid = reinterpret_cast<const IID*>(a2);
+        if (iid && IsEqualGUID(*iid, __uuidof(ID3D12LifetimeTracker)) && Slot < self->slot_count) {
+            note_slot(Slot);
+            using TrackerFn = HRESULT(WINAPI*)(ID3D12Device*, std::uint64_t, const IID*, std::uint64_t);
+            return hr_to_u64(reinterpret_cast<TrackerFn>(self->real_vtable[Slot])(self->real, a1, iid, a3));
+        }
+        return hr_to_u64(proxy_create_graphics_pipeline_from_native_code(
+            self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
+            reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 67) {
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
@@ -3547,7 +3757,7 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 ||
         slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 ||
-        slot == 50 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 74 || slot == 75 || slot == 76 || slot == 55 ||
+        slot == 50 || slot == 57 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 74 || slot == 75 || slot == 76 || slot == 55 ||
         slot == 86 || slot == 101 || slot == 108 || slot == 127 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
