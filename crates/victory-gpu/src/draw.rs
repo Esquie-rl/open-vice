@@ -691,11 +691,20 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        failed("");
+        let ran = self.dispatch_inner(list, x, y, z);
+        #[cfg(feature = "diagnostics")]
+        self.report(true, format_args!("dispatch {x}x{y}x{z}"), ran);
+        let _ = ran;
+    }
+
+    fn dispatch_inner(&mut self, list: &HostList, x: u32, y: u32, z: u32) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            failed("skipped pipeline");
+            return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
@@ -705,21 +714,71 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            failed("no host pipeline (shader not translated)");
+            return false;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
-            return;
+            failed("a dispatch with a graphics pipeline");
+            return false;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Open Vice frame report (diagnostics): for the frames listed in
+    /// `VICTORY_CAPTURE_FRAMES`, one line per draw, mesh dispatch, dispatch
+    /// and indirect execution, in recording order, at target
+    /// `victory_gpu::frame_report`: the pipeline, the topology, the render
+    /// targets and depth (size and format), the unordered access views the
+    /// shaders write, and whether it ran or why it was dropped. With the
+    /// targets the capture saves (`VICTORY_DUMP_TARGETS`), it names the
+    /// pass a frame loses its picture at.
+    #[cfg(feature = "diagnostics")]
+    fn report(&self, compute: bool, kind: std::fmt::Arguments, ran: bool) {
+        if !crate::capture::listed(crate::queue::presented() + 1) {
+            return;
+        }
+        let name = crate::pipeline::host_pipeline(self.pipeline as This)
+            .map_or_else(|| format!("no host pipeline {:#x}", self.pipeline), |p| p.name.clone());
+        let size = |t: usize| {
+            crate::resource::host_resource(t as This).map(|r| {
+                // SAFETY: a live resource.
+                let d = unsafe { r.GetDesc() };
+                format!("{t:#x} {}x{} f{}", d.Width, d.Height, d.Format.0)
+            })
+        };
+        let (targets, depth): (Vec<String>, Option<String>) = if compute {
+            (Vec::new(), None)
+        } else {
+            (
+                self.targets.iter().filter_map(|&t| size(t)).collect(),
+                (self.depth != 0).then(|| size(self.depth)).flatten(),
+            )
+        };
+        let writes: Vec<String> = self
+            .reads(compute)
+            .into_iter()
+            .filter(|r| r.contains("Uav"))
+            .collect();
+        let outcome = if ran {
+            "ran".to_owned()
+        } else {
+            format!("DROPPED: {}", FAILED.with(std::cell::Cell::get))
+        };
+        tracing::info!(
+            target: "victory_gpu::frame_report",
+            "{kind} topology {} {name} targets {targets:?} depth {depth:?} uav {writes:?} -> {outcome}",
+            self.topology
+        );
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -762,6 +821,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        failed("");
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -781,6 +841,8 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        #[cfg(feature = "diagnostics")]
+        self.report(false, format_args!("mesh {x}"), ran);
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -1015,10 +1077,16 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        failed("");
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        if !ran && rects && failed_reason().is_empty() {
+            failed("rectangles not expanded");
+        }
+        #[cfg(feature = "diagnostics")]
+        self.report(false, format_args!("draw {vertices}x{instances}"), ran);
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -1106,12 +1174,16 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        failed("");
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
+            failed("indexed rectangle topology");
         }
         let ran = self.topology != RECTANGLES && self.prepare(list, true);
+        #[cfg(feature = "diagnostics")]
+        self.report(false, format_args!("indexed {indices}x{instances}"), ran);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -1144,6 +1216,24 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        failed("");
+        let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
+        #[cfg(feature = "diagnostics")]
+        self.report(
+            kind == 2,
+            format_args!("indirect kind {kind} max {max} counted {}", count.is_some()),
+            ran,
+        );
+        ran
+    }
+
+    fn execute_indirect_inner(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -1160,14 +1250,14 @@ impl State {
         let why = |_: &str| {};
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
-            why("arguments outside title buffers");
+            why("arguments outside title buffers"); failed("arguments outside title buffers");
             return false;
         };
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
-                    why("count outside title buffers");
+                    why("count outside title buffers"); failed("count outside title buffers");
                     return false;
                 }
             },
@@ -1177,7 +1267,7 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
-            why("no host signature");
+            why("no host signature"); failed("no host signature");
             return false;
         };
         args.refresh(list, arguments, len);
@@ -1186,7 +1276,7 @@ impl State {
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            why("not bounded (no clamp, or arguments not 4-byte aligned)"); failed("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
         self.host_pipeline = 0;
@@ -1254,6 +1344,14 @@ fn failed(why: &'static str) {
 
 #[cfg(not(feature = "diagnostics"))]
 fn failed(_: &'static str) {}
+
+/// The reason [`failed`] last noted on this thread ("" without diagnostics).
+fn failed_reason() -> &'static str {
+    #[cfg(feature = "diagnostics")]
+    return FAILED.with(std::cell::Cell::get);
+    #[cfg(not(feature = "diagnostics"))]
+    ""
+}
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made

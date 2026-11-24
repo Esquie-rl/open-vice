@@ -133,7 +133,32 @@ impl Shader {
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
-    let host = crate::shader_cache::host_shader(container, target)?;
+    // Open Vice: a program the host's wave sizes refuse (NVIDIA's 32 lanes:
+    // Grand Theft Auto VI's world mesh shaders read lane masks as data) is
+    // translated for any wave size instead, as VIctory did before it knew
+    // the host's: the world's geometry was drawn then, and refusing it
+    // drops every world draw (the picture stays black). What a program
+    // reads across lanes may come out wrong on 32 lanes; loops stay
+    // bounded. `VICTORY_STRICT_WAVES` keeps the refusal.
+    let host = match crate::shader_cache::host_shader(container, target) {
+        Ok(host) => host,
+        Err(e) if target != victory_shader::emit::Target::ANY
+            && std::env::var_os("VICTORY_STRICT_WAVES").is_none() =>
+        {
+            match crate::shader_cache::host_shader(container, victory_shader::emit::Target::ANY) {
+                Ok(host) => {
+                    tracing::info!(
+                        stage = ?host.stage,
+                        refused = %e,
+                        "translated for any wave size: the host's refused it"
+                    );
+                    host
+                }
+                Err(_) => return Err(e),
+            }
+        }
+        Err(e) => return Err(e),
+    };
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
