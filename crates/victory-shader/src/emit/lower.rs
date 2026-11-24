@@ -323,6 +323,52 @@ enum MaskData {
     None,
 }
 
+/// Open Vice: whether two scalar loads read the same entry: the same
+/// instruction and offset, from registers that hold the same values once
+/// trivial joins and `v_readfirstlane_b32` (a waterfall loop's own copy of
+/// the lane's value) are looked through.
+fn same_entry(p: &Program, a: &Inst, b: &Inst) -> bool {
+    let (Fields::Smem { offset: oa, .. }, Fields::Smem { offset: ob, .. }) = (&a.fields, &b.fields)
+    else {
+        return false;
+    };
+    if a.name() != b.name() || oa != ob || a.reads.len() != b.reads.len() {
+        return false;
+    }
+    let canonical = |mut v: Value| {
+        for _ in 0..16 {
+            let def = p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.writes.iter().any(|&(_, w)| w == v));
+            if let Some(i) = def {
+                match i.reads.iter().find(|(r, _)| matches!(r, Reg::V(_))) {
+                    Some(&(_, s)) if i.name() == "v_readfirstlane_b32" => {
+                        v = s;
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+            let Some(phi) = p.blocks.iter().flat_map(|b| &b.phis).find(|ph| ph.value == v) else {
+                break;
+            };
+            let mut others = phi.args.iter().copied().filter(|&x| x != v);
+            match others.next() {
+                Some(first) if others.all(|x| x == first) => v = first,
+                _ => break,
+            }
+        }
+        v
+    };
+    a.reads.iter().all(|&(r, v)| {
+        b.reads
+            .iter()
+            .any(|&(rb, vb)| rb == r && (vb == v || canonical(vb) == canonical(v)))
+    })
+}
+
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
@@ -1695,6 +1741,19 @@ impl<'a> Lower<'a> {
             return Err("an image result");
         };
         let c = self.cur;
+        // Diagnostics (Open Vice): `VICTORY_GATHER_LEVEL_CONST=<float>` makes
+        // every gather at a level return that value, to tell a depth pyramid's
+        // contents from the code that tests them.
+        if let Some(k) = std::env::var("VICTORY_GATHER_LEVEL_CONST")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+        {
+            let x = self.s.m.i32(k.to_bits());
+            for k in 0..4u8 {
+                self.write(inst, Reg::V(reg + k), x, guard);
+            }
+            return Ok(());
+        }
         // The level follows the coordinates (and the array slice).
         let lod = float_at(self, first + coords)?;
         let f32t = self.s.t.f32;
@@ -3472,8 +3531,59 @@ impl<'a> Lower<'a> {
                     _ => None,
                 })
             });
+        // Open Vice: a load used only for its numbers, where another load of
+        // the same entry is used as a view (Grand Theft Auto VI's indirect
+        // compute passes 88f6e5d9, a5dcdb5a, df1c34cb: one waterfall loop
+        // over a per-lane texture reads its size and level fields, a later
+        // one samples it). That use tells the view's kind; the handle is
+        // still this load's.
+        let use_at = use_at.or_else(|| {
+            let p = self.x.p;
+            self.x
+                .res
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .find_map(|d| {
+                    d.source.leaves().into_iter().find_map(|l| match *l {
+                        Source::Loaded { load, first }
+                            if same_entry(p, inst, &p.blocks[load.0].insts[load.1]) =>
+                        {
+                            Some((d.site, first))
+                        }
+                        _ => None,
+                    })
+                })
+        });
         let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
+            // Open Vice: a sampler's words read as numbers, where a register
+            // that held a sampler on one path joins one that holds data on
+            // another (Grand Theft Auto VI's indirect compute pass 88f6e5d9:
+            // the joined value is read only on the data path). A sampler's
+            // words have no host value.
+            // shortcut: they read 0 (`VICTORY_STRICT_DESCRIPTOR_DATA` refuses).
+            let sampler = self.x.res.descriptors.iter().any(|d| {
+                d.role == Role::Sampler
+                    && d.source.leaves().into_iter().any(
+                        |l| matches!(*l, Source::Loaded { load, .. } if load == site),
+                    )
+            });
+            if sampler && std::env::var_os("VICTORY_STRICT_DESCRIPTOR_DATA").is_none() {
+                let zero = self.s.m.i32(0);
+                for k in 0..count {
+                    self.write(inst, Reg::S(code + k as u8), zero, None);
+                }
+                return Ok(());
+            }
+            if std::env::var_os("VICTORY_DEBUG_DESC").is_some() {
+                let off = inst.machine.offset;
+                eprintln!("descriptor data: load {off:#x} {} sampler {sampler}", inst.name());
+            }
+            return Err(if sampler {
+                "a sampler's words read as data"
+            } else {
+                "a descriptor read only as data"
+            });
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -6750,9 +6860,21 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(fu);
-                    self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    if !self.s.pixel {
+                        // Open Vice: implicit derivatives outside a pixel
+                        // shader (Grand Theft Auto VI's compute passes; the
+                        // console takes them from lane quads), which DXIL's
+                        // `sample` refuses there.
+                        // shortcut: the base level.
+                        let lod = self.s.m.f32(0);
+                        args.push(lod);
+                        self.s
+                            .op(c, "sampleLevel.f32", Attr::ReadOnly, self.s.t.res_ret, 62, &args)
+                    } else {
+                        args.push(fu);
+                        self.s
+                            .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    }
                 }
                 61 => {
                     let bias = addr_val(self, 0)?;

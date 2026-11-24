@@ -781,6 +781,7 @@ impl State {
     /// pass a frame loses its picture at.
     #[cfg(feature = "diagnostics")]
     fn report(&self, compute: bool, kind: std::fmt::Arguments, ran: bool) {
+        crate::probe::flush();
         if !crate::capture::listed(crate::queue::presented() + 1) {
             return;
         }
@@ -1276,6 +1277,8 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         failed("");
+        #[cfg(feature = "diagnostics")]
+        PROBED.with(|p| p.set(None));
         let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
         #[cfg(feature = "diagnostics")]
         {
@@ -1287,8 +1290,9 @@ impl State {
             self.report(
                 kind == 2,
                 format_args!(
-                    "indirect kind {kind} max {max} counted {} at {arguments:#x} args {args:?}",
-                    count.is_some()
+                    "indirect kind {kind} max {max} counted {} at {arguments:#x} args {args:?} probe {:?}",
+                    count.is_some(),
+                    PROBED.with(std::cell::Cell::get)
                 ),
                 ran,
             );
@@ -1460,6 +1464,10 @@ impl State {
             (&args.buffer, args.offset(arguments)),
             counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
         );
+        #[cfg(feature = "diagnostics")]
+        PROBED.with(|p| {
+            p.set(crate::probe::record(list, &args.buffer, args.offset(arguments), u64::from(stride)))
+        });
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1474,6 +1482,8 @@ impl State {
 #[cfg(feature = "diagnostics")]
 thread_local! {
     static FAILED: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+    /// The probe slot of the last indirect execution (see crate::probe).
+    static PROBED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(feature = "diagnostics")]

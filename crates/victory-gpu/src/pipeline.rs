@@ -109,13 +109,23 @@ impl Shader {
             .get_or_init(|| {
                 let done = translate(&self.container);
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            "shader translated"
+                        );
+                        // Open Vice: `VICTORY_SHADER_DUMP_ALL=<folder>` (outside
+                        // the repository) keeps translated shaders too.
+                        if let Some(dir) = std::env::var_os("VICTORY_SHADER_DUMP_ALL") {
+                            let path = std::path::Path::new(&dir)
+                                .join(format!("{}-{}.dxbc", self.stage, self.hash));
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(path, &self.container);
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(
                             stage = self.stage,

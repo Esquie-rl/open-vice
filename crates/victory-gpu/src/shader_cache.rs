@@ -53,6 +53,13 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                // Translation switches read from the environment.
+                for name in ["VICTORY_GATHER_LEVEL_CONST", "VICTORY_STRICT_DESCRIPTOR_DATA"] {
+                    if let Some(v) = std::env::var_os(name) {
+                        bytes.extend_from_slice(name.as_bytes());
+                        bytes.extend_from_slice(v.as_encoded_bytes());
+                    }
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
