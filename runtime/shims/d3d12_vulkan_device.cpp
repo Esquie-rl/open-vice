@@ -3251,6 +3251,33 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
     return S_OK;
 }
 
+// local: LEONIDA_CAPTURE_SHADERS=<folder> saves the container of each shader that has no translation as
+// <folder>/<stage>_<first 16 hex digits of its FSSM sha256>.dxbc (once per program), so the work folder's tools can
+// translate it into <shaders>/captured. The files are the title's shaders: they stay in the work folder.
+void capture_missing_shader(const char* stage, const std::string& hash, const void* code, SIZE_T size) {
+    static const std::wstring dir = [] {
+        wchar_t v[MAX_PATH] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_CAPTURE_SHADERS", v, MAX_PATH);
+        return n && n < MAX_PATH ? std::wstring(v, n) : std::wstring();
+    }();
+    if (dir.empty() || !code || size < 32 || size > (64u << 20)) return;
+    const bool dxbc = std::memcmp(code, "DXBC", 4) == 0;
+    std::wstring path = dir + L"\\";
+    for (const char* c = stage; *c; ++c) path += wchar_t(*c);
+    path += L"_";
+    for (std::size_t i = 0; i < 16 && i < hash.size(); ++i) path += wchar_t(hash[i]);
+    path += dxbc ? L".dxbc" : L".bin";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;  // already captured (or the folder is not writable)
+    DWORD written = 0;
+    const BOOL ok = WriteFile(file, code, static_cast<DWORD>(size), &written, nullptr);
+    CloseHandle(file);
+    std::fprintf(stderr, "[rt] d3d12: captured the missing %s shader %.16s (%s, %llu bytes)%s\n", stage, hash.c_str(),
+                 dxbc ? "DXBC container" : "not a DXBC container", static_cast<unsigned long long>(size),
+                 ok && written == size ? "" : ": write failed");
+}
+
 class PipelineState final
     : public Child<PipelineState, XboxPipelineStateStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12PipelineState> {
@@ -3490,6 +3517,7 @@ public:
             });
             if (!stage.entry) {
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                capture_missing_shader(stage.name, hash, stage.code.pShaderBytecode, stage.code.BytecodeLength);
                 return stub_or(E_INVALIDARG, "graphics");
             }
             if (stage.entry->binding_count) {
@@ -8794,6 +8822,11 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->graphics() ? p->id() : 0;
+}
+
+bool stub_pipeline(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && !p->compute() && !p->graphics();
 }
 
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {

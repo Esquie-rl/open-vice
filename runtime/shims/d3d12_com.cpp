@@ -13,7 +13,9 @@
 #include <bit>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
+#include <source_location>
 #include <optional>
 #include <cstdio>
 #include <cstring>
@@ -216,8 +218,14 @@ public:
     // reports it.
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
-        if (list_.queries_open()) invalid_ = true;
-        if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
+        if (list_.queries_open()) {
+            if (!invalid_) note_once("Close: a query was begun and not ended; the list is invalid");
+            invalid_ = true;
+        }
+        if (!list_.close()) {
+            note_once("Close on a list that is not recording: E_FAIL");
+            return d3d12_trace::result(method, E_FAIL);
+        }
         stop_recording();
         return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
     }
@@ -485,6 +493,7 @@ public:
     void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override {
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
+        if (!graphics_pipeline_ && stub_bound_) return note_stub_drop("mesh draw");
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
@@ -698,6 +707,22 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
+        // LOCAL DIAGNOSTIC: LEONIDA_DIAG_CLEAR=1 clears every render target to magenta, to check that what is drawn
+        // reaches the window at all.
+        static const bool diag_clear = [] {
+            wchar_t v[4] = {};
+            return GetEnvironmentVariableW(L"LEONIDA_DIAG_CLEAR", v, 4) > 0 && v[0] == L'1';
+        }();
+        static const FLOAT magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+        if (diag_clear) color = magenta;
+        {  // LOCAL DIAGNOSTIC: what the first clears target and with which colour.
+            static std::atomic<unsigned> shown{0};
+            if (shown.fetch_add(1, std::memory_order_relaxed) < 40) {
+                const auto& t = *reinterpret_cast<const leonida::TargetView*>(view.ptr);
+                std::fprintf(stderr, "[rt] diag: clear rtv resource %llu mip %u color %.3f %.3f %.3f %.3f\n",
+                             static_cast<unsigned long long>(t.resource), t.mip, color[0], color[1], color[2], color[3]);
+            }
+        }
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
                                         {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
     }
@@ -864,6 +889,7 @@ public:
         cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
         cmd.count_offset = count_buffer ? count_buffer_offset : 0;
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
+            if (!compute_pipeline_ && stub_bound_) return note_stub_drop("indirect dispatch");
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
             cmd.user_data = compute_.data;
@@ -1024,8 +1050,20 @@ private:
         return out;
     }
 
-    void check(bool ok) {
-        if (!ok) invalid_ = true;
+    void check(bool ok, std::source_location where = std::source_location::current()) {
+        if (ok) return;
+        if (!invalid_) {
+            // Which check first made this recording invalid: once per (line, method), then every 1000th.
+            static std::mutex mutex;
+            static std::map<std::pair<unsigned, std::string>, unsigned long long> seen;
+            const char* method = d3d12_trace::last_method ? d3d12_trace::last_method : "?";
+            std::lock_guard lock(mutex);
+            const auto n = ++seen[{static_cast<unsigned>(where.line()), method}];
+            if (n == 1 || n % 1000 == 0)
+                std::fprintf(stderr, "[rt] d3d12: list invalid at d3d12_com.cpp:%u in %s (%llu times)\n",
+                             static_cast<unsigned>(where.line()), method, n);
+        }
+        invalid_ = true;
     }
 
     void stop_recording() {
@@ -1262,6 +1300,7 @@ private:
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
     std::uintptr_t graphics_pipeline_ = 0;
+    bool stub_bound_ = false;  // the bound PSO is a LEONIDA_STUB_PIPELINES stub
     ID3D12DescriptorHeap* cbv_srv_uav_heap_ = nullptr;
     ID3D12DescriptorHeap* sampler_heap_ = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base_ = 0;
@@ -1326,8 +1365,17 @@ private:
         hold(state);
         compute_pipeline_ = compute_pipeline_id(state);
         graphics_pipeline_ = graphics_pipeline_id(state);
-        if (state && !compute_pipeline_ && !graphics_pipeline_)
+        // A LEONIDA_STUB_PIPELINES stub binds no pipeline, and the draws and dispatches it would run are dropped
+        // instead of making the recording invalid (D3D-482): the rest of the list still runs.
+        stub_bound_ = state && !compute_pipeline_ && !graphics_pipeline_ && stub_pipeline(state);
+        if (state && !compute_pipeline_ && !graphics_pipeline_ && !stub_bound_) {
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
+            // LOCAL DIAGNOSTIC: which objects these are (the first few, with their vtable pointer).
+            static std::atomic<unsigned> shown{0};
+            if (shown.fetch_add(1, std::memory_order_relaxed) < 6)
+                std::fprintf(stderr, "[rt] d3d12: foreign pipeline %p vtable %p\n", static_cast<void*>(state),
+                             *reinterpret_cast<void**>(state));
+        }
     }
 
     void set_descriptor_heaps(ID3D12DescriptorHeap* cbv, D3D12_GPU_VIRTUAL_ADDRESS cbv_base,
@@ -1394,7 +1442,17 @@ private:
                       : leonida::IndexBufferView{};
     }
 
+    // A draw or dispatch dropped because a stub PSO is bound: counted, the first one and every power of two logged.
+    static void note_stub_drop(const char* what) {
+        static std::atomic<unsigned long long> dropped{0};
+        const unsigned long long n = dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_STUB_PIPELINES: %s with a stub pipeline dropped (%llu so far)\n",
+                         what, n);
+    }
+
     void record_dispatch(UINT x, UINT y, UINT z) {
+        if (!compute_pipeline_ && stub_bound_) return note_stub_drop("dispatch");
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         note_direct_heap_indexing(compute_.layout);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
@@ -1415,7 +1473,23 @@ private:
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
-        if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        {  // LOCAL DIAGNOSTIC: the first draws' pipeline and first render target.
+            static std::atomic<unsigned> shown{0};
+            if (shown.fetch_add(1, std::memory_order_relaxed) < 60)
+                std::fprintf(stderr, "[rt] diag: draw pipeline %llu%s rt0 %llu (%u targets) count %u inst %u vp %.0fx%.0f\n",
+                             static_cast<unsigned long long>(graphics_pipeline_), stub_bound_ ? " (stub)" : "",
+                             static_cast<unsigned long long>(render_targets_[0].resource), render_target_count_, count,
+                             instances, viewport_.width, viewport_.height);
+        }
+        if (!graphics_pipeline_ && stub_bound_) return note_stub_drop("draw");
+        static const bool diag_no_draw = [] {  // LOCAL DIAGNOSTIC: LEONIDA_DIAG_NODRAW=1 drops every draw
+            wchar_t v[4] = {};
+            return GetEnvironmentVariableW(L"LEONIDA_DIAG_NODRAW", v, 4) > 0 && v[0] == L'1';
+        }();
+        if (diag_no_draw) return;
+        if (!graphics_pipeline_) return check(false);
+        if (!graphics_.layout) return check(false);
+        if (!topology_) return check(false);
         note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.

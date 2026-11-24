@@ -198,6 +198,16 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
         log_once(logged_planes_, "PresentX with 2 planes and no overlay flag on plane 1: only plane 0 is shown (plane 1 is taken "
                                  "as the GameDVR copy of the frame)");
     const bool compose = hdr0 || placement(planes[0]) || filter_of(planes[0]) != xbox_scale_filter_default || overlay;
+    {  // LOCAL DIAGNOSTIC: which resource the first presents show.
+        static unsigned shown = 0;
+        if (shown++ < 8 && planes[0].ppResources && planes[0].ppResources[0]) {
+            const D3D12_RESOURCE_DESC d = planes[0].ppResources[0]->GetDesc();
+            std::fprintf(stderr, "[rt] diag: present resource %llu %llux%u format %d planes %u compose %d hdr %d\n",
+                         static_cast<unsigned long long>(resource_id(planes[0].ppResources[0])),
+                         static_cast<unsigned long long>(d.Width), d.Height, int(d.Format), plane_count,
+                         int(compose), int(hdr0));
+        }
+    }
 
     if (compose) {
         // Every shown plane: a 2D texture, a source rectangle inside it, a placement inside the output.

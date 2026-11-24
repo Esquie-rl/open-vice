@@ -762,7 +762,9 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* folder : {"fspx", "bvh", "library"}) {
+        // local: "captured" holds the containers the runtime saved when it met a shader it had no translation for
+        // (LEONIDA_CAPTURE_SHADERS, found by fssm_sha256), "library_gfx" the pipeline library's graphics programs.
+        for (const char* folder : {"fspx", "bvh", "library", "captured", "library_gfx", "library_pri"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = dir / folder;

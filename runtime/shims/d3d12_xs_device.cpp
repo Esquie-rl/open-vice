@@ -2095,6 +2095,64 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
     }
 }
 
+// Console list slots 50-54 (PC 46-50) take CPU descriptor handles. With a title-placed heap (the custom ranges of
+// register_descriptor_range) those are the title's addresses, which the real list cannot read: they are translated
+// to the real heap here, as device slots 17-24 translate theirs. Typed functions rather than list_slot, because
+// ClearDepthStencilView's depth is a float the caller passes in XMM2, which the translation's calls may clobber.
+constexpr unsigned kConsoleOMSetRenderTargets = 50;
+constexpr unsigned kConsoleClearDepthStencilView = 51;
+constexpr unsigned kConsoleClearRenderTargetView = 52;
+constexpr unsigned kConsoleClearUavUint = 53;
+constexpr unsigned kConsoleClearUavFloat = 54;
+static_assert(console_to_pc_list_slot(kConsoleOMSetRenderTargets) == 46 &&
+                  console_to_pc_list_slot(kConsoleClearUavFloat) == 50,
+              "slots 50-54 are the PC chain's OMSetRenderTargets..ClearUnorderedAccessViewFloat");
+
+void WINAPI list_om_set_render_targets(ListProxy* self, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs,
+                                       BOOL single_range, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
+    note_list_slot(kConsoleOMSetRenderTargets, count, reinterpret_cast<std::uint64_t>(rtvs),
+                   static_cast<std::uint64_t>(single_range), reinterpret_cast<std::uint64_t>(dsv));
+    // One handle for a contiguous range: the range is contiguous in the real heap too. A count past D3D12's limit
+    // is forwarded as it is, for the real list to reject.
+    const UINT translated = !rtvs || !count ? 0u : single_range ? 1u : count;
+    if (translated > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT)
+        return self->real->OMSetRenderTargets(count, rtvs, single_range, dsv);
+    D3D12_CPU_DESCRIPTOR_HANDLE rt[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    for (UINT i = 0; i < translated; ++i) rt[i] = translate_cpu_handle(self->device, rtvs[i]);
+    D3D12_CPU_DESCRIPTOR_HANDLE ds{};
+    if (dsv) ds = translate_cpu_handle(self->device, *dsv);
+    self->real->OMSetRenderTargets(count, rtvs ? rt : nullptr, single_range, dsv ? &ds : nullptr);
+}
+
+void WINAPI list_clear_depth_stencil_view(ListProxy* self, D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags,
+                                          FLOAT depth, UINT8 stencil, UINT count, const D3D12_RECT* rects) {
+    note_list_slot(kConsoleClearDepthStencilView, view.ptr, static_cast<std::uint64_t>(flags), stencil, count);
+    self->real->ClearDepthStencilView(translate_cpu_handle(self->device, view), flags, depth, stencil, count, rects);
+}
+
+void WINAPI list_clear_render_target_view(ListProxy* self, D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT* color,
+                                          UINT count, const D3D12_RECT* rects) {
+    note_list_slot(kConsoleClearRenderTargetView, view.ptr, reinterpret_cast<std::uint64_t>(color), count,
+                   reinterpret_cast<std::uint64_t>(rects));
+    self->real->ClearRenderTargetView(translate_cpu_handle(self->device, view), color, count, rects);
+}
+
+void WINAPI list_clear_uav_uint(ListProxy* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                                ID3D12Resource* resource, const UINT* values, UINT count, const D3D12_RECT* rects) {
+    note_list_slot(kConsoleClearUavUint, gpu.ptr, cpu.ptr, reinterpret_cast<std::uint64_t>(resource),
+                   reinterpret_cast<std::uint64_t>(values));
+    self->real->ClearUnorderedAccessViewUint(gpu, translate_cpu_handle(self->device, cpu), resource, values, count,
+                                             rects);
+}
+
+void WINAPI list_clear_uav_float(ListProxy* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                                 ID3D12Resource* resource, const FLOAT* values, UINT count, const D3D12_RECT* rects) {
+    note_list_slot(kConsoleClearUavFloat, gpu.ptr, cpu.ptr, reinterpret_cast<std::uint64_t>(resource),
+                   reinterpret_cast<std::uint64_t>(values));
+    self->real->ClearUnorderedAccessViewFloat(gpu, translate_cpu_handle(self->device, cpu), resource, values, count,
+                                              rects);
+}
+
 template <std::size_t... I>
 void fill_list_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&list_slot<static_cast<unsigned>(I)>) ), ...);
@@ -2104,6 +2162,11 @@ void** get_list_vtable() {
     static void** vtable = [] {
         static void* storage[kListSlots];
         fill_list_vtable(storage, std::make_index_sequence<kListSlots>{});
+        storage[kConsoleOMSetRenderTargets] = reinterpret_cast<void*>(&list_om_set_render_targets);
+        storage[kConsoleClearDepthStencilView] = reinterpret_cast<void*>(&list_clear_depth_stencil_view);
+        storage[kConsoleClearRenderTargetView] = reinterpret_cast<void*>(&list_clear_render_target_view);
+        storage[kConsoleClearUavUint] = reinterpret_cast<void*>(&list_clear_uav_uint);
+        storage[kConsoleClearUavFloat] = reinterpret_cast<void*>(&list_clear_uav_float);
         return storage;
     }();
     return vtable;
@@ -3281,6 +3344,38 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
     return reinterpret_cast<std::uint64_t>(ret);
 }
 
+// LOCAL DIAGNOSTIC: reads `count` qwords at `address` without faulting; false when any of them is unreadable.
+bool read_qwords(std::uint64_t address, std::uint64_t* out, unsigned count) {
+    if (address < 0x10000) return false;
+    __try {
+        for (unsigned i = 0; i < count; ++i) out[i] = reinterpret_cast<const volatile std::uint64_t*>(address)[i];
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// LOCAL DIAGNOSTIC: the arguments of an unmodelled device slot and the first words each pointer argument points at,
+// for the first few calls. Stays on this machine (it prints title addresses).
+void diag_device_slot(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4,
+                      std::uint64_t a5) {
+    static std::atomic<unsigned> calls{0};
+    const unsigned call = calls.fetch_add(1, std::memory_order_relaxed);
+    if (call >= 6) return;
+    std::fprintf(stderr, "[rt] d3d12_xs: diag slot %u call %u args %llx %llx %llx %llx %llx\n", slot, call,
+                 static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                 static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                 static_cast<unsigned long long>(a5));
+    const std::uint64_t args[] = {a1, a2, a3, a4, a5};
+    for (unsigned i = 0; i < 5; ++i) {
+        std::uint64_t w[16];
+        if (!read_qwords(args[i], w, 16)) continue;
+        std::fprintf(stderr, "[rt] d3d12_xs: diag slot %u call %u *a%u:", slot, call, i + 1);
+        for (unsigned j = 0; j < 16; ++j) std::fprintf(stderr, " %llx", static_cast<unsigned long long>(w[j]));
+        std::fprintf(stderr, "\n");
+    }
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -3417,6 +3512,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                     reinterpret_cast<D3D12_HEAP_PROPERTIES*>(self), reinterpret_cast<DeviceProxy*>(a1),
                     static_cast<UINT>(a2), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3))));
         }
+        if constexpr (Slot == 57) diag_device_slot(Slot, a1, a2, a3, a4, a5);
         note_slot(Slot);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
