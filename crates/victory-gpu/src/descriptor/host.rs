@@ -198,8 +198,10 @@ impl HostHeap {
                     return None;
                 }
             }
-        // After the dynamic slots: the guard slot (#483), then the raw view
-        // pool (#704).
+        // After the dynamic slots: the raw view pool (#704), then the guard
+        // slot (#483), last: shaders read the guard for any computed index
+        // at or past it, so the pool (indexed through the runtime stride
+        // table) must come before it.
         } else if let Ok(heap) = make(count + DYNAMIC + 1 + aliases) {
             (heap, count, DYNAMIC)
         } else {
@@ -255,7 +257,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra + guard) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             strides,
-            alias_base: count + extra + guard,
+            alias_base: count + extra,
             aliases: Mutex::new(Aliases {
                 of: HashMap::new(),
                 free: Vec::new(),
@@ -393,13 +395,13 @@ impl HostHeap {
     /// The slot translated shaders read in place of a computed heap index
     /// at or past it (a stale buffer can give any index, and one past the
     /// heap hangs some GPUs): in a view heap its last slot, after the
-    /// dynamic ones, null from the start and never made; in a sampler heap
-    /// its last slot (any sampler reads safely).
+    /// dynamic ones and the raw view pool, null from the start and never
+    /// made; in a sampler heap its last slot (any sampler reads safely).
     pub(crate) fn guard_slot(&self) -> u32 {
         if self.sampler {
             self.count.saturating_sub(1)
         } else {
-            self.count + self.dynamic
+            self.alias_base + ALIASES
         }
     }
 

@@ -115,16 +115,25 @@ fn program() -> HostShader {
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = victory_shader::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
-    let io = victory_shader::io::raise(&p, &native).unwrap();
     let st = victory_shader::structure::structure(&p).unwrap();
+    let res = victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = victory_shader::io::raise(&p, &native).unwrap();
     // An empty container (no signature parts): the tag, a digest, version
     // 1, its size, no parts.
     let mut container = b"DXBC".to_vec();
     container.extend([0; 16]);
     container.extend([1u32, 32, 0].into_iter().flat_map(u32::to_le_bytes));
     let c = victory_shader::Container::parse(&container).unwrap();
-    let cs = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+    let cs = victory_shader::emit::emit(
+        &c,
+        &native,
+        &p,
+        &st,
+        &io,
+        &res,
+        victory_shader::emit::Target::ANY,
+    )
+    .unwrap();
     assert!(cs.stride_table);
     cs
 }
@@ -201,9 +210,19 @@ fn dispatch(
     heap: &HostHeap,
     root: &ID3D12RootSignature,
     pso: &ID3D12PipelineState,
-    user_data: u32,
+    cs: &HostShader,
 ) -> windows::core::Result<()> {
-    let zeros = vec![0u32; user_data as usize];
+    // The console's user data are zeros; a heap's guard dword names its
+    // guard slot (#483), as draws set it.
+    let user_data = cs.user_data_dwords();
+    let mut zeros = vec![0u32; user_data as usize];
+    for u in &cs.user_data {
+        if u.root == RootType::ResourceHeap
+            && let Some(d) = zeros.get_mut(u.index as usize)
+        {
+            *d = heap.guard_slot();
+        }
+    }
     // SAFETY: an open list with every root argument set; the heap, its
     // table and the buffers its views read outlive the wait.
     unsafe {
@@ -320,7 +339,7 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
         unsafe {
             slots_copy.cast::<[u32; 2]>().write(chosen);
             out.add(5).cast::<[u32; 8]>().write([0; 8]);
-            dispatch(device, &heap, &root, &pso, cs.user_data_dwords()).expect("a dispatch");
+            dispatch(device, &heap, &root, &pso, &cs).expect("a dispatch");
             out.add(5).cast::<[u32; 8]>().read()
         }
     };
