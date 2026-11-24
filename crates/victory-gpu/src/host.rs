@@ -965,6 +965,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
+        crate::watch::next_submission();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
@@ -1916,16 +1917,32 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
+        // Open Vice: a block found unmapped lately reads zeros without
+        // asking the kernel page by page again (`watch::known_unmapped`).
+        if crate::watch::known_unmapped(at) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to.write_bytes(0, n) };
+            return;
+        }
         if !read(at as *const u8, to, n) {
+            let mut any = false;
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                if read(at as *const u8, to, n) {
+                    any = true;
+                } else {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
                     unsafe { to.write_bytes(0, n) };
                 }
             });
+            // A whole block with no readable page.
+            if !any && n == 64 << 10 {
+                crate::watch::note_unmapped(at);
+            }
         }
     });
 }

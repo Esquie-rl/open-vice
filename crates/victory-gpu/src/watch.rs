@@ -35,13 +35,95 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// Open Vice: the submission (see [`next_submission`]) and the page
+    /// ranges asked during it for its refreshes.
+    asked_in: (u64, Vec<(usize, usize)>),
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    asked_in: (0, Vec::new()),
 });
+
+/// Numbers the host's submissions (Open Vice).
+static SUBMISSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A host submission starts being prepared.
+pub(crate) fn next_submission() {
+    SUBMISSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Open Vice: 64 KiB blocks of title memory a copy found unmapped (none of
+/// their 4 KiB pages readable), by block, with the submission that found
+/// them. The world's copies cross ~208 MB of unmapped memory per frame,
+/// and each crossing asked the kernel for every 4 KiB page (about 53,000
+/// failed reads per frame). A block is taken as unmapped for
+/// [`UNMAPPED_FOR`] submissions (about two frames) or until the runtime
+/// maps memory there ([`title_memory_remapped`]).
+/// shortcut: memory the title commits without the runtime telling us reads
+/// as zeros for up to that long.
+static UNMAPPED: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+const UNMAPPED_FOR: u64 = 64;
+
+/// Whether the 64 KiB block holding `at` was found unmapped lately.
+pub(crate) fn known_unmapped(at: usize) -> bool {
+    let now = SUBMISSION.load(std::sync::atomic::Ordering::Relaxed);
+    let mut u = UNMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    match u.get(&(at >> 16)) {
+        Some(&found) if now.wrapping_sub(found) < UNMAPPED_FOR => true,
+        Some(_) => {
+            u.remove(&(at >> 16));
+            false
+        }
+        None => false,
+    }
+}
+
+/// The 64 KiB block holding `at` has no readable page.
+pub(crate) fn note_unmapped(at: usize) {
+    let now = SUBMISSION.load(std::sync::atomic::Ordering::Relaxed);
+    let mut u = UNMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    if u.len() > 1 << 20 {
+        u.clear();
+    }
+    u.insert(at >> 16, now);
+}
+
+/// [`writes`] for the refreshes of a submission (Open Vice): a range
+/// already asked during this submission is answered from the journal
+/// without asking the kernel again. The world refreshes overlapping views
+/// of its big heaps dozens of times per submission: 1,761 kernel askings,
+/// 96 ms, per world frame. `VICTORY_NO_WATCH_MEMO` asks every time.
+/// shortcut: a title write between two refreshes of one submission's
+/// preparation shows at the next submission, as one right after the
+/// first refresh would.
+pub(crate) fn writes_in_submission(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("VICTORY_NO_WATCH_MEMO").is_some()) {
+        return writes(start, end, true);
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let submission = SUBMISSION.load(std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if j.asked_in.0 != submission {
+            j.asked_in.0 = submission;
+            j.asked_in.1.clear();
+        }
+        if j.asked_in.1.iter().any(|&(a, b)| a <= first && last <= b) {
+            let written = j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+            return Some((j.asked, written));
+        }
+    }
+    let answer = writes(start, end, true)?;
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if j.asked_in.0 == submission && j.asked_in.1.len() < 4096 {
+        j.asked_in.1.push((first, last));
+    }
+    Some(answer)
+}
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -217,6 +299,14 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    {
+        let mut u = UNMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+        if !u.is_empty() {
+            for block in at >> 16..at.saturating_add(len).div_ceil(1 << 16) {
+                u.remove(&block);
+            }
+        }
+    }
     let mut g = guards();
     let blocks: Vec<usize> = g
         .protected
