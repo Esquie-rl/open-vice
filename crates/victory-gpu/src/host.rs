@@ -2268,7 +2268,7 @@ impl Host {
                 }
                 if let Some(o) = p.overlay.as_mut() {
                     let text = p.meter.overlay.clone();
-                    o.record(&self.device, list, &back, (width, height), &text, |r, a, b| transition(r, a, b));
+                    o.record(&self.device, list, &back, (width, height), &text, transition);
                     back_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 }
             }

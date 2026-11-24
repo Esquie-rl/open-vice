@@ -106,7 +106,7 @@ fn rasterize(text: &str, px: i32, w: u32, h: u32) -> Vec<u8> {
             let _ = TextOutW(dc, margin, margin, &wide);
             let _ = GdiFlush();
             let pixels = std::slice::from_raw_parts(bits.cast::<u8>(), wu * hu * 4);
-            for (c, p) in coverage.iter_mut().zip(pixels.chunks_exact(4)) {
+            for (c, p) in coverage.iter_mut().zip(pixels.as_chunks::<4>().0) {
                 *c = p[0].max(p[1]).max(p[2]);
             }
             SelectObject(dc, old_font);
@@ -137,7 +137,7 @@ fn rasterize(text: &str, px: i32, w: u32, h: u32) -> Vec<u8> {
         }
     }
     let mut rgba = vec![0u8; wu * hu * 4];
-    for ((px, &c), &o) in rgba.chunks_exact_mut(4).zip(&coverage).zip(&wide) {
+    for ((px, &c), &o) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(&coverage).zip(&wide) {
         let (c, o) = (f32::from(c) / 255.0, f32::from(o) / 255.0);
         let a = c + o * (1.0 - c);
         let v = (c * 255.0).round() as u8; // white, premultiplied

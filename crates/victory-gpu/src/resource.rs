@@ -1298,7 +1298,7 @@ fn hand_out_resource(
             AT_ADDRESS[0].fetch_add(1, Relaxed);
             let made = AT_ADDRESS[1].fetch_add(1, Relaxed) + 1;
             AT_ADDRESS[2].fetch_add(footprint(&desc).map_or(0, |i| i.size), Relaxed);
-            if made.is_power_of_two() || made % 4096 == 0 {
+            if made.is_power_of_two() || made.is_multiple_of(4096) {
                 tracing::info!(made, kib = bytes >> 10, console_kib = footprint(&desc).map_or(0, |i| i.size) >> 10, ?desc, "texture at an address");
             }
         }
