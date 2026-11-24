@@ -1400,6 +1400,10 @@ std::uint64_t queue_present_x(ChildProxy*, std::uint64_t, std::uint64_t, std::ui
 
 #endif
 
+// local: a console queue slot that submits command lists (defined after the list proxy).
+bool queue_execute_x(ChildProxy* self, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                     std::uint64_t a4, std::uint64_t& out);
+
 template <ChildKind K, unsigned Slot>
 std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1531,6 +1535,15 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 return hr_to_u64(S_OK);
             }
             if (Slot == (newer ? 32u : 30u)) return queue_present_x(self, a1, a2, a3);  // PresentX
+            if constexpr (K == ChildKind::queue) {
+                if (Slot >= 31 && Slot <= 40) {
+                    // local: the title submits its command lists through a console queue slot past the public
+                    // chain (no ExecuteCommandLists reaches slot 10). A call whose arguments are a count and an
+                    // array of that many console list proxies is executed as ExecuteCommandLists.
+                    std::uint64_t submitted = 0;
+                    if (queue_execute_x(self, Slot, a1, a2, a3, a4, submitted)) return submitted;
+                }
+            }
             if (Slot >= self->slot_count || (newer && (Slot == 14 || Slot == 15))) {
                 d3d12_trace::record(child_trace_name<K>(Slot), "console-only");
                 return hr_to_u64(S_OK);  // unmodelled console queue methods: frame pacing flows through them
@@ -3353,6 +3366,51 @@ bool read_qwords(std::uint64_t address, std::uint64_t* out, unsigned count) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+// local: queue slots 31-40 past the public chain. The title submits its lists through one of them; the shapes
+// (count, lists), (lists, count) and a single list are recognised by the console list proxies they hold, and run as
+// the real queue's ExecuteCommandLists (PC slot 10). Anything else stays the console-only no-op.
+bool queue_execute_x(ChildProxy* self, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                     std::uint64_t a4, std::uint64_t& out) {
+    static std::atomic<unsigned> shown{0};
+    const unsigned n_shown = shown.fetch_add(1, std::memory_order_relaxed);
+    if (n_shown < 6) {
+        std::fprintf(stderr, "[rt] d3d12_xs: queue slot %u args %llx %llx %llx %llx\n", slot,
+                     static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                     static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+    }
+    // A list proxy, read without faulting: an argument may be a small integer or any pointer.
+    const auto list_proxy = [](std::uint64_t p) {
+        std::uint64_t vtable = 0;
+        return read_qwords(p, &vtable, 1) && vtable == reinterpret_cast<std::uint64_t>(get_list_vtable());
+    };
+    const auto run = [&](std::uint64_t count, std::uint64_t array, const char* shape) -> bool {
+        if (count == 0 || count > 64) return false;
+        std::uint64_t ptrs[64];
+        if (!read_qwords(array, ptrs, static_cast<unsigned>(count))) return false;
+        ID3D12CommandList* lists[64];
+        for (std::uint64_t i = 0; i < count; ++i) {
+            if (!list_proxy(ptrs[i])) return false;
+            lists[i] = static_cast<ID3D12CommandList*>(reinterpret_cast<const ListProxy*>(ptrs[i])->real);
+        }
+        using Fn = void(WINAPI*)(IUnknown*, UINT, ID3D12CommandList* const*);
+        reinterpret_cast<Fn>(self->real_vtable[10])(self->real, static_cast<UINT>(count), lists);
+        d3d12_trace::record("XboxID3D12CommandQueue::ExecuteCommandListsX", "ok");
+        static std::atomic<std::uint64_t> calls{0};
+        const std::uint64_t c = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (c == 1 || (c & (c - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12_xs: queue slot %u %s: %llu list(s) executed (%llu calls so far)\n", slot,
+                         shape, static_cast<unsigned long long>(count), static_cast<unsigned long long>(c));
+        out = hr_to_u64(S_OK);
+        return true;
+    };
+    if (run(a1, a2, "(count, lists)")) return true;
+    if (list_proxy(a1)) return run(1, reinterpret_cast<std::uint64_t>(&a1), "(list)");
+    if (run(a2, a1, "(lists, count)")) return true;
+    if (run(a2, a3, "(x, count, lists)")) return true;
+    if (run(a3, a2, "(x, lists, count)")) return true;
+    return false;
 }
 
 // LOCAL DIAGNOSTIC: the arguments of an unmodelled device slot and the first words each pointer argument points at,

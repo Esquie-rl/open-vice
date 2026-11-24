@@ -2305,7 +2305,16 @@ private:
                 occlusion_resolve_->sum_binary(cb, pool, first, count, dst, offset);
             };
         }
-        const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
+        const auto resolve = [this](ResourceId id) {
+            const auto* binding = context_.resolve(id);
+            if (!binding && id) {  // LOCAL DIAGNOSTIC: the first unresolved resource ids
+                static std::atomic<unsigned> shown{0};
+                if (shown.fetch_add(1, std::memory_order_relaxed) < 12)
+                    std::fprintf(stderr, "[rt] diag: replay cannot resolve resource %llu\n",
+                                 static_cast<unsigned long long>(id));
+            }
+            return binding;
+        };
         std::uint32_t segments = 0, statistics_segments = 0;
         bool has_queries = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {

@@ -1714,6 +1714,7 @@ public:
             recorded.push_back(&list->commands());
             graphics.push_back(list);
         }
+        retry_pending_host_imports();
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)

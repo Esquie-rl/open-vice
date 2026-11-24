@@ -1962,7 +1962,10 @@ public:
     HRESULT create_host_buffer(void* address) {
         auto& vk = device_.context->vk;
         const VkDeviceSize alignment = device_.info.host_pointer_alignment;
-        if (!device_.get_host_pointer_properties || !alignment) return E_NOTIMPL;
+        if (!device_.get_host_pointer_properties || !alignment) {
+            std::fprintf(stderr, "[rt] diag: host import: no VK_EXT_external_memory_host on this device\n");
+            return E_NOTIMPL;
+        }
         const auto start = reinterpret_cast<std::uintptr_t>(address);
         if (!address || !desc_.Width || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
         // The import starts at the page that holds `address`, and the buffer is bound at the offset inside it: the
@@ -1976,11 +1979,32 @@ public:
         // three mapped windows); a page not committed yet (xmem commits on first touch) or a write-combined one (on
         // an RTX 5090 such an import succeeded but GPU reads returned wrong bytes, found in review) is not imported,
         // and the ordinary-buffer fallback answers instead.
+        // local: xmem maps each physical page as a view of a SEC_RESERVE section and commits it on the first CPU touch,
+        // so pages the title has mapped but not touched read as MEM_RESERVE / MEM_MAPPED. They are committed here (the
+        // section's pages, whatever another view of them already holds), which is what a touch would do. A range
+        // with no view yet stays pending.
+        for (VkDeviceSize at = 0; at < bytes;) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (!VirtualQuery(static_cast<const char*>(base_address) + at, &region, sizeof(region))) break;
+            const auto region_end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+            if (region.State == MEM_RESERVE && region.Type == MEM_MAPPED) {
+                if (!VirtualAlloc(region.BaseAddress, region.RegionSize, MEM_COMMIT, PAGE_READWRITE)) {
+                    static std::atomic<unsigned> shown{0};
+                    if (shown.fetch_add(1, std::memory_order_relaxed) < 4)
+                        std::fprintf(stderr, "[rt] d3d12: commit of the title's view %p failed (%lu)\n",
+                                     region.BaseAddress, GetLastError());
+                }
+            }
+            at = region_end - base;
+        }
         bool importable = true;
         for (VkDeviceSize at = 0; at < bytes;) {
             MEMORY_BASIC_INFORMATION region{};
             if (!VirtualQuery(static_cast<const char*>(base_address) + at, &region, sizeof(region)) ||
                 region.State != MEM_COMMIT || (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE))) {
+                // local: pages the title has reserved but not mapped yet (it creates the resource before it maps
+                // the physical pages). E_PENDING: the caller keeps the resource and retries the import later.
+                if (region.State == MEM_RESERVE) return E_PENDING;
                 importable = false;
                 break;
             }
@@ -2004,13 +2028,21 @@ public:
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
         VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-        if (device_.get_host_pointer_properties(device_.info.device,
-                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, base_address,
-                                                &host) != VK_SUCCESS)
+        if (const VkResult r = device_.get_host_pointer_properties(
+                device_.info.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, base_address, &host);
+            r != VK_SUCCESS) {
+            std::fprintf(stderr, "[rt] diag: host import of %p: vkGetMemoryHostPointerPropertiesEXT %d\n", base_address,
+                         int(r));
             return E_NOTIMPL;
+        }
         const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
         // An offset off the buffer's own alignment cannot be bound: the fallback answers.
-        if (!types || (offset % requirements.alignment) || bytes < offset + requirements.size) return E_NOTIMPL;
+        if (!types || (offset % requirements.alignment) || bytes < offset + requirements.size) {
+            std::fprintf(stderr, "[rt] diag: host import of %p: types 0x%x/0x%x offset %llu align %llu\n", base_address,
+                         host.memoryTypeBits, requirements.memoryTypeBits, static_cast<unsigned long long>(offset),
+                         static_cast<unsigned long long>(requirements.alignment));
+            return E_NOTIMPL;
+        }
         VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         import.pHostPointer = base_address;
@@ -2748,6 +2780,30 @@ bool equal_semantic(const std::string& a, const char* b) {
         if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
     return true;
 }
+// local: title-placed buffers (device slot 133) whose pages were only reserved when the title created them. Each
+// holds a reference; retry_pending_host_imports imports the pages once the title has mapped them, and drops the
+// resources the title has released.
+struct PendingHostImport {
+    Resource* resource;
+    void* address;
+};
+std::mutex& pending_host_mutex() {
+    static std::mutex m;
+    return m;
+}
+std::vector<PendingHostImport>& pending_host_imports() {
+    static std::vector<PendingHostImport> v;
+    return v;
+}
+std::atomic<std::size_t> g_pending_host_count{0};
+
+void add_pending_host_import(Resource* resource, void* address) {
+    resource->AddRef();
+    std::lock_guard lock(pending_host_mutex());
+    pending_host_imports().push_back({resource, address});
+    g_pending_host_count.store(pending_host_imports().size(), std::memory_order_release);
+}
+
 // A heap (section 3.3): a range of the GPU address arena, as large as the game asked for, so a placed buffer can
 // name any 64 KiB-aligned offset in it. Textures placed in it still get their own VkDeviceMemory; the offset is only
 // their key, which keeps optimal-tiling images out of the arena's memory type.
@@ -7176,6 +7232,16 @@ public:
             resource->Release();
             return d3d12_trace::result(method, hr);
         }
+        if (hr == E_PENDING) {
+            // local: the pages are reserved, not mapped yet; the import is retried before each submission.
+            static std::atomic<unsigned> shown{0};
+            if (shown.fetch_add(1, std::memory_order_relaxed) < 4)
+                std::fprintf(stderr, "[rt] d3d12: title-placed buffer at %p (%llu bytes) waits for its pages to be "
+                                     "mapped; imported later\n",
+                             address, static_cast<unsigned long long>(desc.Width));
+            add_pending_host_import(resource, address);
+            return d3d12_trace::result(method, hand_out(resource, riid, out));
+        }
         if (FAILED(hr)) {
             // The driver would not import these pages: RADV refuses a view of a pagefile-backed section, the form
             // xmem's physical pages take (found in review on an RX 9070 XT under Wine), and a device without
@@ -8822,6 +8888,57 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->graphics() ? p->id() : 0;
+}
+
+void retry_pending_host_imports() {
+    if (g_pending_host_count.load(std::memory_order_acquire) == 0) return;
+    std::lock_guard lock(pending_host_mutex());
+    auto& pending = pending_host_imports();
+    for (auto it = pending.begin(); it != pending.end();) {
+        // Only our reference left: the title released the resource.
+        if (it->resource->AddRef() == 2) {
+            it->resource->Release();
+            it->resource->Release();
+            it = pending.erase(it);
+            continue;
+        }
+        it->resource->Release();
+        const HRESULT hr = it->resource->create_host_buffer(it->address);
+        if (hr == E_PENDING) {
+            static std::atomic<unsigned> mapped_logs{0};  // LOCAL DIAGNOSTIC: the range's map, a few times
+            if (mapped_logs.fetch_add(1, std::memory_order_relaxed) % 200 == 0) {
+                const auto width = it->resource->GetDesc().Width;
+                std::uint64_t committed = 0, regions = 0, committed_regions = 0, first_reserved = width;
+                for (std::uint64_t at = 0; at < width;) {
+                    MEMORY_BASIC_INFORMATION r{};
+                    if (!VirtualQuery(static_cast<const char*>(it->address) + at, &r, sizeof(r))) break;
+                    const std::uint64_t end = reinterpret_cast<std::uintptr_t>(r.BaseAddress) + r.RegionSize -
+                                              reinterpret_cast<std::uintptr_t>(it->address);
+                    const std::uint64_t len = (end < width ? end : width) - at;
+                    ++regions;
+                    if (r.State == MEM_COMMIT) {
+                        committed += len;
+                        ++committed_regions;
+                    } else if (first_reserved == width) {
+                        first_reserved = at;
+                    }
+                    at = end;
+                }
+                std::fprintf(stderr, "[rt] diag: pending %p: %llu of %llu bytes mapped in %llu of %llu regions; first "
+                                     "unmapped at +0x%llx\n",
+                             it->address, static_cast<unsigned long long>(committed),
+                             static_cast<unsigned long long>(width), static_cast<unsigned long long>(committed_regions),
+                             static_cast<unsigned long long>(regions), static_cast<unsigned long long>(first_reserved));
+            }
+            ++it;
+            continue;
+        }
+        std::fprintf(stderr, "[rt] d3d12: title-placed buffer at %p: deferred import %s (0x%08lx)\n", it->address,
+                     SUCCEEDED(hr) ? "done" : "failed", static_cast<unsigned long>(hr));
+        it->resource->Release();
+        it = pending.erase(it);
+    }
+    g_pending_host_count.store(pending.size(), std::memory_order_release);
 }
 
 bool stub_pipeline(ID3D12PipelineState* pipeline) {
