@@ -82,6 +82,13 @@ Manettes XInput. Sans manette, le clavier sert de manette quand la fenêtre du j
 
 La liste complète est dans le README d'origine de VIctory.
 
+## Contribuer
+
+1. Clonez le dépôt et ouvrez-le avec votre agent de code (Claude Code lit `CLAUDE.md`, les autres `AGENTS.md`) : les règles et la méthode de travail y sont.
+2. Annoncez votre sujet dans l'issue épinglée **« Coordination : qui travaille sur quoi »**.
+3. Créez une branche, puis ouvrez une pull request vers `open-vice-monde` : le contrôle « No Game Data » et la relecture du propriétaire sont obligatoires.
+
+Règle n° 1 : **aucune donnée du jeu** dans le dépôt, les issues ou les pull requests. Chacun utilise sa propre copie du jeu, en local. Le détail est dans [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Licence et crédits
 
 GPL-3.0-or-later, voir [LICENSE](LICENSE). Basé sur VIctory (https://github.com/Marvisak/VIctory) ; les
