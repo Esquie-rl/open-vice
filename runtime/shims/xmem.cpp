@@ -219,7 +219,11 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
 constexpr DWORD kPageGraphicsMask = 0x0007F800;
 
 DWORD host_protect(DWORD p) {
-    const DWORD cpu = p & ~kPageGraphicsMask;
+    // local: no cache modifier either. A write-combined (0x400) or uncached (0x200) host allocation cannot be
+    // imported as a GPU buffer (an import of WC pages read wrong bytes on NVIDIA, #7218), so the title's buffers placed
+    // there (device slot 133) were ordinary buffers its writes never reached. Cached memory is coherent for the host
+    // import; only the CPU's write speed differs.
+    const DWORD cpu = p & ~kPageGraphicsMask & ~static_cast<DWORD>(PAGE_WRITECOMBINE | PAGE_NOCACHE);
     return cpu ? cpu : PAGE_NOACCESS;
 }
 

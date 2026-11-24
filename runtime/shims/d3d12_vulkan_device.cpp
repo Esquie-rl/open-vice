@@ -2004,7 +2004,17 @@ public:
                 region.State != MEM_COMMIT || (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE))) {
                 // local: pages the title has reserved but not mapped yet (it creates the resource before it maps
                 // the physical pages). E_PENDING: the caller keeps the resource and retries the import later.
-                if (region.State == MEM_RESERVE) return E_PENDING;
+                if (region.State == MEM_RESERVE || region.State == MEM_FREE) return E_PENDING;
+                static std::atomic<unsigned> shown{0};  // LOCAL DIAGNOSTIC
+                if (shown.fetch_add(1, std::memory_order_relaxed) < 6)
+                    std::fprintf(stderr,
+                                 "[rt] diag: host import of %p (+%llu of %llu bytes): region %p size %llu state 0x%lx "
+                                 "protect 0x%lx type 0x%lx\n",
+                                 base_address, static_cast<unsigned long long>(at),
+                                 static_cast<unsigned long long>(bytes), region.BaseAddress,
+                                 static_cast<unsigned long long>(region.RegionSize),
+                                 static_cast<unsigned long>(region.State), static_cast<unsigned long>(region.Protect),
+                                 static_cast<unsigned long>(region.Type));
                 importable = false;
                 break;
             }

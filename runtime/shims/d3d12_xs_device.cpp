@@ -3070,6 +3070,24 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
 
 // The Xbox routes at their configured indices. Returns false when `slot` is none of them. The built-in handlers of
 // slots 70 and 74 ask too, because an override that moves a route onto their slot must win over the built-in handler.
+// local: device slot 81. Answered by the presentation once PresentX made one; before that, no frame: S_FALSE, 0.
+HRESULT proxy_get_frame_statistics_x(DeviceProxy* self, std::uint64_t token, std::uint64_t type_mask,
+                                     std::uint64_t count_word, std::uint64_t array_word) {
+    auto* count = reinterpret_cast<UINT*>(count_word);
+#ifdef LEONIDA_VULKAN_DEVICE
+    if (auto* state = static_cast<PresentState*>(self->present_state); state && state->xbox)
+        return state->xbox->GetFrameStatisticsX(token, static_cast<UINT>(type_mask), count,
+                                                reinterpret_cast<leonida::FrameStatistic*>(array_word));
+#else
+    (void)self;
+    (void)token;
+    (void)type_mask;
+    (void)array_word;
+#endif
+    if (count) *count = 0;
+    return S_FALSE;
+}
+
 bool route_xbox_device_slot(DeviceProxy* self, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                             std::uint64_t a4, std::uint64_t a5, std::uint64_t& result) {
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
@@ -3091,6 +3109,11 @@ bool route_xbox_device_slot(DeviceProxy* self, unsigned slot, std::uint64_t a1, 
         log_xbox_route_once(slot, "CreateCommandListX", a1, a2, a3, a4, a5);
         result = hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
                                                        reinterpret_cast<void**>(a5)));
+    } else if (slot == 81) {
+        // local: GetFrameStatisticsX(token, type mask, &count, array) (docs/d3d12_vulkan.md, statistics), the fourth
+        // frame-pacing slot after 78/79/80. It reached the PC table's end and was E_NOTIMPL on every frame.
+        log_xbox_route_once(slot, "GetFrameStatisticsX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_get_frame_statistics_x(self, a1, a2, a3, a4));
     } else {
         return false;
     }
