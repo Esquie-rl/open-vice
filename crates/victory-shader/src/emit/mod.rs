@@ -97,7 +97,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
-/// The loop limit without an override: 2^20.
+/// The loop limit without an override: 2^20. Open Vice reads
+/// `VICTORY_SHADER_LOOP_LIMIT` in every build (a lower limit was measured not
+/// to stop the GPU hang on entering the world on an RTX 4080 Laptop).
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
 /// The iteration count after which a translated loop is left, per lane and
@@ -111,13 +113,8 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// translation, so the shader cache must key on it (`victory-gpu`'s does).
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
-        } else {
-            lower::LOOP_LIMIT
-        }
-    })
+    // Open Vice: read in every build, not only diagnostics ones.
+    *LIMIT.get_or_init(|| parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref()))
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -131,7 +128,7 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
         });
     match parsed {
         Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
+        _ => DEFAULT_LOOP_LIMIT,
     }
 }
 
@@ -393,17 +390,16 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 #[cfg(test)]
 mod tests {
     use super::bitcode::Attr;
-    use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{DEFAULT_LOOP_LIMIT, parse_loop_limit};
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
-        assert_eq!(parse_loop_limit(None), LOOP_LIMIT);
+        assert_eq!(parse_loop_limit(None), DEFAULT_LOOP_LIMIT);
         assert_eq!(parse_loop_limit(Some("4096")), 4096);
-        assert_eq!(parse_loop_limit(Some(" 0x1000 ")), 4096);
+        assert_eq!(parse_loop_limit(Some(" 0x100000 ")), 1 << 20);
         assert_eq!(parse_loop_limit(Some("1")), 1);
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
-            assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+            assert_eq!(parse_loop_limit(Some(bad)), DEFAULT_LOOP_LIMIT, "{bad:?}");
         }
     }
     use super::container::SigElement;

@@ -1459,17 +1459,25 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// Open Vice: the frame-rate box copied into every presented image.
+    overlay: Option<crate::overlay::Overlay>,
 }
 
-/// The frame rate, shown in the window's caption every second and logged
+/// The frame rate, shown in the window's caption every half second and logged
 /// every few seconds.
 struct Meter {
     since: std::time::Instant,
     frames: u32,
     drawn: u64,
     logged: std::time::Instant,
-    /// The caption the window had, once read.
-    caption: Option<Vec<u16>>,
+    /// The last present, for the time between frames.
+    last: Option<std::time::Instant>,
+    /// The time between each two presents since the caption was last set, in
+    /// milliseconds.
+    intervals: Vec<f64>,
+    /// What the in-image box shows: the rate and the average frame time of the
+    /// last half second.
+    overlay: String,
 }
 
 impl Meter {
@@ -1480,7 +1488,9 @@ impl Meter {
             frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
-            caption: None,
+            last: None,
+            intervals: Vec::with_capacity(512),
+            overlay: String::new(),
         }
     }
 
@@ -1489,8 +1499,12 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
-        let elapsed = self.since.elapsed();
-        if elapsed < std::time::Duration::from_secs(1) {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last.replace(now) {
+            self.intervals.push((now - last).as_secs_f64() * 1000.0);
+        }
+        let elapsed = now - self.since;
+        if elapsed < std::time::Duration::from_millis(500) {
             return;
         }
         let drawn = crate::draw::drawn();
@@ -1536,18 +1550,15 @@ impl Meter {
                 }
             }
         }
-        if self.caption.is_none() {
-            // The window's own text, read without a message.
-            let mut buffer = vec![0u16; 512];
-            // SAFETY: a window handle and a buffer of that length.
-            let n = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
-            buffer.truncate(n.max(0) as usize);
-            self.caption = Some(buffer);
-        }
-        let Some(caption) = &self.caption else { return };
-        let text = format!(" | Open Vice {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
-        text.push(0);
+        let average = if self.intervals.is_empty() {
+            ms
+        } else {
+            self.intervals.iter().sum::<f64>() / self.intervals.len() as f64
+        };
+        self.overlay = format!("{fps:.1} FPS | {average:.2} ms");
+        // The caption is only "Open Vice" (the title's own text is not kept); the rate is in the image.
+        self.intervals.clear();
+        let text: Vec<u16> = "Open Vice\0".encode_utf16().collect();
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
         // presenting never waits; it takes the newest text when free.
@@ -1628,6 +1639,20 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            // Open Vice: the frame rate, drawn over the image itself (white letters, black outline).
+            let mut back_state = D3D12_RESOURCE_STATE_COPY_DEST;
+            if !p.meter.overlay.is_empty() {
+                if !p.overlay.as_ref().is_some_and(|o| o.fits(format, height)) {
+                    p.overlay = crate::overlay::Overlay::new(&self.device, format, height, |size| {
+                        self.upload_buffer(size)
+                    });
+                }
+                if let Some(o) = p.overlay.as_mut() {
+                    let text = p.meter.overlay.clone();
+                    o.record(&self.device, list, &back, (width, height), &text, |r, a, b| transition(r, a, b));
+                    back_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                }
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -1638,11 +1663,7 @@ impl Host {
             let _ = frame;
             list.ResourceBarrier(&[
                 transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
+                transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT),
             ]);
             p.copy.close();
             self.execute(&[&p.copy]);
@@ -1699,6 +1720,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                overlay: None,
             })
         }
     }

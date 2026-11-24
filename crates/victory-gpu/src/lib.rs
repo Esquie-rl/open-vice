@@ -31,6 +31,7 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
+mod overlay;
 pub mod list;
 pub mod object;
 pub mod pipeline;
