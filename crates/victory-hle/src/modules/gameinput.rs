@@ -1184,16 +1184,24 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>[*<hold>],...` holds each
+    /// key that long after input starts, with or without focus, for 0.2 s or
+    /// `<hold>` seconds (Open Vice: a title running at one frame a second
+    /// misses a 0.2 s press). A key is a letter, a digit, or `Enter`, `Esc`,
+    /// `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's
+    /// table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        type Script = (Instant, Vec<(Duration, Duration, u8)>);
+        static SCRIPT: LazyLock<Script> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
+                let (key, hold) = match key.split_once('*') {
+                    Some((key, hold)) => (key, hold.trim().parse::<f64>().ok()?),
+                    None => (key, 0.2),
+                };
+                let hold = Duration::try_from_secs_f64(hold).ok()?;
                 let vk = match key.trim() {
                     "Enter" => 0x0D,
                     "Esc" => 0x1B,
@@ -1210,6 +1218,7 @@ mod host {
                 };
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                    hold,
                     vk,
                 ))
             });
@@ -1217,10 +1226,13 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        let mut down: Vec<u8> = keys
+            .iter()
+            .filter(|&&(at, hold, _)| (at..at + hold).contains(&now))
+            .map(|&(_, _, vk)| vk)
+            .collect();
+        down.dedup();
+        down
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

@@ -400,12 +400,15 @@ impl State {
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
+    /// A failure notes its reason ([`failed`]).
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            failed("skipped pipeline");
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            failed("no host pipeline");
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -413,6 +416,7 @@ impl State {
                 mesh,
                 "a draw or mesh dispatch with another kind of pipeline"
             );
+            failed("a pipeline of another kind");
             return false;
         }
         if !self.bind(list, p, false) {
@@ -451,6 +455,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+                failed("index buffer outside title buffers");
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -535,6 +540,7 @@ impl State {
                         "a draw or dispatch dropped: no dynamic slots for its tables"
                     );
                 }
+                failed("no dynamic slots for its tables");
                 return false;
             }
             if let Some((param, dwords)) = stage.user_data {
@@ -605,6 +611,7 @@ impl State {
                     }
                 } else {
                     once!("a shader reads the runtime stride table without a host view heap");
+                    failed("a stride table without a host view heap");
                     return false;
                 }
             }
@@ -632,6 +639,7 @@ impl State {
             .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
         else {
             once!("a root SRV without a bound view heap: the draw is dropped");
+            failed("a root SRV without a bound view heap");
             return false;
         };
         let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
@@ -640,6 +648,7 @@ impl State {
             Some(&index) => index,
             None => {
                 let Some(index) = self.take_dynamic(host, key.0, 1) else {
+                    failed("no dynamic slot for a root SRV");
                     return false;
                 };
                 self.root_srv_slots.insert(key, index);
@@ -1182,6 +1191,10 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
+        failed("");
+        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
+            failed("rectangle topology");
+        }
         let ran = match kind {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -1196,8 +1209,10 @@ impl State {
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
                 Some(p) => why(&format!(
-                    "prepare failed (compute {}, mesh {})",
-                    p.compute, p.mesh
+                    "prepare failed (compute {}, mesh {}): {}",
+                    p.compute,
+                    p.mesh,
+                    FAILED.with(std::cell::Cell::get)
                 )),
             }
             return false;
@@ -1224,6 +1239,21 @@ impl State {
         true
     }
 }
+
+// Why the last draw or dispatch this thread prepared could not run
+// (diagnostics: the indirect drop reasons in the log name it).
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static FAILED: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+#[cfg(feature = "diagnostics")]
+fn failed(why: &'static str) {
+    FAILED.with(|f| f.set(why));
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn failed(_: &'static str) {}
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
