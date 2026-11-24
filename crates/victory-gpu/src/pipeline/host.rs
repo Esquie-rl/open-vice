@@ -268,6 +268,8 @@ pub(crate) struct Stage {
     /// ([`victory_shader::emit::RootView`]).
     pub(crate) root_cbvs: Vec<(u16, u32)>,
     pub(crate) root_srvs: Vec<(u16, u32)>,
+    /// Root UAVs, likewise (Open Vice).
+    pub(crate) root_uavs: Vec<(u16, u32)>,
     /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
     pub(crate) stride_table: Option<u32>,
 }
@@ -364,6 +366,7 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
                 stride_table: None,
             };
             let dwords = t.user_data_dwords();
@@ -433,6 +436,23 @@ impl HostPipeline {
                         ShaderVisibility: visibility,
                     });
                 }
+            }
+            // Open Vice: root UAVs, raw read-write buffers at the address the
+            // title sets (bound in `State::bind`, written back after the
+            // submission).
+            for &slot in &t.root_uavs {
+                stage.root_uavs.push((slot, params.len() as u32));
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: u32::from(slot),
+                            RegisterSpace: ROOT_CBV_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
             }
             if t.stride_table {
                 stage.stride_table = Some(params.len() as u32);

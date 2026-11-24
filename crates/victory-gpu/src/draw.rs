@@ -595,6 +595,43 @@ impl State {
                     }
                 }
             }
+            // Open Vice: root UAVs, raw read-write buffers at the address the
+            // title sets: its buffer's host copy, brought up to date and
+            // written back into title memory after the submission (Grand
+            // Theft Auto VI's culling passes write the world's draw
+            // arguments through them).
+            // shortcut: a root view has no size: up to 4 MiB from the
+            // address are refreshed and written back, cut at the buffer's
+            // end; writes past that stay in the host copy.
+            for &(register, param) in &stage.root_uavs {
+                let Some(address) = self.view_address(compute, register) else {
+                    once!(register, "a shader writes a root UAV the title did not set");
+                    failed("a root UAV the title did not set");
+                    return false;
+                };
+                let Some(shadow) = crate::shadow::find(address, 1) else {
+                    once!(
+                        address = format_args!("{address:#x}"),
+                        "a root UAV outside title buffers"
+                    );
+                    failed("a root UAV outside title buffers");
+                    return false;
+                };
+                let len = shadow.left(address).min(4 << 20);
+                shadow.refresh(list, address, len);
+                shadow.gpu_writes(list, address, len);
+                list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
+                let gpu = shadow.gpu(address);
+                // SAFETY: an open list; the address is in a live host copy
+                // the list holds.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootUnorderedAccessView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                    }
+                }
+            }
             if let Some(param) = stage.stride_table {
                 let gpu = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())

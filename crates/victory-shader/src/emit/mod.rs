@@ -172,6 +172,9 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<register>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u16>,
+    /// Root UAVs (raw read-write buffers) the shader writes or reads:
+    /// `u<register>` in [`ROOT_CBV_SPACE`] (Open Vice).
+    pub root_uavs: Vec<u16>,
     /// True when the shader reads the runtime stride table (`t0` in
     /// [`STRIDE_SPACE`]).
     pub stride_table: bool,
@@ -441,6 +444,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
         stride_table: l.stride_table,
     })
 }
@@ -699,6 +703,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
             stride_table: false,
         };
         let file = |var: &str, stage| {
@@ -710,6 +715,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
                 stride_table: false,
             })
         };
@@ -1112,6 +1118,23 @@ mod tests {
         l
     }
 
+    /// Probe (run by hand with `--ignored --nocapture`): the native programs
+    /// of the container at `VICTORY_PROBE_SHADER` (a file outside the
+    /// repository) and their stage I/O.
+    #[test]
+    #[ignore]
+    fn probe_native_io() {
+        let Some(path) = std::env::var_os("VICTORY_PROBE_SHADER") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let c = crate::Container::parse(&bytes).unwrap();
+        let dxil = c.part(crate::FourCC::DXIL).unwrap().data;
+        for p in crate::native_programs(dxil).unwrap() {
+            eprintln!("{:?} wave64 {} vgprs {} io {:?}", p.stage, p.wave64, p.vgprs, p.io);
+        }
+    }
+
     /// User data `s0..s4` (`s0` given, the rest 0), and a heap guard entry
     /// (#483) past every slot these tests use, so no index reaches it.
     fn guarded(cs: &super::HostShader, s0: u32) -> Vec<u32> {
@@ -1141,6 +1164,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
             stride_table: l.stride_table,
         }
     }
