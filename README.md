@@ -1,136 +1,88 @@
-# VIctory
+# Open Vice
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+Fait tourner **Grand Theft Auto VI (Xbox Series X|S, 1.0.2.1)** nativement sous Windows, à partir des fichiers de
+**ta propre copie** du jeu. Aucun fichier du jeu n'est dans ce dépôt.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
+Open Vice est un fork de **[VIctory](https://github.com/Marvisak/VIctory)** (Marvisak et ses contributeurs,
+GPL-3.0-or-later), adapté pour tourner sur un PC **Intel + NVIDIA** (VIctory n'était testé que sur une AMD RX 6700 XT).
+Le code x86-64 du jeu tourne tel quel dans notre processus ; Open Vice fournit la plateforme Xbox en dessous et
+convertit les données du jeu (shaders console traduits en DXIL au premier usage, puis mis en cache). Architecture :
 [docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-23)
+## État (24/11/2026, i9-12900HX + RTX 4080 Laptop, Windows 11)
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
+**Pas encore jouable.**
 
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
+| Étape | État sur ce PC |
+|-------|----------------|
+| Démarrage, écrans de premier lancement (profil, navigation, réglages…) | marche, 30 images/s, interface en français |
+| Son | marche : sons d'interface et musique enregistrés (`VICTORY_AUDIO_CAPTURE`) |
+| Écran titre, profil, chargement | marche |
+| Entrée dans le monde | le GPU décroche (`device removed`) pendant les premières soumissions du monde, comme sur la machine de VIctory |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+## Ce qu'Open Vice change par rapport à VIctory
 
-> **Warning.** Entering the world on a real GPU can currently hang it, and
-> Windows then resets the display driver (every monitor goes black for a
-> moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
+- **CPU Intel** : le jeu efface la mémoire avec des boucles `clzero` (instruction AMD). Sur Intel, chaque ligne de
+  64 octets coûtait une exception (~5 s par image). Au premier passage, chaque boucle est réécrite dans le code chargé
+  en un appel vers une routine de 8 écritures par ligne (`crates/victory-loader/src/crash.rs`).
+- **Nom** : fenêtre, exécutable (`open-vice.exe`), messages de crash et nom du GPU affiché.
 
-What each part does today and what it still needs:
+Les noms internes de VIctory sont **conservés** pour ne rien casser : crates `victory-*`, variables `VICTORY_*`,
+fichier `victory.toml`, dossiers `%LOCALAPPDATA%\victory`, marqueur `.victory-root`.
 
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
+## Prérequis
 
-## Getting started
+Windows 10/11 x64, un CPU avec AVX2, un GPU Direct3D 12 shader model 6.6 (et mesh shaders pour le monde), Rust
+(version épinglée dans `rust-toolchain.toml`, installée toute seule par rustup), plusieurs Gio de mémoire virtuelle
+disponible (si `crashes.log` signale l'erreur Windows 1455, agrandir le fichier d'échange).
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
-
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+## Compiler et lancer
 
 ```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+copy victory.example.toml victory.toml   # puis mettre tes chemins (hors du dépôt)
+cargo test --workspace                   # aucun fichier du jeu nécessaire
+cargo run -p open-vice -- config         # vérifie les chemins
+
+cargo build --release -p open-vice
+target\release\open-vice.exe run <dossier du jeu>\game_scarlett_master.exe --execute
 ```
 
-Run the title:
+Build de diagnostic (captures d'images, touches automatiques, couche de debug D3D12) :
 
 ```powershell
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+cargo build --profile diag -p open-vice --features diagnostics   # target\diag\open-vice.exe
 ```
 
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
+La barre de titre affiche les images/s. Sauvegardes, réglages et `crashes.log` : dossier de données (par défaut
+`%LOCALAPPDATA%\victory\data`).
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+## Contrôles
 
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
+Manettes XInput. Sans manette, le clavier sert de manette quand la fenêtre du jeu a le focus :
 
-## Commands
+| Touches | Manette |
+|---------|---------|
+| W A S D / I J K L | stick gauche / droit |
+| flèches | croix |
+| Entrée, Retour arrière, X, Y | A, B, X, Y |
+| Q / E, Z / C | gâchettes hautes, gâchettes |
+| F / H | clics des sticks |
+| Échap, Tab | Menu, Vue |
 
-```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
-```
+## Variables de diagnostic (build `diag`)
 
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
+| Variable | Effet |
+|----------|-------|
+| `VICTORY_KEYS=15:Enter,20:Enter` | appuie sur des touches à ces secondes, focus ou pas |
+| `VICTORY_AUDIO_CAPTURE=<fichier.wav>` | enregistre le son joué par le jeu |
+| `VICTORY_CAPTURE=<dossier>` | enregistre des images présentées |
+| `VICTORY_D3D12_DEBUG=1` | couche de debug D3D12 (nomme la commande qui fait décrocher le GPU) |
+| `VICTORY_D3D12_WARP=1` | rendu logiciel (lent, ne peut pas planter le pilote) |
+| `VICTORY_LOG=<cible>=debug,...` | journaux détaillés |
 
-## Debugging
+La liste complète est dans le README d'origine de VIctory.
 
-A release build has no debugging aids. Build them in with
+## Licence et crédits
 
-```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
-```
-
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
-
-## License
-
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later, voir [LICENSE](LICENSE). Basé sur VIctory (https://github.com/Marvisak/VIctory) ; les
+modifications d'Open Vice sont dans l'historique git de ce dépôt.

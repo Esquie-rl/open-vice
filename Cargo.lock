@@ -321,6 +321,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "open-vice"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "memchr",
+ "victory-core",
+ "victory-game",
+ "victory-hle",
+ "victory-loader",
+ "victory-pe",
+ "victory-shader",
+ "walkdir",
+]
+
+[[package]]
 name = "opus-pure"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -642,23 +659,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "victory"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "memchr",
- "victory-core",
- "victory-game",
- "victory-hle",
- "victory-loader",
- "victory-pe",
- "victory-shader",
- "walkdir",
-]
 
 [[package]]
 name = "victory-core"

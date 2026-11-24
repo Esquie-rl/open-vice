@@ -63,7 +63,7 @@ extern "system" fn unimplemented_import(site: &'static ImportSite) -> u64 {
         UnimplementedPolicy::Trap => {
             tracing::error!(dll = %site.dll, symbol = %site.symbol, "unimplemented import called");
             eprintln!(
-                "VIctory: unimplemented import {}!{} called",
+                "Open Vice: unimplemented import {}!{} called",
                 site.dll, site.symbol
             );
             // SAFETY: plain Win32 calls without preconditions.
