@@ -149,7 +149,17 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         }
         let code = context.Rip as *const u8;
         match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
+            [0x0f, 0x01, 0xfc] => {
+                // A clearing loop is rewritten once, so its later lines take no exception; execution
+                // resumes on the loop head, now a call to the store loop (see `patch_clzero_loop`).
+                if 0x1000 - (context.Rip as usize & 0xfff) >= 12
+                    && let Some((rex, modrm)) = clzero_loop_shape(&code.cast::<[u8; 12]>().read_unaligned())
+                    && patch_clzero_loop(code.cast_mut(), rex, modrm)
+                {
+                    return true;
+                }
+                ((context.Rax & !63) as *mut u8).write_bytes(0, 64)
+            }
             [0x0f, 0x01, 0xfa] => {}
             [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
             _ => {
@@ -189,6 +199,123 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         }
         context.Rip += 3;
     }
+    true
+}
+
+/// The title's `clzero` clearing loop, one cache line a pass:
+///
+/// ```text
+/// top: clzero                 0f 01 fc
+///      add  rax, 0x40         48 83 c0 40
+///      cmp  rax, limit        48|4c 39 /r (rax in r/m)
+///      jb   top               72 f4
+/// ```
+///
+/// On an Intel host every line is an exception (about a microsecond, plus the
+/// dispatch), and the title clears large blocks this way every frame: measured
+/// on an Intel i9-12900HX, ~5 s per frame before the loops were rewritten. The
+/// `cmp` instruction's REX and ModRM bytes, or `None` for any other code.
+fn clzero_loop_shape(code: &[u8; 12]) -> Option<(u8, u8)> {
+    if code[..3] != [0x0f, 0x01, 0xfc] || code[3..7] != [0x48, 0x83, 0xc0, 0x40] {
+        return None;
+    }
+    let (rex, op, modrm) = (code[7], code[8], code[9]);
+    if rex & 0xfa != 0x48 || op != 0x39 || modrm & 0xc7 != 0xc0 || code[10..12] != [0x72, 0xf4] {
+        return None;
+    }
+    let limit = (modrm >> 3) & 7 | (rex & 4) << 1;
+    (limit != 0 && limit != 4).then_some((rex, modrm))
+}
+
+/// The store loop a rewritten `clzero` loop calls: `do { zero the line at rax;
+/// rax += 64 } while (rax < limit)`, with eight 8-byte stores a line and the
+/// loop's own `cmp` at the end, so `rax` and the flags leave it as the loop
+/// leaves them. `rcx` is saved around its use. Bytes 76 and 78 take the `cmp`'s
+/// REX and ModRM.
+const CLZERO_THUNK: [u8; 82] = [
+    0x51, // push rcx
+    0x48, 0x89, 0xc1, // mov rcx, rax
+    0x48, 0x83, 0xe1, 0xc0, // and rcx, -64
+    0x48, 0xc7, 0x01, 0, 0, 0, 0, // mov qword [rcx], 0
+    0x48, 0xc7, 0x41, 0x08, 0, 0, 0, 0, // mov qword [rcx+8], 0
+    0x48, 0xc7, 0x41, 0x10, 0, 0, 0, 0, //
+    0x48, 0xc7, 0x41, 0x18, 0, 0, 0, 0, //
+    0x48, 0xc7, 0x41, 0x20, 0, 0, 0, 0, //
+    0x48, 0xc7, 0x41, 0x28, 0, 0, 0, 0, //
+    0x48, 0xc7, 0x41, 0x30, 0, 0, 0, 0, //
+    0x48, 0xc7, 0x41, 0x38, 0, 0, 0, 0, // ... [rcx+56]
+    0x59, // pop rcx
+    0x48, 0x83, 0xc0, 0x40, // add rax, 0x40
+    0x00, 0x39, 0x00, // cmp rax, limit
+    0x72, 0xaf, // jb top (-81)
+    0xc3, // ret
+];
+
+/// Executable memory near the title's image for the store loops (a `call
+/// rel32` reaches 2 GiB), and the loop heads already rewritten.
+static CLZERO_THUNKS: std::sync::Mutex<(usize, usize, Vec<usize>)> = std::sync::Mutex::new((0, 0, Vec::new()));
+
+/// Rewrites the loop at `site` (shape checked by `clzero_loop_shape`) as
+/// `call thunk; jmp +5`: the store loop does every line, from the first.
+/// Returns false, leaving the code as it is, when no memory near the image is
+/// free or the page cannot be made writable. The 12 bytes are written while
+/// this thread is stopped on their first one (another thread inside them would
+/// see a torn instruction; the title runs these loops on one thread).
+unsafe fn patch_clzero_loop(site: *mut u8, rex: u8, modrm: u8) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualProtect,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let Ok(mut state) = CLZERO_THUNKS.lock() else { return false };
+    let (arena, used, done) = &mut *state;
+    if done.contains(&(site as usize)) {
+        return true; // another thread rewrote it while this one trapped
+    }
+    if *arena == 0 {
+        let base = site as usize & !0xffff;
+        'search: for step in 1..0x7000usize {
+            for at in [base.wrapping_add(step << 16), base.wrapping_sub(step << 16)] {
+                // SAFETY: a fresh reservation at a free address; nothing else is touched.
+                let p = unsafe {
+                    VirtualAlloc(at as *const _, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)
+                };
+                if !p.is_null() {
+                    *arena = p as usize;
+                    break 'search;
+                }
+            }
+        }
+        if *arena == 0 {
+            return false;
+        }
+    }
+    let thunk = *arena + *used;
+    let rel = thunk as i64 - (site as i64 + 5);
+    if *used + 96 > 0x10000 || rel > i64::from(i32::MAX) || rel < i64::from(i32::MIN) {
+        return false;
+    }
+    let mut body = CLZERO_THUNK;
+    body[76] = rex;
+    body[78] = modrm;
+    let mut patch = [0xe8, 0, 0, 0, 0, 0xeb, 0x05, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc];
+    patch[1..5].copy_from_slice(&(rel as i32).to_le_bytes());
+    // SAFETY: `thunk` is inside the committed RWX arena; `site` is the title's code, made writable
+    // for the 12 bytes of the loop this thread is stopped on, then restored.
+    unsafe {
+        std::ptr::copy_nonoverlapping(body.as_ptr(), thunk as *mut u8, body.len());
+        FlushInstructionCache(GetCurrentProcess(), thunk as *const _, body.len());
+        let mut old = 0u32;
+        if VirtualProtect(site as *const _, patch.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(patch.as_ptr(), site, patch.len());
+        VirtualProtect(site as *const _, patch.len(), old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), site as *const _, patch.len());
+    }
+    *used += 96;
+    done.push(site as usize);
+    tracing::info!("clzero loop at {site:p} rewritten as a store loop (Intel host)");
     true
 }
 
