@@ -1659,6 +1659,106 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// `image_gather4_l` (`_o`): channel `channel` of the four texels a
+    /// bilinear sample at the given level would read, in gather order
+    /// (x: left bottom, y: right bottom, z: right top, w: left top, with
+    /// v growing downwards). DXIL's gather reads level 0 only, so each texel
+    /// is a level sample at its centre with the title's sampler (which keeps
+    /// its addressing: clamp, wrap): bilinear weights there are 1 and 0.
+    /// Open Vice: Grand Theft Auto VI's indirect compute passes that read
+    /// its depth pyramid gather this way.
+    /// shortcut: the level is the given one truncated (gathers have no mip
+    /// filtering); 2D and 2D array textures only.
+    #[allow(clippy::too_many_arguments)]
+    fn gather_at_level(
+        &mut self,
+        inst: &Inst,
+        (h, sh): (V, V),
+        cs: &[V],
+        (kind, coords, first): (u32, usize, usize),
+        channel: u32,
+        d16: bool,
+        guard: Option<V>,
+        mut float_at: impl FnMut(&mut Self, usize) -> Result<V, Why>,
+        mut offset_word: impl FnMut(&mut Self) -> Result<V, Why>,
+    ) -> Result<(), Why> {
+        let Fields::Image { data, .. } = &inst.fields else {
+            unreachable!()
+        };
+        if d16 {
+            return Err("a 16-bit gather at a level");
+        }
+        if !matches!(kind, 2 | 6) {
+            return Err("a gather at a level of a 1D, 3D or cube texture");
+        }
+        let Operand::Vector { reg, .. } = *data else {
+            return Err("an image result");
+        };
+        let c = self.cur;
+        // The level follows the coordinates (and the array slice).
+        let lod = float_at(self, first + coords)?;
+        let f32t = self.s.t.f32;
+        let i32t = self.s.t.i32;
+        let level = self.s.m.cast(c, Cast::FpToUi, lod, i32t);
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let d = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, level]);
+        let half = self.s.m.f32(0.5f32.to_bits());
+        let one = self.s.m.f32(1.0f32.to_bits());
+        let mut base = [half; 2];
+        let mut size = [one; 2];
+        for k in 0..2 {
+            let n = self.s.m.extract(c, d, k as u32);
+            size[k] = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+            let at = self.s.m.bin(c, Bin::Mul, cs[k], size[k]);
+            let at = self.s.m.bin(c, Bin::Sub, at, half);
+            base[k] = self.unary(27, at);
+        }
+        if first > 0 {
+            // Texel offsets: x in bits 0-5, y in 8-13, signed.
+            let w = offset_word(self)?;
+            for (k, at) in [(0, 26), (1, 18)] {
+                let left = self.s.m.i32(at);
+                let t = self.s.m.bin(c, Bin::Shl, w, left);
+                let k26 = self.s.m.i32(26);
+                let o = self.s.m.bin(c, Bin::AShr, t, k26);
+                let o = self.s.m.cast(c, Cast::SiToFp, o, f32t);
+                base[k] = self.s.m.bin(c, Bin::Add, base[k], o);
+            }
+        }
+        let fu = self.s.m.undef(f32t);
+        let iu = self.s.m.undef(i32t);
+        let level_f = self.s.m.cast(c, Cast::UiToFp, level, f32t);
+        let slice = if kind == 6 { cs[2] } else { fu };
+        let zero = self.s.m.f32(0.0f32.to_bits());
+        // Gather order: (0, 1), (1, 1), (1, 0), (0, 0).
+        for (k, (dx, dy)) in [(zero, one), (one, one), (one, zero), (zero, zero)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut uv = [fu; 2];
+            for (j, dd) in [dx, dy].into_iter().enumerate() {
+                let t = self.s.m.bin(c, Bin::Add, base[j], dd);
+                let t = self.s.m.bin(c, Bin::Add, t, half);
+                uv[j] = self.s.m.bin(c, Bin::SDiv, t, size[j]);
+            }
+            let args = [h, sh, uv[0], uv[1], slice, fu, iu, iu, iu, level_f];
+            let r = self.s.op(
+                c,
+                "sampleLevel.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                62,
+                &args,
+            );
+            let x = self.s.m.extract(c, r, channel);
+            let x = self.as_int(x);
+            self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        Ok(())
+    }
+
     fn unary(&mut self, op: u32, f: V) -> V {
         self.s.op(
             self.cur,
@@ -6492,6 +6592,8 @@ impl<'a> Lower<'a> {
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            // Open Vice: at a level, emulated (see `gather_at_level`).
+            "image_gather4_l" | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -6724,6 +6826,22 @@ impl<'a> Lower<'a> {
                     }
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
+                    }
+                    if name.starts_with("image_gather4_l") && !name.starts_with("image_gather4_lz") {
+                        return self.gather_at_level(
+                            inst,
+                            (h, sh),
+                            &cs,
+                            (kind, coords, first),
+                            dmask.trailing_zeros(),
+                            *d16,
+                            guard,
+                            |l: &mut Self, k| {
+                                let x = addr_val(l, k)?;
+                                Ok(to_float(l, x))
+                            },
+                            |l: &mut Self| addr_val(l, 0),
+                        );
                     }
                     if offset_word {
                         let w = addr_val(self, 0)?;

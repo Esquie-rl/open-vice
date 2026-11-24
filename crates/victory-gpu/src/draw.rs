@@ -784,8 +784,13 @@ impl State {
         if !crate::capture::listed(crate::queue::presented() + 1) {
             return;
         }
-        let name = crate::pipeline::host_pipeline(self.pipeline as This)
-            .map_or_else(|| format!("no host pipeline {:#x}", self.pipeline), |p| p.name.clone());
+        let name = crate::pipeline::host_pipeline(self.pipeline as This).map_or_else(
+            || {
+                let why = crate::pipeline::missing_of(self.pipeline as This).unwrap_or_default();
+                format!("no host pipeline ({why})")
+            },
+            |p| p.name.clone(),
+        );
         let size = |t: usize| {
             crate::resource::host_resource(t as This).map(|r| {
                 // SAFETY: a live resource.
@@ -1282,7 +1287,7 @@ impl State {
             self.report(
                 kind == 2,
                 format_args!(
-                    "indirect kind {kind} max {max} counted {} args {args:?}",
+                    "indirect kind {kind} max {max} counted {} at {arguments:#x} args {args:?}",
                     count.is_some()
                 ),
                 ran,

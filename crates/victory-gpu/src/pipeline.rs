@@ -322,6 +322,16 @@ pub(crate) fn note_drop(this: This) {
     }
 }
 
+/// Why a title pipeline has no host pipeline (diagnostics, Open Vice frame
+/// report): its shaders that do not translate, "refused" or "being made".
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn missing_of(this: This) -> Option<String> {
+    if this.is_null() {
+        return Some("no pipeline set".to_owned());
+    }
+    make::missing(&pipeline(this).host)
+}
+
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
