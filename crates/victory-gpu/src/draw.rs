@@ -84,6 +84,8 @@ pub(crate) struct State {
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+    /// Address maps made in this list: title view heap, host GPU address.
+    maps: Vec<(usize, u64)>,
 }
 
 impl Drop for State {
@@ -561,6 +563,50 @@ impl State {
                         l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     } else {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                    }
+                }
+            }
+            // The address map and the descriptor words belong to the view
+            // heap: without them the shader would read nothing it expects.
+            let heap = (self.heaps[0] != 0)
+                .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                .flatten();
+            let mut extra = Vec::new();
+            if let Some(param) = stage.address_map {
+                let made = self.maps.iter().find(|m| m.0 == self.heaps[0]).map(|m| m.1);
+                let gpu = match (made, heap) {
+                    (Some(gpu), _) => Some(gpu),
+                    (None, Some(h)) => {
+                        crate::address_map::make(list, h).map(|(gpu, (first, n))| {
+                            if n > 0 {
+                                self.lease.add(self.heaps[0], first, n);
+                            }
+                            self.maps.push((self.heaps[0], gpu));
+                            gpu
+                        })
+                    }
+                    (None, None) => None,
+                };
+                let Some(gpu) = gpu else {
+                    once!("a draw or dispatch dropped: no address map for its view heap");
+                    return false;
+                };
+                extra.push((param, gpu));
+            }
+            if let Some(param) = stage.descriptor_words {
+                let Some(gpu) = heap.and_then(|h| h.words()) else {
+                    once!("a draw or dispatch dropped: no descriptor words for its view heap");
+                    return false;
+                };
+                extra.push((param, gpu));
+            }
+            for (param, gpu) in extra {
+                // SAFETY: an open list; the buffers live as long as it runs.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, gpu);
                     }
                 }
             }

@@ -262,6 +262,31 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        // The address map, then the descriptor words, come last.
+        for (wanted, space) in [
+            (
+                stages.iter().any(|(s, _)| s.address_map),
+                super::ADDRESS_MAP_SPACE,
+            ),
+            (
+                stages.iter().any(|(s, _)| s.descriptor_words),
+                super::DESCRIPTOR_WORDS_SPACE,
+            ),
+        ] {
+            if wanted {
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: 0,
+                            RegisterSpace: space,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+            }
+        }
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
@@ -634,6 +659,8 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         stride_table: false,
+        address_map: false,
+        descriptor_words: false,
     }
 }
 
@@ -1023,6 +1050,8 @@ pub enum View<'a> {
     Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// A raw buffer UAV holding these dwords (read back like `RawUav`).
+    RawData(&'a [u32]),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1311,7 +1340,7 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) | View::BufferUav(..) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::BufferUav(..) | View::RawData(_) => {
                         // (dwords, format, elements, element bytes, flags)
                         let (n, format, elements, stride, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1337,6 +1366,10 @@ impl Host {
                             View::BufferUav(n, Stride::Format(f, bytes)) => {
                                 (n, f, n * 4 / bytes, 0, D3D12_BUFFER_UAV_FLAG_NONE)
                             }
+                            View::RawData(d) => {
+                                let n = d.len() as u32;
+                                (n, DXGI_FORMAT_R32_TYPELESS, n, 0, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
                             _ => unreachable!(),
                         };
                         let bytes = u64::from(n) * 4;
@@ -1359,6 +1392,17 @@ impl Host {
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
                         buffers[i] = Some((b.clone(), n, true));
+                        if let View::RawData(d) = *v {
+                            // The copy promotes the buffer to a copy target.
+                            let up = upload(d)?;
+                            list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(up);
+                        }
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
