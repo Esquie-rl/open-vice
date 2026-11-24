@@ -116,12 +116,24 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        // Open Vice: `VICTORY_SHADER_DUMP=<folder>` (outside
+                        // the repository: title data) keeps the container of
+                        // each shader that does not translate, to translate
+                        // it again offline (`open-vice translate <folder>`).
+                        if let Some(dir) = std::env::var_os("VICTORY_SHADER_DUMP") {
+                            let path = std::path::Path::new(&dir)
+                                .join(format!("{}-{}.dxbc", self.stage, self.hash));
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(path, &self.container);
+                        }
+                    }
                 }
                 done.ok()
             })

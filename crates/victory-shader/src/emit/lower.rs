@@ -3346,7 +3346,7 @@ impl<'a> Lower<'a> {
             ..
         } = inst.fields
         else {
-            return Err("a scalar memory read as data");
+            return Err("a scalar memory read as data (no data registers)");
         };
         let count = match inst.name().strip_prefix("s_load_dword") {
             Some("") => 1u32,
@@ -3354,7 +3354,7 @@ impl<'a> Lower<'a> {
             Some("x4") => 4,
             Some("x8") => 8,
             Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err("a scalar memory read as data (not s_load_dword)"),
         };
         // How the program uses the descriptor tells the view's kind.
         let use_at = self
@@ -3408,7 +3408,28 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
-            _ => return Err("a scalar memory read as data"),
+            // Open Vice: the descriptor of a scalar buffer load (Grand Theft
+            // Auto VI's world pixel shader 94d281151ca58b4f), its record
+            // count read to bound offsets. A buffer view's comes from the
+            // view, as for vector buffer loads.
+            // shortcut: a constant buffer has no host size query, so its
+            // record count reads the largest a constant buffer can be (64
+            // KiB): bounds checks pass, and offsets past its data read zeros.
+            Fields::Smem { .. } => {
+                if used.is_none_or(|u| u.kind == ResourceType::Cbv) {
+                    let size = self.s.m.i32(1 << 16);
+                    for k in 0..count {
+                        if k.wrapping_sub(u32::from(first)) == 2 {
+                            self.write(inst, Reg::S(code + k as u8), size, None);
+                        } else if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                            self.vals.insert(v, Val::Missing(OTHER));
+                        }
+                    }
+                    return Ok(());
+                }
+                ((11 | u, 0), None)
+            }
+            _ => return Err("a scalar memory read as data (a descriptor of another use)"),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -7738,7 +7759,19 @@ impl<'a> Lower<'a> {
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
         // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
         // lowering accepts what it refuses when the same value is read directly.
-        let mut work: Vec<Value> = self.read_phis.iter().copied().collect();
+        //
+        // Open Vice: off unless `VICTORY_STRICT_PHIS` is set. Grand Theft Auto
+        // VI's world mesh shaders (ef5409053e14aa82, 093c64546c55554e,
+        // 5bd95fdec765c0d6) carry such a value (a lane mask, a scalar memory
+        // read) through two joins: with this they are refused, every world
+        // geometry draw is dropped and the picture is black; without it the
+        // value reads zero there and the world is drawn.
+        let strict = std::env::var_os("VICTORY_STRICT_PHIS").is_some();
+        let mut work: Vec<Value> = if strict {
+            self.read_phis.iter().copied().collect()
+        } else {
+            Vec::new()
+        };
         while let Some(v) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
