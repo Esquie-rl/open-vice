@@ -1,4 +1,4 @@
-param([int]$Samples = 20, [int]$IntervalMs = 200, [UInt64]$Base = 0x140000000, [UInt64]$Size = 184995840)
+﻿param([int]$Samples = 20, [int]$IntervalMs = 200, [UInt64]$Base = 0x140000000, [UInt64]$Size = 184995840)
 # Samples the instruction pointer of every gta6rt thread (suspend, read RIP, resume) and prints, per thread, where in
 # the game's image (or outside it) the samples fell.
 Add-Type @'
@@ -16,8 +16,13 @@ public static class ThreadRip {
         IntPtr p = OpenProcess(0x0010, false, pid);
         if (p == IntPtr.Zero) return new ulong[0];
         try {
-            byte[] buf = new byte[0x2000]; IntPtr got;
-            if (!ReadProcessMemory(p, new IntPtr((long)rsp), buf, new IntPtr(buf.Length), out got)) return new ulong[0];
+            byte[] buf = new byte[0x10000]; long total = 0; IntPtr got;
+            byte[] page = new byte[0x1000];
+            for (long off = 0; off < buf.Length; off += 0x1000) {
+                if (!ReadProcessMemory(p, new IntPtr((long)rsp + off), page, new IntPtr(0x1000), out got)) break;
+                Array.Copy(page, 0, buf, off, 0x1000); total += 0x1000;
+            }
+            got = new IntPtr(total);
             var list = new System.Collections.Generic.List<ulong>();
             for (int i = 0; i + 8 <= got.ToInt64() && list.Count < count; i += 8) {
                 ulong v = BitConverter.ToUInt64(buf, i);
@@ -65,3 +70,5 @@ foreach ($tid in $hist.Keys) {
     $line = ($top | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ' | '
     "tid $tid : $line"
 }
+
+

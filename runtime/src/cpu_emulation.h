@@ -136,6 +136,8 @@ inline uint64_t extract_bits(uint64_t src, unsigned len, unsigned idx) {
 
 #include <atomic>
 #include <cstdio>
+#include <mutex>
+#include <set>
 
 namespace rt::cpu_emulation {
 
@@ -272,6 +274,78 @@ inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullpt
     return true;
 }
 
+// local: executable memory within +-2 GiB of `origin`, for the CLZERO loop thunks a rel32 CALL reaches. 64 KiB, made once;
+// null when no free range is found next to the image.
+inline uint8_t* thunk_arena(uint64_t origin) {
+    static std::mutex m;
+    static uint8_t* arena = nullptr;
+    static std::size_t used = 0;
+    std::lock_guard lock(m);
+    if (!arena) {
+        const uint64_t base = origin & ~uint64_t(0xFFFF);
+        for (uint64_t step = 1; step < 0x7000 && !arena; ++step) {  // 64 KiB steps, up to ~1.7 GiB away
+            for (const int64_t sign : {1, -1}) {
+                const uint64_t at = base + uint64_t(sign * int64_t(step << 16));
+                arena = static_cast<uint8_t*>(
+                    VirtualAlloc(reinterpret_cast<void*>(at), 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+                if (arena) break;
+            }
+        }
+        if (!arena) return nullptr;
+    }
+    const int64_t dist = int64_t(reinterpret_cast<uint64_t>(arena) - origin);
+    if (dist > 0x7FFF0000LL || dist < -0x7FFF0000LL || used + 96 > 0x10000) return nullptr;
+    uint8_t* t = arena + used;
+    used += 96;
+    return t;
+}
+
+// local: rewrites a recognised CLZERO loop in the title's code, once per site, as `call thunk; jmp +5`, the thunk
+// zeroing each line with eight 8-byte stores (no CLZERO, so no trap): do { zero line(rax); rax += 64 } while (rax <
+// end), with the same CMP at the end, so RAX and the flags leave it as the loop left them. A store to a page xmem has
+// not committed faults inside the thunk and resumes there after the commit, as CLZERO's write would. The 12 bytes are
+// written while this thread is stopped at their first one; another thread inside them would see a torn instruction
+// (a HYPOTHESIS that none is: the sites are in one clearing routine).
+inline void patch_clzero_loop(uint8_t* site, uint8_t rex, uint8_t modrm) {
+    static std::mutex m;
+    static std::set<uint8_t*> done;
+    {
+        std::lock_guard lock(m);
+        if (!done.insert(site).second) return;
+    }
+    uint8_t* t = thunk_arena(reinterpret_cast<uint64_t>(site));
+    if (!t) return;
+    static const uint8_t body[] = {
+        0x51,                                                   // push rcx
+        0x48, 0x89, 0xC1,                                       // mov rcx, rax
+        0x48, 0x83, 0xE1, 0xC0,                                 // and rcx, -64
+        0x48, 0xC7, 0x01, 0, 0, 0, 0,                           // mov qword [rcx], 0
+        0x48, 0xC7, 0x41, 0x08, 0, 0, 0, 0, 0x48, 0xC7, 0x41, 0x10, 0, 0, 0, 0,
+        0x48, 0xC7, 0x41, 0x18, 0, 0, 0, 0, 0x48, 0xC7, 0x41, 0x20, 0, 0, 0, 0,
+        0x48, 0xC7, 0x41, 0x28, 0, 0, 0, 0, 0x48, 0xC7, 0x41, 0x30, 0, 0, 0, 0,
+        0x48, 0xC7, 0x41, 0x38, 0, 0, 0, 0,                     // ... [rcx+8] .. [rcx+56]
+        0x59,                                                   // pop rcx
+        0x48, 0x83, 0xC0, 0x40,                                 // add rax, 40h
+        0x00, 0x39, 0x00,                                       // cmp rax, r64 (REX and ModRM copied below)
+        0x72, 0x00,                                             // jb top
+        0xC3};                                                  // ret
+    static_assert(sizeof(body) == 82, "thunk layout");
+    std::memcpy(t, body, sizeof body);
+    t[76] = rex;
+    t[78] = modrm;
+    t[80] = static_cast<uint8_t>(-81);  // back to offset 0 from the end of the JB (offset 81)
+    FlushInstructionCache(GetCurrentProcess(), t, sizeof body);
+    uint8_t patch[12] = {0xE8, 0, 0, 0, 0, 0xEB, 0x05, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
+    const int32_t rel = int32_t(int64_t(reinterpret_cast<uint64_t>(t)) - int64_t(reinterpret_cast<uint64_t>(site) + 5));
+    std::memcpy(patch + 1, &rel, 4);
+    DWORD old = 0;
+    if (!VirtualProtect(site, sizeof patch, PAGE_EXECUTE_READWRITE, &old)) return;
+    std::memcpy(site, patch, sizeof patch);
+    VirtualProtect(site, sizeof patch, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, sizeof patch);
+    std::fprintf(stderr, "[rt] cpu: CLZERO loop at %p rewritten to a store loop\n", static_cast<void*>(site));
+}
+
 // local: a CLZERO loop run whole. Right after an emulated CLZERO (c->Rip past it), the title's clearing loops are
 //   clzero ; add rax, 40h ; cmp rax, r64 ; jb back-to-clzero        (0F 01 FC | 48 83 C0 40 | REX 39 /r | 72 F4)
 // On an Intel host each line would take one #UD trap; here the rest of the loop zeroes its lines directly, page by
@@ -287,6 +361,7 @@ inline uint64_t clzero_loop(CONTEXT* c, const uint8_t* clzero_at) {
     if (!(p[7] == 0x72 && p[8] == 0xF4)) return 0;                                    // jb clzero
     const unsigned reg = ((modrm >> 3) & 7) | ((rex & 0x4) ? 8u : 0u);
     if (reg == 0 || reg == 4) return 0;  // rax itself or rsp: not the shape measured
+    patch_clzero_loop(const_cast<uint8_t*>(clzero_at), rex, modrm);  // later runs of this loop take no trap
     const uint64_t end = (&c->Rax)[reg];
     uint64_t rax = c->Rax, lines = 0;
     while (rax < end) {
@@ -343,9 +418,18 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (n == 0)
         std::fprintf(stderr, "[rt] cpu: this CPU has no %s; emulating it (first at %p)\n", name(d.op),
                      reinterpret_cast<void*>(c->Rip - d.length));
-    else if (n >= 4096 && (n & (n - 1)) == 0)  // LOCAL DIAGNOSTIC: how often the trap runs
+    else if (n >= 4096 && (n & (n - 1)) == 0) {  // LOCAL DIAGNOSTIC: how often the trap runs
         std::fprintf(stderr, "[rt] cpu: %s emulated %llu times (last at %p)\n", name(d.op),
                      static_cast<unsigned long long>(n), reinterpret_cast<void*>(c->Rip - d.length));
+        if (d.op == Op::mwaitx) {  // the title's wait loops compare a 64-bit word at RDI with RSI
+            std::uint64_t word = 0;
+            const bool ok = readable(c->Rdi, 8) == 8;
+            if (ok) std::memcpy(&word, reinterpret_cast<const void*>(c->Rdi), 8);
+            std::fprintf(stderr, "[rt] cpu: MWAITX waits on %p = 0x%llx%s for 0x%llx\n",
+                         reinterpret_cast<void*>(c->Rdi), static_cast<unsigned long long>(word),
+                         ok ? "" : " (unreadable)", static_cast<unsigned long long>(c->Rsi));
+        }
+    }
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 

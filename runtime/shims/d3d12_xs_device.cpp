@@ -56,6 +56,9 @@
 #include <mutex>
 #include <new>
 #include <utility>
+#include <string>
+#include <map>
+#include <set>
 #include <vector>
 
 #include "d3d12_xs_command_list_iid.h"
@@ -86,8 +89,8 @@ struct DeviceProxy {
     // first call. Opaque: UploadArena is defined with the list proxy. Atomic: lists record on several threads
     // at once, so the first AllocateUploadMemory installs the arena by compare-exchange.
     std::atomic<void*> upload_state{nullptr};
-    // The console runtime layout this title was built against (docs/d3d12_xs_console_abi.md §4): the queue proxy
-    // writes it on detection and every object shares it — the queue/list slot tails shift +2 under the newer one.
+    // The console runtime layout this title was built against (docs/d3d12_xs_console_abi.md Â§4): the queue proxy
+    // writes it on detection and every object shares it â€” the queue/list slot tails shift +2 under the newer one.
     std::atomic<unsigned char> console_layout{0};  // 0 unknown, 1 older, 2 newer
     // Set by create_device_proxy: false hands real (PC-shaped) lists back from CreateCommandList for callers
     // compiled against the PC headers.
@@ -793,20 +796,20 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
 // fence) wrap what they create, so a title never holds a PC or Vulkan-layer queue or fence. The proxies forward
 // the public chain in PC order, exactly like the device proxy; on a fence a slot past the PC vtable is logged and
 // refused with E_NOTIMPL. PresentX, SuspendX and ResumeX are queue methods past the public chain
-// (docs/d3d12_command_objects.md §5.3). A sibling layer measured two queue layouts on retail titles
-// (docs/d3d12_xs_console_abi.md §4, unverified here): the older has Signal 14, Wait 15,
+// (docs/d3d12_command_objects.md Â§5.3). A sibling layer measured two queue layouts on retail titles
+// (docs/d3d12_xs_console_abi.md Â§4, unverified here): the older has Signal 14, Wait 15,
 // GetTimestampFrequency 16, GetClockCalibration 17, GetDesc 18, SignalX 23, PresentX 30; a newer game
 // OS inserts two methods before Signal, shifting to Signal 16, Wait 17, frequency 18, SignalX 25,
-// PresentX 32 — a fence passed to slot 16 or 17 marks the newer layout, and the detection is shared
+// PresentX 32 â€” a fence passed to slot 16 or 17 marks the newer layout, and the detection is shared
 // across queues through the device. PresentX is wired to the Vulkan layer's Xbox presentation,
 // SignalX forwards as Signal, and the unmodelled console-only slots answer S_OK (the PresentX
 // section below); the first run of the executable confirms which layout.
 //
 // Slot numbers are those of the Windows SDK 10.0.26100 d3d12.h: ID3D12CommandQueue has 19, ID3D12Fence 11 and
 // ID3D12Fence1 12. That the console keeps these public slots, and keeps device slots 8/32/36/75, is an assumption
-// the shipped binaries cannot test (§3.5: the package has no queue or fence client). Every queue and fence method
+// the shipped binaries cannot test (Â§3.5: the package has no queue or fence client). Every queue and fence method
 // takes integer and pointer arguments only; GetDesc returns its struct through the hidden pointer in RDX, which is
-// forwarded unchanged (no Xbox variant is measured, §6).
+// forwarded unchanged (no Xbox variant is measured, Â§6).
 //
 // The refused range is the proxy's own table: 128 queue slots and 64 fence slots, every one a thunk. The table sits
 // at the end of the first page of a 64 KiB reservation whose other pages are never committed, so a slot index past
@@ -820,7 +823,7 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
 // SetEventOnMultipleFenceCompletion (45) and EnqueueMakeResident fences. The heap proxies of slot 14 are pageables
 // and device children too and are unwrapped in the same places. Command lists from device slot 12 come back
 // console-shaped (the list proxy below): queue ExecuteCommandLists (10) unwraps the list array, the list's own
-// Reset and ExecuteBundle unwrap allocator and bundle proxies, and its SetDescriptorHeaps unwraps heap proxies —
+// Reset and ExecuteBundle unwrap allocator and bundle proxies, and its SetDescriptorHeaps unwraps heap proxies â€”
 // all through proxy_real_object, so any object kind added later unwraps in every place at once.
 //
 // QueryInterface answers only the interfaces the proxy models (the base chain and its own interface, Fence1 when
@@ -865,7 +868,7 @@ struct ChildProxy {
     void** real_vtable;
     unsigned slot_count;    // public slots the real object implements; the rest of the table is refused
     std::atomic<unsigned long> refs;
-    // Queues only: the console runtime layout this title was built against (docs/d3d12_xs_console_abi.md §4),
+    // Queues only: the console runtime layout this title was built against (docs/d3d12_xs_console_abi.md Â§4),
     // detected by a fence reaching slot 16/17 or SignalX slot 25. Unused on fences and allocators. A queue is
     // used from many threads, so the cache of the device's shared detection is atomic like the shared flag
     // itself.
@@ -1067,6 +1070,15 @@ std::uint64_t fence_completed_value_address(ChildProxy* self, std::uint64_t valu
         return 0;
     }
     refresh_mirror(m);
+    {  // LOCAL DIAGNOSTIC: which fence each mirror address belongs to (first 40 distinct)
+        static std::mutex mx;
+        static std::set<const void*> seen;
+        std::lock_guard lock(mx);
+        if (seen.size() < 40 && seen.insert(m).second)
+            std::fprintf(stderr, "[rt] diag: fence proxy %p (real %p) mirror %p value now %llu, title value %llu\n",
+                         static_cast<void*>(self), static_cast<void*>(self->real), static_cast<void*>(m),
+                         static_cast<unsigned long long>(m->completed), static_cast<unsigned long long>(value));
+    }
     return reinterpret_cast<std::uint64_t>(&m->completed);
 }
 
@@ -1287,11 +1299,11 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
 
 // ---- PresentX on the queue (LEONIDA_VULKAN_DEVICE) ---------------------------------------------------------
 //
-// The measured console queue slots (docs/d3d12_xs_console_abi.md §4): the older runtime keeps the PC order —
-// Signal 14, Wait 15, frequency 16, calibration 17, GetDesc 18 — and presents at slot 30, with SignalX at 23. A
+// The measured console queue slots (docs/d3d12_xs_console_abi.md Â§4): the older runtime keeps the PC order â€”
+// Signal 14, Wait 15, frequency 16, calibration 17, GetDesc 18 â€” and presents at slot 30, with SignalX at 23. A
 // newer game OS inserts two methods before Signal: Signal 16, Wait 17, frequency 18, calibration 19, GetDesc 20,
 // SignalX 25, PresentX 32. The layout is detected once, by a fence object reaching slot 16 or 17 (the older
-// layout's frequency and calibration getters take no object argument) or by a fence reaching SignalX slot 25 —
+// layout's frequency and calibration getters take no object argument) or by a fence reaching SignalX slot 25 â€”
 // a title that signals only through SignalX would otherwise stay undetected and lose every signal.
 //
 // Every other console-only queue method answers S_OK (sibling layer: title frame pacing flows through them, and a
@@ -1473,7 +1485,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                         self->real, fence, a2));
                 }
                 if (newer) return hr_to_u64(S_OK);  // proven newer: a non-fence Signal/Wait arg is malformed,
-                // not evidence of the older layout — do not downgrade the shared detection on it
+                // not evidence of the older layout â€” do not downgrade the shared detection on it
                 if (self->queue_layout.load(std::memory_order_relaxed) ==
                     ChildProxy::kQueueLayoutUnknown) {
                     self->queue_layout.store(ChildProxy::kQueueLayoutOlder, std::memory_order_relaxed);
@@ -1498,7 +1510,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             // Slot 18 while the layout is still unknown is ambiguous: the older GetDesc (a struct-return
             // write of a whole desc) or the newer frequency getter (an 8-byte out). Answering it as GetDesc
             // writes far past the 8 bytes a frequency caller passes, so the call goes to the frequency
-            // getter — the only interpretation that cannot overrun its argument, and a title often queries
+            // getter â€” the only interpretation that cannot overrun its argument, and a title often queries
             // the frequency before its first fence call. A proven-older queue keeps the generic GetDesc
             // path below; slots 19 and 20 stay no-ops, since their newer interpretations write through
             // caller pointers an unmodelled older method might not supply.
@@ -1684,26 +1696,26 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
 //
 // Device slot 12 (CreateCommandList) hands the title a console-shaped command list: the console vtable order, a
 // 160-slot table, and the object fields the console SDK's inline writers touch (docs/d3d12_xs_console_abi.md
-// §5). The write cursor (+0x18) is pinned at both limits (+0x28, +0x30), so a title always finds the record
-// buffer full and takes the vtable path for every command — the proxy never has to interpret inline records.
+// Â§5). The write cursor (+0x18) is pinned at both limits (+0x28, +0x30), so a title always finds the record
+// buffer full and takes the vtable path for every command â€” the proxy never has to interpret inline records.
 // The flag bytes (+0x140..+0x143), the root-parameter header table (+0x344) and the pipeline record (+0x544)
 // stay zeroed: they are only read while writing a record, which never happens at the limit.
 //
 // The console slot order keeps the PC order through slot 26 (measured: 9, 10, 12-17, 19, 20, 25, 26), places
-// four console-only methods at 27-30, then the PC chain resumes shifted +4 — confirmed at console 32->PC 28
+// four console-only methods at 27-30, then the PC chain resumes shifted +4 â€” confirmed at console 32->PC 28
 // (SetDescriptorHeaps), 33->29, 41->37, 43->39, 45->41, 48->44, 51->47 and 53->49, and the same shift fills the
 // block through console 59 -> PC 55. The console has no PIX markers: console 60 is EndEvent (PC 58) and 61 is
 // ExecuteIndirect (PC 59, package-measured). Console 146 is the enhanced Barrier taking one D3D12_BARRIER_GROUP
-// (package-confirmed; PC equivalent is GCL7 slot 80). Console-only slots — the 27-30 extras, AllocateUploadMemory
-// (148), the disputed tail past 61 and the newer-layout +2 tail — are recorded with their first argument words
+// (package-confirmed; PC equivalent is GCL7 slot 80). Console-only slots â€” the 27-30 extras, AllocateUploadMemory
+// (148), the disputed tail past 61 and the newer-layout +2 tail â€” are recorded with their first argument words
 // and return 0 without a PC call: a wrong forward is worse than a clean refusal.
 
 constexpr unsigned kListSlots = 160;
 // ---- Upload memory (console list slot 148, AllocateUploadMemory) ----
 //
 // On the console the CPU and GPU share one address space: the pointer AllocateUploadMemory(size, alignment)
-// returns is written by the CPU and handed to the GPU unchanged — the package measures it going straight into a
-// root SRV (docs/d3d12_xs_console_abi.md §5.3, d3d12_command_objects.md §3.3a). A PC has two address spaces, so
+// returns is written by the CPU and handed to the GPU unchanged â€” the package measures it going straight into a
+// root SRV (docs/d3d12_xs_console_abi.md Â§5.3, d3d12_command_objects.md Â§3.3a). A PC has two address spaces, so
 // each arena chunk is a persistently-mapped UPLOAD-heap buffer: the title gets the CPU pointer and writes the
 // very memory the GPU samples, and the root-descriptor setters translate a chunk address to the buffer's device
 // address (the same backing memory) before forwarding. Translation covers the six root VA setters (console
@@ -1772,7 +1784,7 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
     alignment = alignment < 16 ? 16 : alignment;  // every measured call asked for 16
     // Refuse what cannot be served before any arithmetic runs: only power-of-two alignments are measured,
     // chunks map at 64K granularity at best, and a size too big to add the alignment to would wrap the
-    // checks below — one such call returned a pointer and left the cursor so the next request re-handed
+    // checks below â€” one such call returned a pointer and left the cursor so the next request re-handed
     // the same range (daemosofchaos's report on #2490).
     if ((alignment & (alignment - 1)) != 0 || alignment > (64 << 10) ||
         size > ~static_cast<std::size_t>(0) - alignment) {
@@ -1815,8 +1827,8 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
     return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
 }
 
-// An address inside an upload chunk becomes the chunk's device address plus the offset; anything else — a
-// real resource VA the title already holds — passes through.
+// An address inside an upload chunk becomes the chunk's device address plus the offset; anything else â€” a
+// real resource VA the title already holds â€” passes through.
 std::uint64_t upload_translate(DeviceProxy* device, std::uint64_t va) {
     auto* arena = static_cast<UploadArena*>(
         device ? device->upload_state.load(std::memory_order_acquire) : nullptr);
@@ -1934,7 +1946,7 @@ void note_list_slot(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint
 }
 
 // The interfaces the console list answers: the base chain, ID3D12CommandList and every graphics-command-list
-// interface the real list implements — on the console the list is a single object, so any of them returns the
+// interface the real list implements â€” on the console the list is a single object, so any of them returns the
 // proxy.
 bool is_list_iid(const IID& iid) {
     return IsEqualIID(iid, __uuidof(IUnknown)) || IsEqualIID(iid, __uuidof(ID3D12Object)) ||
@@ -2047,7 +2059,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                      std::uint64_t, std::uint64_t);
             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
             if constexpr (pc == 10) {
-                // Reset(allocator, pso) — console 10, and 139 as the retail title calls it: the title hands its
+                // Reset(allocator, pso) â€” console 10, and 139 as the retail title calls it: the title hands its
                 // allocator proxy; the real list takes the real one (and a wrapped pipeline state, if that ever
                 // exists, the same way).
                 a1 = unwrap_object(a1);
@@ -2056,7 +2068,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 a1 = unwrap_object(a1);  // the bundle is a list proxy too
             } else if constexpr (Slot >= 41 && Slot <= 46) {
                 // The six root descriptor setters (index, GPU VA): an upload-arena CPU pointer becomes the
-                // chunk's device address (d3d12_xs_console_abi.md §5.3 measures slots 41/43/45 for the compute
+                // chunk's device address (d3d12_xs_console_abi.md Â§5.3 measures slots 41/43/45 for the compute
                 // side; the graphics setters interleave on even slots).
                 a2 = upload_translate(self->device, a2);
             } else if constexpr (Slot == 47) {
@@ -2780,7 +2792,7 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     if (!desc) return E_INVALIDARG;
     if (!riid) return E_POINTER;
 
-    // FSPX description layout (docs/fspx.md §How the DLL reads it):
+    // FSPX description layout (docs/fspx.md Â§How the DLL reads it):
     struct XboxNativeComputePipelineStateDesc {
         ID3D12RootSignature* root_signature;  // +0x00
         const void* kind0;                    // +0x08: dispatch state
