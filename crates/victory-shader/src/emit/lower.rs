@@ -3483,10 +3483,23 @@ impl<'a> Lower<'a> {
             }
             None => vec![(2, field(self, 0))],
         };
+        // Open Vice: the other dwords (address, format) read zero unless
+        // `VICTORY_STRICT_DESCRIPTOR_DATA` is set. Grand Theft Auto VI's
+        // world pixel shader 94d281151ca58b4f tests a bit of a register that,
+        // on one path into a join, still holds an earlier descriptor's first
+        // dword: refusing it dropped every world geometry draw.
+        // shortcut: code that really computes with a descriptor's address or
+        // format gets zero; addresses made from it read outside any view
+        // (zeros) instead of the title's memory.
+        let strict = std::env::var_os("VICTORY_STRICT_DESCRIPTOR_DATA").is_some();
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
+                None if !strict => {
+                    let zero = self.s.m.i32(0);
+                    self.write(inst, Reg::S(code + k as u8), zero, None);
+                }
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
                         self.vals.insert(v, Val::Missing(OTHER));
