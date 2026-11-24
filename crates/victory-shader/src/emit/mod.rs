@@ -1079,6 +1079,19 @@ mod tests {
         l
     }
 
+    /// User data `s0..s4` (`s0` given, the rest 0), and a heap guard entry
+    /// (#483) past every slot these tests use, so no index reaches it.
+    fn guarded(cs: &super::HostShader, s0: u32) -> Vec<u32> {
+        let mut ud = vec![0u32; cs.user_data_dwords().max(5) as usize];
+        ud[0] = s0;
+        for u in &cs.user_data {
+            if matches!(u.root, crate::RootType::ResourceHeap | crate::RootType::SamplerHeap) {
+                ud[u.index as usize] = 1 << 20;
+            }
+        }
+        ud
+    }
+
     /// One thread, user SGPRs `s0..s4`.
     const ONE_THREAD: crate::native::ComputeIo = crate::native::ComputeIo {
         rsrc2: 5 << 1,
@@ -1238,7 +1251,7 @@ mod tests {
                     &pso,
                     &Dispatch {
                         roots: vec![
-                            (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (0, Root::Constants(guarded(&cs, 0))),
                             (
                                 1,
                                 Root::View {
@@ -1362,7 +1375,7 @@ mod tests {
                             &pso,
                             &Dispatch {
                                 roots: vec![
-                                    (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                                    (0, Root::Constants(guarded(&cs, 0))),
                                     (
                                         1,
                                         Root::View {
@@ -1455,7 +1468,7 @@ mod tests {
                             &pso,
                             &Dispatch {
                                 roots: vec![
-                                    (0, Root::Constants(vec![s0, 0, 0, 0, 0])),
+                                    (0, Root::Constants(guarded(&cs, s0))),
                                     (
                                         1,
                                         Root::View {

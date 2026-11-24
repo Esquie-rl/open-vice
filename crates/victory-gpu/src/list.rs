@@ -1189,8 +1189,32 @@ mod state {
     ) {
         super::count_draw();
         if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            // Grand Theft Auto VI dispatches its world's instances this way:
+            // dropped, none were drawn or retired, and its INSTANCE_LIST pool
+            // filled until the title stopped itself (0x80000003, #698). The
+            // group counts are records of three dwords at `indirect`, run
+            // through the host's indirect execution, whose clamp bounds
+            // every record and the list's work.
+            // shortcut: `x` is taken as the record count (at least one, at
+            // most 4096); its first distinct values are logged to check it.
+            const MESH: u32 = 10;
+            const STRIDE: u32 = 12;
+            static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+            {
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.len() < 16 && !seen.contains(&x) {
+                    seen.push(x);
+                    tracing::info!(x, flags = _flags, payload = _payload, "indirect mesh dispatch");
+                }
+            }
+            let max = x.clamp(1, 4096);
+            let mut ran = false;
+            with_state(this, |list, s| {
+                ran = s.execute_indirect(list, (MESH, STRIDE, max), indirect, None);
+            });
+            if !ran {
+                super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
