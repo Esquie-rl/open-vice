@@ -99,6 +99,22 @@ impl Shadow {
         address - self.start
     }
 
+    /// Diagnostics (Open Vice frame report): `n` dwords the host copy holds
+    /// at a title address now, what the last submission left there.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn peek(&self, address: u64, n: usize) -> Vec<u32> {
+        let n = n.min((self.left(address) / 4) as usize);
+        // SAFETY: inside the CPU-visible mapping of the copy.
+        (0..n)
+            .map(|k| unsafe {
+                self.data
+                    .add(self.offset(address) as usize + 4 * k)
+                    .cast::<u32>()
+                    .read_unaligned()
+            })
+            .collect()
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {

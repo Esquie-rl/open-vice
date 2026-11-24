@@ -144,6 +144,19 @@ impl Shader {
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
+    // Open Vice: the title's ray-tracing BVH builder (XboxBvhBuilder.dll's
+    // build passes, whose containers carry an `XboxBvhBuilder/...` debug
+    // path) is dropped as a unit unless `VICTORY_KEEP_BVH_BUILDER` is set.
+    // With root UAVs translated, some of its passes run and others do not:
+    // those that run wait on data the others never write, and the list
+    // runs past the host's 2 s limit (device removed entering the world;
+    // VIctory #264). Ray tracing is lost; the world does not need it.
+    const BVH_BUILDER: &[u8] = b"XboxBvhBuilder";
+    if std::env::var_os("VICTORY_KEEP_BVH_BUILDER").is_none()
+        && container.windows(BVH_BUILDER.len()).any(|w| w == BVH_BUILDER)
+    {
+        return Err("the title's ray-tracing BVH builder (dropped as a unit)".into());
+    }
     let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
     // Open Vice: a program the host's wave sizes refuse (NVIDIA's 32 lanes:
     // Grand Theft Auto VI's world mesh shaders read lane masks as data) is

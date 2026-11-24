@@ -1273,11 +1273,21 @@ impl State {
         failed("");
         let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
         #[cfg(feature = "diagnostics")]
-        self.report(
-            kind == 2,
-            format_args!("indirect kind {kind} max {max} counted {}", count.is_some()),
-            ran,
-        );
+        {
+            // The first record as the host copy holds it now (the last
+            // submission's values: the title's passes write them on the GPU).
+            let args = crate::shadow::find(arguments, u64::from(stride.max(4)))
+                .map(|s| s.peek(arguments, (stride / 4).clamp(1, 5) as usize))
+                .unwrap_or_default();
+            self.report(
+                kind == 2,
+                format_args!(
+                    "indirect kind {kind} max {max} counted {} args {args:?}",
+                    count.is_some()
+                ),
+                ran,
+            );
+        }
         ran
     }
 
