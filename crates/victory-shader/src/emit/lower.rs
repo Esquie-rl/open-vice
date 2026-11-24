@@ -296,6 +296,9 @@ struct Lower<'a> {
 /// until the driver resets it. A lane that reaches the limit leaves the
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
+// Open Vice: VIctory's default, kept for reference; Open Vice's is
+// `super::DEFAULT_LOOP_LIMIT`.
+#[allow(dead_code)]
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar

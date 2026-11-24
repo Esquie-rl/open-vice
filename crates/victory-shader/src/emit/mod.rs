@@ -112,10 +112,14 @@ pub use shader::{
     ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
 };
 
-/// The loop limit without an override: 2^20. Open Vice reads
-/// `VICTORY_SHADER_LOOP_LIMIT` in every build (a lower limit was measured not
-/// to stop the GPU hang on entering the world on an RTX 4080 Laptop).
-pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
+/// The loop limit without an override: 4096 in Open Vice (VIctory's is
+/// 2^20, [`lower::LOOP_LIMIT`]). On NVIDIA hosts some world shaders read
+/// zeros where the console reads their bounds, and their loops ran to 2^20
+/// until the driver reset the device (VIctory #392); with VIctory's stack
+/// for NVIDIA merged, 4096 took an RTX 4080 Laptop through the opening
+/// cutscene for ten minutes without a device removal. Open Vice reads
+/// `VICTORY_SHADER_LOOP_LIMIT` in every build.
+pub const DEFAULT_LOOP_LIMIT: u32 = 4096;
 
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
