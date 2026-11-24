@@ -7233,6 +7233,15 @@ public:
             // @dracbat); a state the description refuses (or UNDEFINED) gives COMMON, so the title still gets it.
             const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
             const D3D12_RESOURCE_STATES initial = state_for_barrier_layout(layout);
+            {  // LOCAL DIAGNOSTIC: the title-placed textures, which never see the title's writes
+                static std::atomic<unsigned> shown{0};
+                if (shown.fetch_add(1, std::memory_order_relaxed) < 16)
+                    std::fprintf(stderr, "[rt] diag: title-placed texture at %p: %llux%u x%u mips %u format %d flags 0x%x "
+                                         "layout %d\n",
+                                 address, static_cast<unsigned long long>(desc.Width), desc.Height,
+                                 desc.DepthOrArraySize, desc.MipLevels, int(desc.Format), unsigned(desc.Flags),
+                                 int(desc.Layout));
+            }
             HRESULT hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, initial, 0, nullptr, riid, out);
             if (FAILED(hr) && initial != D3D12_RESOURCE_STATE_COMMON)
                 hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, 0, nullptr,
