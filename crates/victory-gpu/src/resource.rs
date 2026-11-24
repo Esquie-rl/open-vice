@@ -670,6 +670,13 @@ struct Heap {
     memory: Memory,
 }
 
+#[cfg(windows)]
+impl Drop for Heap {
+    fn drop(&mut self) {
+        account(3, self.desc.size, false);
+    }
+}
+
 pub(crate) extern "system" fn create_heap(
     _: This,
     desc: *const HeapDesc,
@@ -697,6 +704,8 @@ pub(crate) extern "system" fn create_heap(
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
+    #[cfg(windows)]
+    account(3, desc.size, true);
     let heap = Box::new(Heap {
         object: Object::new(&HEAP_FUNCTIONS),
         desc,
@@ -749,6 +758,56 @@ struct Resource {
     /// yet.
     #[cfg(windows)]
     host: Option<std::sync::Arc<HostTexture>>,
+    /// Host GPU bytes the host copy takes (accounting).
+    #[cfg(windows)]
+    host_bytes: u64,
+}
+
+/// Host GPU bytes of title textures' host copies, by how the title made
+/// them: committed, placed in a heap, at an address it mapped. And the
+/// bytes of the title's heaps (index 3).
+#[cfg(windows)]
+static HOST_BYTES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Textures at an address: live, made so far, console bytes of the live
+/// ones (accounting).
+#[cfg(windows)]
+static AT_ADDRESS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[cfg(windows)]
+fn origin(backing: &Backing) -> usize {
+    match backing {
+        Backing::Committed(_) => 0,
+        Backing::Placed { .. } => 1,
+        Backing::Address(_) => 2,
+    }
+}
+
+/// Logs the host copies' memory each time it grows by another 256 MiB.
+#[cfg(windows)]
+fn account(index: usize, bytes: u64, grow: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if grow {
+        let before = HOST_BYTES[index].fetch_add(bytes, Relaxed);
+        let total: u64 = HOST_BYTES.iter().take(3).map(|b| b.load(Relaxed)).sum();
+        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let step = total >> 28;
+        if index < 3 && LOGGED.fetch_max(step, Relaxed) < step {
+            tracing::info!(
+                committed_mib = HOST_BYTES[0].load(Relaxed) >> 20,
+                placed_mib = HOST_BYTES[1].load(Relaxed) >> 20,
+                at_address_mib = HOST_BYTES[2].load(Relaxed) >> 20,
+                title_heaps_mib = HOST_BYTES[3].load(Relaxed) >> 20,
+                at_address_live = AT_ADDRESS[0].load(Relaxed),
+                at_address_made = AT_ADDRESS[1].load(Relaxed),
+                at_address_console_mib = AT_ADDRESS[2].load(Relaxed) >> 20,
+                "host texture memory"
+            );
+        }
+        let _ = before;
+    } else {
+        let _ = HOST_BYTES[index].fetch_update(Relaxed, Relaxed, |b| Some(b.saturating_sub(bytes)));
+    }
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -929,6 +988,26 @@ fn hand_out_resource(
     let _ = (state, clear);
     #[cfg(windows)]
     let host = host_texture(&desc, state, clear);
+    #[cfg(windows)]
+    let host_bytes = host.as_ref().map_or(0, |t| {
+        let Some(h) = crate::host::host() else { return 0 };
+        // SAFETY: plain queries on a live resource.
+        let bytes = unsafe { h.device.GetResourceAllocationInfo(0, &[t.GetDesc()]) }.SizeInBytes;
+        if bytes >= 64 << 20 {
+            tracing::info!(mib = bytes >> 20, ?desc, origin = origin(&backing), "large host texture");
+        }
+        if origin(&backing) == 2 {
+            use std::sync::atomic::Ordering::Relaxed;
+            AT_ADDRESS[0].fetch_add(1, Relaxed);
+            let made = AT_ADDRESS[1].fetch_add(1, Relaxed) + 1;
+            AT_ADDRESS[2].fetch_add(footprint(&desc).map_or(0, |i| i.size), Relaxed);
+            if made.is_power_of_two() || made % 4096 == 0 {
+                tracing::info!(made, kib = bytes >> 10, console_kib = footprint(&desc).map_or(0, |i| i.size) >> 10, ?desc, "texture at an address");
+            }
+        }
+        account(origin(&backing), bytes, true);
+        bytes
+    });
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -943,6 +1022,8 @@ fn hand_out_resource(
                 state: state.into(),
             })
         }),
+        #[cfg(windows)]
+        host_bytes,
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -972,6 +1053,13 @@ impl Drop for Resource {
                     "a title texture was released while a list not yet reset names its host copy"
                 );
             }
+        }
+        account(origin(&self.backing), self.host_bytes, false);
+        if self.host_bytes > 0 && origin(&self.backing) == 2 {
+            use std::sync::atomic::Ordering::Relaxed;
+            let console = footprint(&self.desc).map_or(0, |i| i.size);
+            let _ = AT_ADDRESS[0].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_sub(1)));
+            let _ = AT_ADDRESS[2].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_sub(console)));
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
@@ -1140,26 +1228,122 @@ pub(crate) extern "system" fn create_at_address(
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and
 /// interface textures), by address and description: a resource at that
 /// address, made the first time a draw reads one.
-/// shortcut: never released (one host texture per distinct address and
-/// description viewed); release them when the title unmaps or reuses the
-/// memory once streaming grows VRAM use.
+///
+/// Streaming puts new textures in memory old ones had: a texture placed
+/// over another's memory retires the other (its memory holds something
+/// else now), unless a frame just drawn viewed it (two views of the same
+/// memory in use). Before this, every texture streamed in kept its host
+/// copy, and the world filled the host GPU's memory within a minute (the
+/// device was then removed). A retired resource is released some frames
+/// later, once lists recorded with it have run; host descriptors and lists
+/// hold the host copy themselves meanwhile.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PLACED_TEXTURES: std::sync::Mutex<PlacedTextures> =
+    std::sync::Mutex::new(PlacedTextures::new());
+
+/// Frames a retired placed texture's resource lives on.
+#[cfg(windows)]
+const RETIRED_FRAMES: u64 = 8;
+
+/// A texture the title placed (see [`PLACED_TEXTURES`]).
+#[cfg(windows)]
+struct Placed {
+    resource: usize,
+    /// The end of its console memory.
+    end: u64,
+    /// The frame (presents so far) it was last viewed in.
+    used: u64,
+    bytes: u64,
+}
+
+#[cfg(windows)]
+struct PlacedTextures {
+    map: std::collections::BTreeMap<(u64, [u32; 14]), Placed>,
+    /// The largest console footprint placed, which bounds how far below a
+    /// new texture an overlapping one can start.
+    longest: u64,
+    /// Resources taken out of the map, and the frame they were.
+    retired: Vec<(u64, usize)>,
+    /// Console bytes of the textures in the map, and textures retired so
+    /// far (diagnostics in the log).
+    bytes: u64,
+    retired_total: u64,
+    made_total: u64,
+}
+
+#[cfg(windows)]
+impl PlacedTextures {
+    const fn new() -> Self {
+        PlacedTextures {
+            map: std::collections::BTreeMap::new(),
+            longest: 0,
+            retired: Vec::new(),
+            bytes: 0,
+            retired_total: 0,
+            made_total: 0,
+        }
+    }
+
+    /// Takes out the textures whose memory overlaps `[start, end)` and
+    /// that no frame just drawn viewed.
+    fn retire_overlapping(&mut self, start: u64, end: u64, frame: u64) {
+        let from = start.saturating_sub(self.longest);
+        let stale: Vec<(u64, [u32; 14])> = self
+            .map
+            .range((from, [0; 14])..(end, [0; 14]))
+            .filter(|&(&(at, _), p)| at < end && p.end > start && p.used + 1 < frame)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in stale {
+            if let Some(p) = self.map.remove(&key) {
+                self.bytes -= p.bytes;
+                self.retired_total += 1;
+                self.retired.push((frame, p.resource));
+            }
+        }
+    }
+
+    /// The retired resources old enough to release, taken out.
+    fn due(&mut self, frame: u64) -> Vec<usize> {
+        let mut due = Vec::new();
+        self.retired.retain(|&(at, r)| {
+            let keep = frame < at + RETIRED_FRAMES;
+            if !keep {
+                due.push(r);
+            }
+            keep
+        });
+        due
+    }
+}
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&r) = map.get(&(address, *desc)) {
-        return Some(r as This);
+    let frame = crate::queue::presented();
+    let mut placed = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let due = placed.due(frame);
+    if !due.is_empty() {
+        // Released without the lock: a resource's release takes others.
+        drop(placed);
+        for r in due {
+            resource_release(r as This);
+        }
+        placed = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    }
+    if let Some(p) = placed.map.get_mut(&(address, *desc)) {
+        p.used = frame;
+        return Some(p.resource as This);
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
     }
+    let bytes = footprint(&d).map_or(0, |info| info.size);
+    let end = address.saturating_add(bytes.max(1));
+    placed.retire_overlapping(address, end, frame);
     let mut out = std::ptr::null();
     let made = create_at_address(
         std::ptr::null(),
@@ -1173,7 +1357,27 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
-    map.insert((address, *desc), out as usize);
+    placed.map.insert(
+        (address, *desc),
+        Placed {
+            resource: out as usize,
+            end,
+            used: frame,
+            bytes,
+        },
+    );
+    placed.longest = placed.longest.max(bytes);
+    placed.bytes += bytes;
+    placed.made_total += 1;
+    if placed.made_total.is_multiple_of(1024) {
+        tracing::info!(
+            live = placed.map.len(),
+            mib = placed.bytes >> 20,
+            made = placed.made_total,
+            retired = placed.retired_total,
+            "placed textures"
+        );
+    }
     resource(out).host.is_some().then_some(out)
 }
 
