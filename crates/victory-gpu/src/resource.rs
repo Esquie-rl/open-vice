@@ -1152,6 +1152,8 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // Packed 16-bit render targets NVIDIA refuses (#581's R16 fallback) are
+    // already R8G8B8A8 here (`target_format`, #89).
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
