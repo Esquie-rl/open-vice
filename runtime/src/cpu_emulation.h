@@ -272,6 +272,50 @@ inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullpt
     return true;
 }
 
+// local: a CLZERO loop run whole. Right after an emulated CLZERO (c->Rip past it), the title's clearing loops are
+//   clzero ; add rax, 40h ; cmp rax, r64 ; jb back-to-clzero        (0F 01 FC | 48 83 C0 40 | REX 39 /r | 72 F4)
+// On an Intel host each line would take one #UD trap; here the rest of the loop zeroes its lines directly, page by
+// page, and execution resumes after the JB with the flags of the last CMP. A page that cannot be written yet (xmem
+// commits on first touch) stops it at that line with RIP back on the CLZERO, so the normal path raises the fault
+// there. Returns the number of lines zeroed.
+inline uint64_t clzero_loop(CONTEXT* c, const uint8_t* clzero_at) {
+    const uint8_t* p = clzero_at + 3;
+    if (readable(reinterpret_cast<uint64_t>(p), 9) < 9) return 0;
+    if (!(p[0] == 0x48 && p[1] == 0x83 && p[2] == 0xC0 && p[3] == 0x40)) return 0;    // add rax, 40h
+    const uint8_t rex = p[4], op = p[5], modrm = p[6];
+    if ((rex & 0xFA) != 0x48 || op != 0x39 || (modrm & 0xC7) != 0xC0) return 0;      // cmp rax, r64
+    if (!(p[7] == 0x72 && p[8] == 0xF4)) return 0;                                    // jb clzero
+    const unsigned reg = ((modrm >> 3) & 7) | ((rex & 0x4) ? 8u : 0u);
+    if (reg == 0 || reg == 4) return 0;  // rax itself or rsp: not the shape measured
+    const uint64_t end = (&c->Rax)[reg];
+    uint64_t rax = c->Rax, lines = 0;
+    while (rax < end) {
+        const uint64_t line = rax & ~uint64_t(63);
+        const uint64_t page_end = (line | 0xFFF) + 1;
+        if (writable(line)) {  // resume on the CLZERO: the normal path raises (or xmem commits) there
+            c->Rax = rax;
+            c->Rip = reinterpret_cast<DWORD64>(clzero_at);
+            return lines;
+        }
+        // Lines of this page the loop reaches: from `line` while rax < end, 64 bytes at a time.
+        uint64_t stop = page_end;
+        const uint64_t reach = ((end - rax + 63) & ~uint64_t(63)) + line;  // rax stays 64-byte apart from line
+        if (reach < stop) stop = reach;
+        std::memset(reinterpret_cast<void*>(line), 0, std::size_t(stop - line));
+        const uint64_t n = (stop - line) / 64;
+        lines += n;
+        rax += n * 64;
+    }
+    // Flags of the last `cmp rax, end` (rax >= end): CF clear, ZF on equality, SF from the difference.
+    const uint64_t diff = rax - end;
+    c->EFlags &= ~DWORD(0x8D5);  // CF PF AF ZF SF OF
+    if (diff == 0) c->EFlags |= 0x40 | 0x4;
+    if (diff >> 63) c->EFlags |= 0x80;
+    c->Rax = rax;
+    c->Rip = reinterpret_cast<DWORD64>(clzero_at + 12);
+    return lines;
+}
+
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT* c = info->ContextRecord;
@@ -292,9 +336,16 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
         r->ExceptionInformation[1] = fault.ExceptionInformation[1];
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if (count(d.op).fetch_add(1, std::memory_order_relaxed) == 0)
+    if (d.op == Op::clzero && !d.addr32)
+        count(d.op).fetch_add(clzero_loop(c, reinterpret_cast<const uint8_t*>(c->Rip - d.length)),
+                              std::memory_order_relaxed);
+    const std::uint64_t n = count(d.op).fetch_add(1, std::memory_order_relaxed);
+    if (n == 0)
         std::fprintf(stderr, "[rt] cpu: this CPU has no %s; emulating it (first at %p)\n", name(d.op),
                      reinterpret_cast<void*>(c->Rip - d.length));
+    else if (n >= 4096 && (n & (n - 1)) == 0)  // LOCAL DIAGNOSTIC: how often the trap runs
+        std::fprintf(stderr, "[rt] cpu: %s emulated %llu times (last at %p)\n", name(d.op),
+                     static_cast<unsigned long long>(n), reinterpret_cast<void*>(c->Rip - d.length));
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
