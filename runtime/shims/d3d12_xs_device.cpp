@@ -3380,6 +3380,343 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
     return reinterpret_cast<std::uint64_t>(ret);
 }
 
+#ifdef LEONIDA_VULKAN_DEVICE
+// ---- local: library pipelines (device slot 57) made real at their first draw ----
+//
+// The packet is the RDNA2 register state of the pipeline. Read here, from the 388-byte packets measured on the retail
+// title (a HYPOTHESIS for the other sizes, checked by the 0xFFFFFFFF word at +0xCC): CB_BLEND0..7_CONTROL at +0xD0,
+// CB_TARGET_MASK at +0xF0 and DB_DEPTH_CONTROL at +0xA0. The metadata is the input layout: a 0x50-byte head with the
+// element count at +0x4C, then per element {u32 name length with its NUL, name, semantic index, DXGI format, input
+// slot, byte offset, classification, step rate}. The stages' programs are found through their metadata digest (the
+// source container's HASH): the carved container is the one the shader corpus translated, so the PSO is the PC one.
+// Render-target and depth formats are not in the packet as DXGI formats; they are taken from the targets the draw has
+// bound, one PSO per combination.
+struct LibraryPipelineRecipe {
+    ID3D12Device* device = nullptr;
+    ID3D12RootSignature* root = nullptr;
+    std::vector<std::uint8_t> vs, ps;
+    std::vector<std::string> names;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+    std::uint32_t blend[8] = {};
+    std::uint32_t target_mask = 0xFFFFFFFFu;
+    std::uint32_t depth_control = 0;
+    std::mutex mutex;
+    std::map<std::string, ID3D12PipelineState*> made;  // by format key; held for the process (stubs live as long)
+};
+
+std::mutex& library_recipes_mutex() {
+    static std::mutex m;
+    return m;
+}
+std::map<const void*, std::shared_ptr<LibraryPipelineRecipe>>& library_recipes() {
+    static std::map<const void*, std::shared_ptr<LibraryPipelineRecipe>> m;
+    return m;
+}
+
+std::wstring shaders_dir() {
+    wchar_t v[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableW(L"LEONIDA_SHADERS", v, MAX_PATH);
+    return n && n < MAX_PATH ? std::wstring(v, n) : std::wstring();
+}
+
+// digest (32 hex digits) -> carved container file, from <LEONIDA_SHADERS>/library_digests.txt ("digest stage file").
+const std::map<std::string, std::string>& library_digest_files() {
+    static const std::map<std::string, std::string> table = [] {
+        std::map<std::string, std::string> t;
+        const std::wstring dir = shaders_dir();
+        if (dir.empty()) return t;
+        std::FILE* f = _wfopen((dir + L"\\library_digests.txt").c_str(), L"rb");
+        if (!f) {
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 57: no library_digests.txt next to the shaders\n");
+            return t;
+        }
+        char line[1024];
+        while (std::fgets(line, sizeof line, f)) {
+            std::string s(line);
+            while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+            const auto a = s.find(' '), b = a == std::string::npos ? a : s.find(' ', a + 1);
+            if (b != std::string::npos) t.emplace(s.substr(0, a), s.substr(b + 1));
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 57: %zu library digests\n", t.size());
+        return t;
+    }();
+    return table;
+}
+
+bool read_container(const std::string& file, std::vector<std::uint8_t>& out) {
+    static std::mutex m;
+    static std::map<std::string, std::vector<std::uint8_t>> cache;
+    std::lock_guard lock(m);
+    if (auto it = cache.find(file); it != cache.end()) {
+        out = it->second;
+        return true;
+    }
+    const std::wstring dir = shaders_dir();
+    if (dir.empty()) return false;
+    std::wstring path = dir + L"\\..\\dxbc\\";
+    for (const char c : file) path += wchar_t(static_cast<unsigned char>(c));
+    std::FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) return false;
+    std::vector<std::uint8_t> bytes;
+    std::uint8_t buf[65536];
+    for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) bytes.insert(bytes.end(), buf, buf + n);
+    std::fclose(f);
+    out = cache.emplace(file, std::move(bytes)).first->second;
+    return true;
+}
+
+std::string stage_digest_hex(std::uint64_t meta, std::uint64_t size) {
+    if (!meta || size < 36 || size > 65536) return {};
+    const auto* y = reinterpret_cast<const std::uint8_t*>(meta);
+    const std::size_t head = y[0] == 2 ? 16 : y[0] == 3 ? 24 : 0;
+    if (!head || y[head - 4] != 0x40) return {};
+    for (std::size_t o = head; o + 4 <= size;) {
+        std::uint32_t tag;
+        std::memcpy(&tag, y + o, 4);
+        if (tag == 0x41 || tag == 0x42) {
+            o += 32;
+            continue;
+        }
+        if (tag != 0x43 || o + 20 > size) return {};
+        char hex[33];
+        for (int i = 0; i < 16; ++i) std::snprintf(hex + 2 * i, 3, "%02x", y[o + 4 + i]);
+        return hex;
+    }
+    return {};
+}
+
+bool parse_input_layout(const std::uint8_t* m, std::uint64_t size, LibraryPipelineRecipe& r) {
+    if (!m || size < 0x50) return false;
+    std::uint32_t count;
+    std::memcpy(&count, m + 0x4C, 4);
+    if (count > 32) return false;
+    std::uint64_t o = 0x50;
+    struct Raw {
+        std::uint32_t index, format, slot, offset, cls, step;
+    };
+    std::vector<Raw> raws;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (o + 4 > size) return false;
+        std::uint32_t len;
+        std::memcpy(&len, m + o, 4);
+        o += 4;
+        if (!len || len > 64 || o + len + sizeof(Raw) > size || m[o + len - 1] != 0) return false;
+        r.names.emplace_back(reinterpret_cast<const char*>(m + o));
+        o += len;
+        Raw raw;
+        std::memcpy(&raw, m + o, sizeof raw);
+        o += sizeof raw;
+        raws.push_back(raw);
+    }
+    for (std::size_t i = 0; i < raws.size(); ++i) {
+        D3D12_INPUT_ELEMENT_DESC e{};
+        e.SemanticIndex = raws[i].index;
+        e.Format = static_cast<DXGI_FORMAT>(raws[i].format);
+        e.InputSlot = raws[i].slot;
+        e.AlignedByteOffset = raws[i].offset;
+        e.InputSlotClass = static_cast<D3D12_INPUT_CLASSIFICATION>(raws[i].cls);
+        e.InstanceDataStepRate = raws[i].step;
+        r.elements.push_back(e);
+    }
+    return true;
+}
+
+D3D12_BLEND d3d12_blend(std::uint32_t v, bool alpha) {
+    static constexpr D3D12_BLEND color[] = {
+        D3D12_BLEND_ZERO, D3D12_BLEND_ONE, D3D12_BLEND_SRC_COLOR, D3D12_BLEND_INV_SRC_COLOR, D3D12_BLEND_SRC_ALPHA,
+        D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_DEST_COLOR,
+        D3D12_BLEND_INV_DEST_COLOR, D3D12_BLEND_SRC_ALPHA_SAT, D3D12_BLEND_ONE, D3D12_BLEND_ONE,
+        D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_SRC1_COLOR, D3D12_BLEND_INV_SRC1_COLOR,
+        D3D12_BLEND_SRC1_ALPHA, D3D12_BLEND_INV_SRC1_ALPHA, D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR};
+    D3D12_BLEND b = v < std::size(color) ? color[v] : D3D12_BLEND_ONE;
+    if (alpha) {  // the alpha factors take no colour variant
+        if (b == D3D12_BLEND_SRC_COLOR) b = D3D12_BLEND_SRC_ALPHA;
+        else if (b == D3D12_BLEND_INV_SRC_COLOR) b = D3D12_BLEND_INV_SRC_ALPHA;
+        else if (b == D3D12_BLEND_DEST_COLOR) b = D3D12_BLEND_DEST_ALPHA;
+        else if (b == D3D12_BLEND_INV_DEST_COLOR) b = D3D12_BLEND_INV_DEST_ALPHA;
+        else if (b == D3D12_BLEND_SRC1_COLOR) b = D3D12_BLEND_SRC1_ALPHA;
+        else if (b == D3D12_BLEND_INV_SRC1_COLOR) b = D3D12_BLEND_INV_SRC1_ALPHA;
+    }
+    return b;
+}
+
+D3D12_BLEND_OP d3d12_blend_op(std::uint32_t v) {
+    switch (v) {
+        case 1: return D3D12_BLEND_OP_SUBTRACT;
+        case 2: return D3D12_BLEND_OP_MIN;
+        case 3: return D3D12_BLEND_OP_MAX;
+        case 4: return D3D12_BLEND_OP_REV_SUBTRACT;
+        default: return D3D12_BLEND_OP_ADD;
+    }
+}
+
+ID3D12PipelineState* realize_library_pipeline(ID3D12PipelineState* stub, const DXGI_FORMAT* rtv, UINT rtv_count,
+                                              DXGI_FORMAT dsv) {
+    std::shared_ptr<LibraryPipelineRecipe> r;
+    {
+        std::lock_guard lock(library_recipes_mutex());
+        const auto it = library_recipes().find(stub);
+        if (it == library_recipes().end()) return nullptr;
+        r = it->second;
+    }
+    std::string key;
+    for (UINT i = 0; i < rtv_count; ++i) key += std::to_string(int(rtv[i])) + ",";
+    key += "|" + std::to_string(int(dsv));
+    std::lock_guard lock(r->mutex);
+    if (const auto it = r->made.find(key); it != r->made.end()) return it->second;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+    d.pRootSignature = r->root;
+    d.VS = {r->vs.data(), r->vs.size()};
+    if (!r->ps.empty()) d.PS = {r->ps.data(), r->ps.size()};
+    for (UINT i = 0; i < 8; ++i) {
+        const std::uint32_t c = r->blend[i];
+        auto& t = d.BlendState.RenderTarget[i];
+        t.BlendEnable = (c >> 30) & 1;
+        const bool separate = (c >> 29) & 1;
+        t.SrcBlend = d3d12_blend(c & 0x1F, false);
+        t.BlendOp = d3d12_blend_op((c >> 5) & 7);
+        t.DestBlend = d3d12_blend((c >> 8) & 0x1F, false);
+        t.SrcBlendAlpha = d3d12_blend(separate ? (c >> 16) & 0x1F : c & 0x1F, true);
+        t.BlendOpAlpha = d3d12_blend_op(separate ? (c >> 21) & 7 : (c >> 5) & 7);
+        t.DestBlendAlpha = d3d12_blend(separate ? (c >> 24) & 0x1F : (c >> 8) & 0x1F, true);
+        t.LogicOp = D3D12_LOGIC_OP_NOOP;
+        t.RenderTargetWriteMask = static_cast<UINT8>((r->target_mask >> (4 * i)) & 0xF);
+    }
+    d.BlendState.IndependentBlendEnable = TRUE;
+    d.SampleMask = 0xFFFFFFFFu;
+    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    d.RasterizerState.DepthClipEnable = TRUE;
+    const bool depth = dsv != DXGI_FORMAT_UNKNOWN && ((r->depth_control >> 1) & 1);
+    d.DepthStencilState.DepthEnable = depth;
+    d.DepthStencilState.DepthWriteMask =
+        depth && ((r->depth_control >> 2) & 1) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    d.DepthStencilState.DepthFunc = static_cast<D3D12_COMPARISON_FUNC>(((r->depth_control >> 4) & 7) + 1);
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elements = r->elements;
+    for (std::size_t i = 0; i < elements.size(); ++i) elements[i].SemanticName = r->names[i].c_str();
+    d.InputLayout = {elements.data(), static_cast<UINT>(elements.size())};
+    d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    d.NumRenderTargets = rtv_count;
+    for (UINT i = 0; i < rtv_count && i < 8; ++i) d.RTVFormats[i] = rtv[i];
+    d.DSVFormat = dsv;
+    d.SampleDesc.Count = 1;
+    ID3D12PipelineState* pso = nullptr;
+    const HRESULT hr = r->device->CreateGraphicsPipelineState(&d, __uuidof(ID3D12PipelineState),
+                                                             reinterpret_cast<void**>(&pso));
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 20)
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 57 pipeline %p made real for formats %s: hr 0x%08lx\n",
+                     static_cast<void*>(stub), key.c_str(), static_cast<unsigned long>(hr));
+    if (FAILED(hr)) pso = nullptr;
+    r->made.emplace(key, pso);  // a failure is remembered too: the same draw is not retried every frame
+    return pso;
+}
+
+// The recipe of one slot-57 description, or null when its stages cannot be found (no VS, a mesh or geometry stage, or
+// a digest the corpus does not have).
+std::shared_ptr<LibraryPipelineRecipe> library_recipe(ID3D12Device* device, const std::uint64_t* w) {
+    const auto& files = library_digest_files();
+    if (files.empty()) return nullptr;
+    if (w[13] || w[17] || w[21] || w[25] || w[29]) return nullptr;  // GS/ES/HS/LS/FS programs: not handled here
+    const std::string vs = stage_digest_hex(w[11], w[12]), ps = stage_digest_hex(w[7], w[8]);
+    const auto vs_file = files.find(vs);
+    if (vs.empty() || vs_file == files.end()) return nullptr;
+    auto r = std::make_shared<LibraryPipelineRecipe>();
+    if (!read_container(vs_file->second, r->vs)) return nullptr;
+    if (w[5]) {  // a pixel program
+        const auto ps_file = files.find(ps);
+        if (ps.empty() || ps_file == files.end() || !read_container(ps_file->second, r->ps)) return nullptr;
+    }
+    if (!parse_input_layout(reinterpret_cast<const std::uint8_t*>(w[3]), w[4], *r)) return nullptr;
+    const auto* packet = reinterpret_cast<const std::uint8_t*>(w[1]);
+    std::uint32_t marker = 0;
+    if (packet && w[2] >= 0xF4) std::memcpy(&marker, packet + 0xCC, 4);
+    if (marker == 0xFFFFFFFFu) {
+        std::memcpy(r->blend, packet + 0xD0, sizeof r->blend);
+        std::memcpy(&r->target_mask, packet + 0xF0, 4);
+        std::memcpy(&r->depth_control, packet + 0xA0, 4);
+    }
+    r->device = device;
+    r->root = reinterpret_cast<ID3D12RootSignature*>(w[0]);
+    if (r->root) r->root->AddRef();
+    return r;
+}
+#endif
+
+// local: Xbox device slot 57 is DeserializeGraphicsPipelineStateX(desc, riid, out), measured on the retail title (riid
+// IID_ID3D12PipelineState) and named by the public GDK sample HlslCompile/AcoPipelineState.cpp: the description is
+// the root signature, the PSO packet and its metadata, then {GPU instructions, size, metadata, size} for PS, VS, GS,
+// ES, HS, LS and FS. The title creates the pipelines of the library in shaders.rpf this way (10,241 calls). The packet
+// is not decoded yet, so each call gets a stub pipeline (never registered; its draws are dropped) instead of
+// E_NOTIMPL from the PC CreateLifetimeTracker that sits at this slot.
+HRESULT proxy_deserialize_graphics_pipeline_state_x(DeviceProxy* self, std::uint64_t desc, const IID* riid,
+                                                    void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!desc || !riid) return E_INVALIDARG;
+#ifdef LEONIDA_VULKAN_DEVICE
+    const HRESULT hr = rt::d3d12::create_stub_pipeline_state(self->real, *riid, out);
+    if (SUCCEEDED(hr) && *out) {
+        static std::once_flag registered;
+        std::call_once(registered, [] { rt::d3d12::set_stub_pipeline_realizer(&realize_library_pipeline); });
+        if (auto recipe = library_recipe(self->real, reinterpret_cast<const std::uint64_t*>(desc))) {
+            std::lock_guard lock(library_recipes_mutex());
+            library_recipes()[*out] = std::move(recipe);
+        }
+    }
+    static const bool diag_slot57 = [] {
+        wchar_t v[4] = {};
+        return GetEnvironmentVariableW(L"LEONIDA_DIAG_SLOT57", v, 4) > 0 && v[0] == L'1';
+    }();
+    if (diag_slot57) {  // LOCAL DIAGNOSTIC (LEONIDA_DIAG_SLOT57=1): each stub's stage digests, to name the drawn ones
+        const auto digest = [](std::uint64_t meta, std::uint64_t size) -> std::string {
+            if (!meta || size < 36 || size > 65536) return "-";
+            const auto* y = reinterpret_cast<const std::uint8_t*>(meta);
+            const std::size_t head = y[0] == 2 ? 16 : y[0] == 3 ? 24 : 0;
+            if (!head || y[head - 4] != 0x40) return "?";
+            for (std::size_t o = head; o + 4 <= size;) {
+                std::uint32_t tag;
+                std::memcpy(&tag, y + o, 4);
+                if (tag == 0x41 || tag == 0x42) {
+                    o += 32;
+                    continue;
+                }
+                if (tag != 0x43 || o + 20 > size) return "?";
+                char hex[33];
+                for (int i = 0; i < 16; ++i) std::snprintf(hex + 2 * i, 3, "%02x", y[o + 4 + i]);
+                return hex;
+            }
+            return "?";
+        };
+        const auto* w = reinterpret_cast<const std::uint64_t*>(desc);
+        if (out && *out)
+            std::fprintf(stderr, "[rt] diag: slot57 pso %p ps %s vs %s gs %s\n", *out, digest(w[7], w[8]).c_str(),
+                         digest(w[11], w[12]).c_str(), digest(w[15], w[16]).c_str());
+        if (digest(w[11], w[12]) == "04cf10b425938ecca5b19f2ae14592ab") {  // the textured quad drawn each frame
+            const auto dump = [](const char* what, std::uint64_t p, std::uint64_t n) {
+                std::fprintf(stderr, "[rt] diag: quad %s (%llu bytes):", what, static_cast<unsigned long long>(n));
+                for (std::uint64_t i = 0; p && i < n && i < 1024; ++i)
+                    std::fprintf(stderr, "%s%02x", i % 32 ? "" : "\n  ", reinterpret_cast<const std::uint8_t*>(p)[i]);
+                std::fprintf(stderr, "\n");
+            };
+            dump("packet", w[1], w[2]);
+            dump("meta", w[3], w[4]);
+        }
+    }
+    static std::atomic<std::uint64_t> calls{0};
+    const std::uint64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || (n & (n - 1)) == 0)
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 57 DeserializeGraphicsPipelineStateX: stub pipeline (%llu so far, "
+                             "hr 0x%08lx)\n",
+                     static_cast<unsigned long long>(n), static_cast<unsigned long>(hr));
+    return hr;
+#else
+    (void)self;
+    return E_NOTIMPL;
+#endif
+}
+
 // LOCAL DIAGNOSTIC: reads `count` qwords at `address` without faulting; false when any of them is unreadable.
 bool read_qwords(std::uint64_t address, std::uint64_t* out, unsigned count) {
     if (address < 0x10000) return false;
@@ -3554,6 +3891,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 57) {
+        note_slot(Slot);
+        return hr_to_u64(proxy_deserialize_graphics_pipeline_state_x(self, a1, reinterpret_cast<const IID*>(a2),
+                                                                     reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 133) {
         return hr_to_u64(proxy_create_placed_resource_slot133(
             self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2), static_cast<std::uint32_t>(a3),

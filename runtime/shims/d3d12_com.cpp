@@ -63,6 +63,14 @@ static bool append_tile_regions(const D3D12_TILED_RESOURCE_COORDINATE* start, co
     return true;
 }
 
+namespace {
+std::atomic<StubPipelineRealizer> g_stub_realizer{nullptr};
+}  // namespace
+void set_stub_pipeline_realizer(StubPipelineRealizer realizer) {
+    g_stub_realizer.store(realizer, std::memory_order_release);
+}
+StubPipelineRealizer stub_pipeline_realizer() { return g_stub_realizer.load(std::memory_order_acquire); }
+
 void stub(const char* method) {
     // Generated API stubs pass a bare method name; explanatory diagnostics are not separate calls.
     if (!std::strchr(method, '(')) d3d12_trace::record(method, "unsupported");
@@ -1301,6 +1309,34 @@ private:
     std::uintptr_t compute_pipeline_ = 0;
     std::uintptr_t graphics_pipeline_ = 0;
     bool stub_bound_ = false;  // the bound PSO is a LEONIDA_STUB_PIPELINES stub
+    ID3D12PipelineState* bound_state_ = nullptr;  // the PSO last set (held while the recording lasts)
+
+    // A typeless resource format as the typed one its render-target / depth view most likely uses.
+    static DXGI_FORMAT typed_color_format(DXGI_FORMAT f) {
+        switch (f) {
+            case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+            case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+            case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+            case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+            case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+            case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT;
+            case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+            case DXGI_FORMAT_R8G8_TYPELESS: return DXGI_FORMAT_R8G8_UNORM;
+            case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+            case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_FLOAT;
+            case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
+            default: return f;
+        }
+    }
+    static DXGI_FORMAT typed_depth_format(DXGI_FORMAT f) {
+        switch (f) {
+            case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_D32_FLOAT;
+            case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+            case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+            case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_D16_UNORM;
+            default: return f;
+        }
+    }
     ID3D12DescriptorHeap* cbv_srv_uav_heap_ = nullptr;
     ID3D12DescriptorHeap* sampler_heap_ = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base_ = 0;
@@ -1368,6 +1404,7 @@ private:
         // A LEONIDA_STUB_PIPELINES stub binds no pipeline, and the draws and dispatches it would run are dropped
         // instead of making the recording invalid (D3D-482): the rest of the list still runs.
         stub_bound_ = state && !compute_pipeline_ && !graphics_pipeline_ && stub_pipeline(state);
+        bound_state_ = state;
         if (state && !compute_pipeline_ && !graphics_pipeline_ && !stub_bound_) {
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
             // LOCAL DIAGNOSTIC: which objects these are (the first few, with their vtable pointer).
@@ -1481,7 +1518,45 @@ private:
                              static_cast<unsigned long long>(render_targets_[0].resource), render_target_count_, count,
                              instances, viewport_.width, viewport_.height);
         }
-        if (!graphics_pipeline_ && stub_bound_) return note_stub_drop("draw");
+        // local: a stub from device slot 57 becomes a real PSO for the formats bound now, for this draw only.
+        struct ForThisDraw {
+            std::uintptr_t& pipeline;
+            bool on = false;
+            ~ForThisDraw() {
+                if (on) pipeline = 0;
+            }
+        } realized{graphics_pipeline_};
+        if (!graphics_pipeline_ && stub_bound_ && bound_state_) {
+            if (const StubPipelineRealizer realize = stub_pipeline_realizer()) {
+                DXGI_FORMAT rtv[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+                const UINT n = (std::min)(render_target_count_, UINT(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT));
+                for (UINT i = 0; i < n; ++i)
+                    if (render_targets_[i].resource)
+                        rtv[i] = typed_color_format(
+                            reinterpret_cast<ID3D12Resource*>(render_targets_[i].resource)->GetDesc().Format);
+                const DXGI_FORMAT dsv =
+                    depth_.resource
+                        ? typed_depth_format(reinterpret_cast<ID3D12Resource*>(depth_.resource)->GetDesc().Format)
+                        : DXGI_FORMAT_UNKNOWN;
+                if (ID3D12PipelineState* real = realize(bound_state_, rtv, n, dsv)) {
+                    hold(real);
+                    graphics_pipeline_ = graphics_pipeline_id(real);
+                    realized.on = graphics_pipeline_ != 0;
+                }
+            }
+        }
+        if (!graphics_pipeline_ && stub_bound_) {
+            static std::mutex m;  // LOCAL DIAGNOSTIC: the stub pipelines draws are made with (first 12 distinct)
+            static std::set<const void*> seen;
+            {
+                std::lock_guard lock(m);
+                if (seen.size() < 12 && seen.insert(bound_state_).second)
+                    std::fprintf(stderr, "[rt] diag: draw with stub pso %p (count %u, %u targets, rt0 %llu)\n",
+                                 bound_state_, count, render_target_count_,
+                                 static_cast<unsigned long long>(render_targets_[0].resource));
+            }
+            return note_stub_drop("draw");
+        }
         static const bool diag_no_draw = [] {  // LOCAL DIAGNOSTIC: LEONIDA_DIAG_NODRAW=1 drops every draw
             wchar_t v[4] = {};
             return GetEnvironmentVariableW(L"LEONIDA_DIAG_NODRAW", v, 4) > 0 && v[0] == L'1';

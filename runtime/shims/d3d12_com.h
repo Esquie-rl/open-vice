@@ -230,6 +230,16 @@ bool device_supports_ray_tracing(ID3D12Device* device);
 // becomes its console VA. The pages are imported with VK_EXT_external_memory_host, so what the CPU writes there is
 // what the GPU reads. A buffer description only; E_NOTIMPL on a device that is not the Vulkan layer, without the
 // extension, or for a texture.
+// local: a never-registered pipeline state of the Vulkan device behind `device` (its draws are dropped), for the
+// console's DeserializeGraphicsPipelineStateX (device slot 57) until its packet is decoded.
+HRESULT create_stub_pipeline_state(ID3D12Device* device, REFIID riid, void** out);
+// local: turns a stub PSO into a real one for the formats a draw has bound (null: none can be made; the draw is
+// dropped). Registered by the Xbox device proxy for the pipelines of device slot 57. The returned PSO is borrowed: the
+// realizer keeps it alive as long as the stub.
+using StubPipelineRealizer = ID3D12PipelineState* (*)(ID3D12PipelineState* stub, const DXGI_FORMAT* rtv_formats,
+                                                      UINT rtv_count, DXGI_FORMAT dsv_format);
+void set_stub_pipeline_realizer(StubPipelineRealizer realizer);
+StubPipelineRealizer stub_pipeline_realizer();
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
                                       std::uint32_t layout, REFIID riid, void** out);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.

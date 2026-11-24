@@ -6161,6 +6161,14 @@ public:
         return hand_out(pipeline, riid, out);
     }
 
+    // local: a pipeline state that is never registered (what LEONIDA_STUB_PIPELINES makes for a missing shader): it
+    // binds as no pipeline, and the draws made with it are dropped (D3D-482). Xbox device slot 57 answers with one.
+    HRESULT create_stub_pipeline(REFIID riid, void** out) {
+        auto* pipeline = new PipelineState(state_);
+        pipeline->attach_device(identity());
+        return hand_out(pipeline, riid, out);
+    }
+
     HRESULT STDMETHODCALLTYPE CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid,
                                                           void** out) override {
         if (!out) return E_POINTER;
@@ -8992,6 +9000,15 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     if (auto* d = Device::from<Device>(real ? real : device)) return &d->state().info;
     return nullptr;
+}
+
+HRESULT create_stub_pipeline_state(ID3D12Device* device, REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    if (!device || !out) return E_POINTER;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_NOTIMPL;
+    return d->create_stub_pipeline(riid, out);
 }
 
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
