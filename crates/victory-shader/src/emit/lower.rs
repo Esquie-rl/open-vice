@@ -6487,6 +6487,77 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, old, x)
     }
 
+    /// Open Vice: a 64-bit image atomic (dmask 3; cmpswap 0xF: new value,
+    /// then the compared one), on the R32G32 view as a 64-bit integer UAV:
+    /// SM 6.6's typed 64-bit atomics (DXIL's i64 `atomicBinOp` and
+    /// `atomicCompareExchange`). Grand Theft Auto VI's software rasterizer
+    /// (compute b6df66af) keeps the nearest depth and its triangle in one
+    /// 64-bit word per pixel with `image_atomic_umax`.
+    fn image_atomic64(
+        &mut self,
+        inst: &Inst,
+        (site, src): (Site, &Source),
+        kind: u32,
+        code: u32,
+        cs: Vec<V>,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let Fields::Image { data, cache, .. } = &inst.fields else {
+            unreachable!()
+        };
+        let Operand::Vector { reg, .. } = *data else {
+            return Err("image atomic data");
+        };
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64 | flags::ATOMIC64_TYPED;
+        let n = if code == u32::MAX { 4 } else { 2 };
+        let vals = self.vgprs(inst, data, n)?;
+        let join = |l: &mut Self, lo: V, hi: V| {
+            let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
+            let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
+            let k32 = l.s.m.int_const(i64t, 32);
+            let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
+            l.s.m.bin(c, Bin::Or, lo, hi)
+        };
+        let mut value = join(self, vals[0], vals[1]);
+        if code == 0 && inst.name() == "image_atomic_sub" {
+            let z = self.s.m.int_const(i64t, 0);
+            value = self.s.m.bin(c, Bin::Sub, z, value);
+        }
+        let old = match (inst.read(Reg::V(reg)), inst.read(Reg::V(reg + 1))) {
+            (Some(lo), Some(hi)) if cache.glc => {
+                let (lo, hi) = (self.i32_of(lo)?, self.i32_of(hi)?);
+                join(self, lo, hi)
+            }
+            _ => self.s.m.int_const(i64t, 0),
+        };
+        let h = self.handle(site, src, false, (kind | 0x1000, 0x107))?;
+        if !matches!(src, Source::Constant(_)) {
+            self.s.flags |= flags::ATOMIC64_HEAP;
+        }
+        let at = self.begin_guarded(guard);
+        let mut args = vec![h];
+        let r = if code == u32::MAX {
+            let compare = join(self, vals[2], vals[3]);
+            args.extend(cs);
+            args.extend([compare, value]);
+            self.s.op(self.cur, "atomicCompareExchange.i64", Attr::NoUnwind, i64t, 79, &args)
+        } else {
+            args.push(self.s.m.i32(code));
+            args.extend(cs);
+            args.push(value);
+            self.s.op(self.cur, "atomicBinOp.i64", Attr::NoUnwind, i64t, 78, &args)
+        };
+        let r = self.end_guarded(at, &[(r, old)])[0];
+        if cache.glc {
+            let (lo, hi) = self.split64(r);
+            self.write(inst, Reg::V(reg), lo, None);
+            self.write(inst, Reg::V(reg + 1), hi, None);
+        }
+        Ok(())
+    }
+
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
@@ -6587,10 +6658,17 @@ impl<'a> Lower<'a> {
                 return Err("a 16-bit image atomic");
             }
             // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
+            let wide = *dmask == if code == u32::MAX { 0xF } else { 3 };
+            if wide {
+                let iu = self.s.m.undef(self.s.t.i32);
+                let mut cs = vec![iu; 3];
+                for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+                    *slot = addr_val(self, k)?;
+                }
+                return self.image_atomic64(inst, (site, src), kind, code, cs, guard);
+            }
             if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
+                return Err("an image atomic of other channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
