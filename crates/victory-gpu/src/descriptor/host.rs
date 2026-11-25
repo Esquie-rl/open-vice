@@ -932,7 +932,10 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                // Open Vice: the strides, then each slot's buffer address (two dwords), which
+                // a shader that takes the address of a view it picks by a computed index
+                // reads there (`victory_shader::emit::SLOT_STRIDES`).
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 12;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -1602,6 +1605,15 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            // Open Vice: the slot's buffer address after the strides (0 for anything else)
+            let address = view.and_then(buffer_range).map_or(0, |r| r.0);
+            let at = victory_shader::emit::SLOT_STRIDES_COUNT as usize + 2 * index as usize;
+            // SAFETY: inside the mapping (`SLOT_STRIDES_COUNT` * 12 bytes).
+            unsafe {
+                let words = (*data as *mut u32).add(at);
+                words.write_volatile(address as u32);
+                words.add(1).write_volatile((address >> 32) as u32);
+            }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {

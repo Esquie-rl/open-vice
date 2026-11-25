@@ -5870,9 +5870,15 @@ impl<'a> Lower<'a> {
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address
             // from the host, the other dwords have no value.
-            if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
-            {
+            let address = if count <= 4 {
+                match self.view_address(site) {
+                    Some(a) => Some(a),
+                    None => self.slot_view_address(site),
+                }
+            } else {
+                None
+            };
+            if let Some((lo, hi)) = address {
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
                     match k {
@@ -6699,6 +6705,45 @@ impl<'a> Lower<'a> {
         let v = self.as_int(f);
         self.strides.insert(key, v);
         Ok(Some(v))
+    }
+
+    /// Open Vice: the title address (low dword, bits from 32 up) of the buffer view whose
+    /// descriptor the scalar load at `site` reads at an index the code computes, from the
+    /// host's table by heap slot (the dwords after the strides of `SLOT_STRIDES`, two per
+    /// slot, which the host writes as it makes each slot); [`Self::view_address`] does a
+    /// fixed table entry. The title's `shadowmask:CS_TraceShadowRays_*` take the address
+    /// of the ray-tracing structure they walk this way.
+    fn slot_view_address(&mut self, site: Site) -> Option<(V, V)> {
+        let a = self.scalar.get(&site).copied()?;
+        let rp = *self.x.native.layout.get(a.param)?;
+        if !matches!(rp.root, RootType::Table | RootType::ResourceHeap) || a.dynamic.is_none() {
+            return None;
+        }
+        let c = self.cur;
+        let slot = self.heap_index(site, 0, false).ok()?;
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+        let after = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT * 4);
+        let byte = self.s.m.bin(c, Bin::Add, byte, after);
+        let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+        let iu = self.s.m.undef(i32t);
+        let mask = self.s.m.i8(3);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let lo = self.s.m.extract(c, r, 0);
+        let hi = self.s.m.extract(c, r, 1);
+        Some((self.as_int(lo), self.as_int(hi)))
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -9999,6 +10044,10 @@ impl<'a> Lower<'a> {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                // Open Vice: only the coordinates the size divides (not an array's slice,
+                // which the validator wants undefined: "out of bound coord must be undef",
+                // `PS_DeferredTextured_AlphaClip` among 3 programs)
+                let lc: Vec<V> = (0..3).map(|k| if k < spatial { cs[k] } else { fu }).collect();
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(
@@ -10007,7 +10056,7 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, lc[0], lc[1], lc[2], clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
