@@ -1250,6 +1250,25 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
+/// A structured view's bytes (`bytes` from byte `start` of its host copy)
+/// as a raw view: its first dword and its dwords, if they start on 16 bytes
+/// (a raw view's alignment), are whole dwords and not too many for one view.
+///
+/// Translated shaders read untyped buffers as raw bytes (scalar loads at a
+/// byte address, raw loads at `element * stride + offset`). Through a
+/// structured host view such a read gives zeros on NVIDIA (an RTX 5090:
+/// byte 20 of a 16-byte-stride view read 0), while structured reads
+/// through a raw view are right; so the host's view is raw where it can be.
+/// The view-stride table keeps the title's stride. Ported from
+/// fxceless/victory-gta6 (GPL-3.0), commit 578d459c, `raw_window`.
+fn raw_window(start: u64, bytes: u64) -> Option<(u64, u32)> {
+    if !start.is_multiple_of(16) || !bytes.is_multiple_of(4) {
+        return None;
+    }
+    let dwords = u32::try_from(bytes / 4).ok().filter(|&d| d <= 1 << 27)?;
+    Some((start / 4, dwords))
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -1278,6 +1297,16 @@ fn buffer_srv(
     };
     if buffer.NumElements == 0 {
         return None;
+    }
+    if desc.Format == DXGI_FORMAT_UNKNOWN
+        && buffer.StructureByteStride > 0
+        && let Some((first, count)) = raw_window(first * element, u64::from(count) * element)
+    {
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.FirstElement = first;
+        buffer.NumElements = count;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -1334,6 +1363,16 @@ fn buffer_uav(
     };
     if buffer.NumElements == 0 {
         return None;
+    }
+    if desc.Format == DXGI_FORMAT_UNKNOWN
+        && buffer.StructureByteStride > 0
+        && let Some((first, count)) = raw_window(first * element, u64::from(count) * element)
+    {
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.FirstElement = first;
+        buffer.NumElements = count;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
