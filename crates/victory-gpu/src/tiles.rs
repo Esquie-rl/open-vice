@@ -72,13 +72,13 @@ const HEAP_TILES: u32 = 1024;
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 /// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
+/// (Open Vice: on by default, `VICTORY_LEVELS_ON_DEMAND=0` turns it off: on a 12 GB card the room stayed without its indirect light and about 16,000 textures had no host copy), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
 /// tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        if std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "0") {
             return false;
         }
         let Some(host) = host() else {
