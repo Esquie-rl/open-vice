@@ -173,6 +173,19 @@ pub(crate) fn tables_done(lists: &[This]) {
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let host = recording_list(this)?;
+    if crate::draw::indirect_batching() {
+        // SAFETY: the title passes one of our lists. Take no other state
+        // lock here; callers acquire it only after this function returns.
+        unsafe { &(*this.cast::<List>()).state }
+            .lock().unwrap_or_else(|e| e.into_inner()).flush_indirect(host);
+    }
+    Some(host)
+}
+
+/// Only indirect calls may append to a pending run. Reset discards it.
+#[cfg(windows)]
+fn recording_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
@@ -306,6 +319,7 @@ fn cut(this: This, wait: ValueWait) {
     let Some(current) = list.host.as_ref() else {
         return;
     };
+    list.state.lock().unwrap_or_else(|e| e.into_inner()).flush_indirect(current);
     if current.untouched() {
         list.gate.push(wait);
         return;
@@ -648,10 +662,13 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.gate.clear();
     }
     #[cfg(windows)]
-    with_state(this, |host, state| {
+    if let Some(host) = recording_list(this) {
+        // SAFETY: one of our lists, exclusively held during reset.
+        let mut state = unsafe { &(*this.cast::<List>()).state }
+            .lock().unwrap_or_else(|e| e.into_inner());
         host.reset();
         state.reset(pipeline);
-    });
+    }
     #[cfg(not(windows))]
     let _ = (this, pipeline);
     S_OK
@@ -1696,9 +1713,17 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
-        });
+        if let Some(list) = recording_list(this) {
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            // SAFETY: the title passes one of our lists. This is the only
+            // recording path allowed to extend an unflushed indirect run.
+            let state = unsafe { &(*this.cast::<List>()).state };
+            ran = state.lock().unwrap_or_else(|e| e.into_inner())
+                .execute_indirect(list, (kind, stride, max), address, counter);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::recorded(started);
+        }
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
@@ -1729,6 +1754,10 @@ extern "system" fn execute_indirect(
 /// Indirect executions dropped since the last call.
 pub(crate) fn take_indirect() -> u64 {
     INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(windows)]
+pub(crate) fn indirect_dropped(records: u32) {
+    INDIRECT.fetch_add(u64::from(records), std::sync::atomic::Ordering::Relaxed);
 }
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
@@ -2008,6 +2037,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(current) = list.host.as_ref() else {
             return;
         };
+        list.state.lock().unwrap_or_else(|e| e.into_inner()).flush_indirect(current);
         let Some(fresh) = fresh_list() else {
             return;
         };
