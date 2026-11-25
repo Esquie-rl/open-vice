@@ -36,6 +36,48 @@ enum Root {
     View(u64),
 }
 
+/// Actual host root values, after translating title addresses and tables.
+/// Resource refreshes still run on every bind, even when these are equal.
+#[derive(Clone, Default, PartialEq, Eq)]
+enum HostArgument {
+    #[default]
+    Unset,
+    Constants(Vec<u32>),
+    Cbv(u64),
+    Srv(u64),
+    Uav(u64),
+    Table(u64),
+}
+
+#[derive(Default)]
+struct HostArguments([Vec<HostArgument>; 2]);
+
+impl HostArguments {
+    fn changed(&mut self, compute: bool, param: u32, value: &HostArgument) -> bool {
+        let args = &mut self.0[usize::from(compute)];
+        let param = param as usize;
+        args.resize_with(args.len().max(param + 1), HostArgument::default);
+        if args[param] == *value {
+            return false;
+        }
+        args[param] = value.clone();
+        true
+    }
+
+    fn invalidate(&mut self, compute: bool) {
+        self.0[usize::from(compute)].clear();
+    }
+}
+
+/// Whether a root argument the host list already holds (same root
+/// signature, same value) is left as it is instead of set again before each
+/// draw (`VICTORY_ROOT_CACHE=0` sets every argument as before). A new root
+/// signature, heap change, replay or reset forgets what is held.
+fn root_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_CACHE").is_none_or(|v| v != "0"))
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
@@ -184,6 +226,63 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Experimental: collect only consecutive, read-only mesh calls with one
+/// record and no count buffer. Every other list operation flushes the run
+/// before changing state or recording work (`list::host_list`). Unlike a
+/// speculative window, a batch charges only records actually requested.
+/// shortcut: parallel clamping can change which records survive when the
+/// list's safety budget runs out. Disabled unless explicitly requested.
+pub(crate) fn indirect_batching() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_BATCH").is_some_and(|v| v == "1"))
+}
+
+const INDIRECT_BATCH_MAX: u32 = 64;
+
+/// Actual requested records, with an observed spacing independent of the
+/// one-record command signature's stride. Never includes an unrequested tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IndirectRun {
+    base: u64,
+    stride: u32,
+    step: u32,
+    records: u32,
+}
+
+impl IndirectRun {
+    fn append(self, offset: u64, stride: u32, left: u64) -> Option<Self> {
+        if stride != self.stride || self.records >= INDIRECT_BATCH_MAX {
+            return None;
+        }
+        let step = if self.records == 1 {
+            offset.checked_sub(self.base)?
+        } else {
+            u64::from(self.step)
+        };
+        // The clamp copies the whole stride, including the last record's
+        // padding. Keep that read inside the source allocation too.
+        if step < u64::from(stride) || step > 256 || !step.is_multiple_of(4) || step > left {
+            return None;
+        }
+        if self.base.checked_add(u64::from(self.records) * step)? != offset {
+            return None;
+        }
+        Some(Self { step: step as u32, records: self.records + 1, ..self })
+    }
+}
+
+struct PendingIndirect {
+    run: IndirectRun,
+    source: std::sync::Arc<crate::shadow::Shadow>,
+    address: u64,
+    signature: ID3D12CommandSignature,
+    /// Graphics bindings were prepared before queuing. The clamp changes
+    /// only the compute root and PSO; restoring this PSO is sufficient.
+    pso: ID3D12PipelineState,
+    #[cfg(feature = "diagnostics")]
+    note: String,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -217,10 +316,12 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    pending_indirect: Option<PendingIndirect>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
+    host_arguments: HostArguments,
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
@@ -705,6 +806,7 @@ impl State {
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
+        self.host_arguments = HostArguments::default();
         self.host_heaps = [0; 2];
         if self.topology_set {
             self.set_topology(list, self.topology);
@@ -972,6 +1074,7 @@ impl State {
         TESTED_DEPTH.set((tested, false));
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
+            self.host_arguments.invalidate(compute);
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
@@ -1032,29 +1135,14 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    }
-                }
+                self.bind_argument(list, compute, param, HostArgument::Constants(values));
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {
-                            // SAFETY: an open list; the directory lives as
-                            // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
-                                }
-                            }
+                            self.bind_argument(list, compute, param, HostArgument::Srv(m.directory));
                         }
                         continue;
                     }
@@ -1062,15 +1150,7 @@ impl State {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
                         match self.heap_buffers(list) {
-                            // SAFETY: an open list; the table lives as long
-                            // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
-                                }
-                            },
+                            Some(gpu) => self.bind_argument(list, compute, param, HostArgument::Srv(gpu)),
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
                         continue;
@@ -1109,30 +1189,15 @@ impl State {
                             None,
                         ));
                     }
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
-                    }
+                    let value = if srv { HostArgument::Srv(gpu) } else { HostArgument::Cbv(gpu) };
+                    self.bind_argument(list, compute, param, value);
                 }
             }
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
-                        // SAFETY: an open list; the buffer lives as long as
-                        // the process and the list holds it.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
-                            } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
-                            }
-                        }
+                        self.bind_argument(list, compute, param, HostArgument::Uav(m.faults));
                     }
                     continue;
                 }
@@ -1152,6 +1217,30 @@ impl State {
         // twins hold what they lack from here on.
         list.twins_written();
         true
+    }
+
+    fn bind_argument(&mut self, list: &HostList, compute: bool, param: u32, value: HostArgument) {
+        if !self.host_arguments.changed(compute, param, &value) && root_cache() {
+            return;
+        }
+        let l = &list.list;
+        // SAFETY: bind has installed this stage's root signature. Callers
+        // supply its full parameter and keep the underlying resources alive.
+        unsafe {
+            match (compute, value) {
+                (false, HostArgument::Constants(v)) => l.SetGraphicsRoot32BitConstants(param, v.len() as u32, v.as_ptr().cast(), 0),
+                (true, HostArgument::Constants(v)) => l.SetComputeRoot32BitConstants(param, v.len() as u32, v.as_ptr().cast(), 0),
+                (false, HostArgument::Cbv(gpu)) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                (true, HostArgument::Cbv(gpu)) => l.SetComputeRootConstantBufferView(param, gpu),
+                (false, HostArgument::Srv(gpu)) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                (true, HostArgument::Srv(gpu)) => l.SetComputeRootShaderResourceView(param, gpu),
+                (false, HostArgument::Uav(gpu)) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                (true, HostArgument::Uav(gpu)) => l.SetComputeRootUnorderedAccessView(param, gpu),
+                (false, HostArgument::Table(ptr)) => l.SetGraphicsRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE { ptr }),
+                (true, HostArgument::Table(ptr)) => l.SetComputeRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE { ptr }),
+                (_, HostArgument::Unset) => unreachable!(),
+            }
+        }
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
@@ -1208,14 +1297,7 @@ impl State {
             // SAFETY: a live buffer.
             let base = unsafe { s.buffer.GetGPUVirtualAddress() };
             let gpu = base + ((s.gpu(a) - base) & !15);
-            // SAFETY: an open list; the address is in a live buffer.
-            unsafe {
-                if compute {
-                    list.list.SetComputeRootUnorderedAccessView(param, gpu);
-                } else {
-                    list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
-                }
-            }
+            self.bind_argument(list, compute, param, HostArgument::Uav(gpu));
             return true;
         }
         let heap = match self.heaps[0] {
@@ -1259,14 +1341,7 @@ impl State {
             ready(*a, s);
         }
         let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        self.bind_argument(list, compute, param, HostArgument::Table(handle.ptr));
         true
     }
 
@@ -1342,14 +1417,7 @@ impl State {
             s.refresh(list, *a, s.left(*a));
         }
         let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        self.bind_argument(list, compute, param, HostArgument::Table(handle.ptr));
         true
     }
 
@@ -2860,6 +2928,64 @@ impl State {
 }
 
 impl State {
+    /// Finish a run before any caller can change bindings, resources or
+    /// ordering. The owning list also calls this before closing or cutting.
+    pub(crate) fn flush_indirect(&mut self, list: &HostList) {
+        let Some(pending) = self.pending_indirect.take() else { return };
+        let run = pending.run;
+        pending.source.refresh(list, pending.address, u64::from(run.step) * u64::from(run.records));
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("indirect kind 10 max {} at {:#x} {}", run.records, pending.address, pending.note));
+        let bounded = crate::indirect::bound(
+            list,
+            (&pending.source.buffer, run.base),
+            None,
+            (10, run.step, run.records),
+        );
+        let Some(bounded) = bounded else {
+            crate::list::indirect_dropped(run.records);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("indirect mesh batch: argument clamp unavailable".into());
+            return;
+        };
+        self.host_roots[1] = 0;
+        self.host_pipeline = pending.pso.as_raw() as usize;
+        // SAFETY: the first call prepared graphics state and kept its
+        // resources. Every intervening list operation flushes this run.
+        // This signature changes no root, vertex or index bindings.
+        unsafe {
+            list.list.SetPipelineState(&pending.pso);
+            list.list.ExecuteIndirect(&pending.signature, run.records, &bounded, 0, None, 0);
+        }
+        crate::indirect::done(list, &bounded);
+        DRAWN.fetch_add(u64::from(run.records), Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::IndirectExecuted, 1);
+            crate::copystat::add(crate::copystat::C::IndirectMerged, u64::from(run.records - 1));
+        }
+    }
+
+    fn append_indirect(&mut self, list: &HostList, stride: u32, arguments: u64) -> bool {
+        let Some(pending) = &mut self.pending_indirect else { return false };
+        let Some(source) = crate::shadow::find_any(arguments, u64::from(stride)) else { return false };
+        if source.id() != pending.source.id() {
+            return false;
+        }
+        let Some(run) = pending.run.append(source.offset(arguments), stride, source.left(arguments)) else {
+            return false;
+        };
+        if run.step != pending.run.step {
+            let Some(signature) = host_signature(10, run.step) else { return false };
+            pending.signature = signature;
+        }
+        pending.run = run;
+        if run.records == INDIRECT_BATCH_MAX {
+            self.flush_indirect(list);
+        }
+        true
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -2873,7 +2999,13 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        // Skip before the argument clamp can mutate the indirect buffer.
+        if kind == 10 && max == 1 && count.is_none()
+            && self.append_indirect(list, stride, arguments)
+        {
+            return true;
+        }
+        self.flush_indirect(list);
+        // Skip before the argument clamp charges the list's work budget.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
@@ -2951,12 +3083,33 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        let offset = args.offset(arguments);
+        if indirect_batching() && kind == MESH && max == 1 && count.is_none()
+            && mesh_test() == 0 && stride >= 12 && stride.is_multiple_of(4)
+            && offset.is_multiple_of(4)
+            && !p.stages.iter().any(|stage| stage.translated().stores)
+        {
+            self.window = None;
+            if !self.prepare_for(list, false, true) {
+                why("batch prepare failed");
+                return false;
+            }
+            self.pending_indirect = Some(PendingIndirect {
+                run: IndirectRun { base: offset, stride, step: stride, records: 1 },
+                source: args,
+                address: arguments,
+                signature,
+                pso: p.pso.clone(),
+                #[cfg(feature = "diagnostics")]
+                note: self.op_text(String::new(), false),
+            });
+            return true;
+        }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
-        let offset = args.offset(arguments);
         let windowed = windows()
             && kind != DISPATCH
             && max == 1
@@ -3066,6 +3219,8 @@ impl State {
             self.mesh_scissor(list, false);
         }
         crate::indirect::done(list, &bounded);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::IndirectExecuted, 1);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -3411,5 +3566,52 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indirect_run_learns_the_step_then_keeps_it() {
+        let one = IndirectRun { base: 64, stride: 12, step: 12, records: 1 };
+        let two = one.append(96, 12, 32).expect("a 32-byte step");
+        assert_eq!((two.step, two.records), (32, 2));
+        let three = two.append(128, 12, 32).expect("the same step");
+        assert_eq!((three.base, three.step, three.records), (64, 32, 3));
+        // Another step, a gap, another stride, too little left, backwards.
+        assert_eq!(two.append(144, 12, 32), None);
+        assert_eq!(two.append(160, 12, 32), None);
+        assert_eq!(two.append(128, 16, 32), None);
+        assert_eq!(two.append(128, 12, 31), None);
+        assert_eq!(one.append(32, 12, 32), None);
+        // Steps under the stride, unaligned or over 256 bytes end a run.
+        assert_eq!(one.append(72, 12, 64), None);
+        assert_eq!(one.append(78, 12, 64), None);
+        assert_eq!(one.append(64 + 260, 12, 512), None);
+    }
+
+    #[test]
+    fn indirect_run_stops_at_its_most() {
+        let full = IndirectRun { base: 0, stride: 12, step: 16, records: INDIRECT_BATCH_MAX };
+        assert_eq!(full.append(u64::from(INDIRECT_BATCH_MAX) * 16, 12, 16), None);
+    }
+
+    #[test]
+    fn host_arguments_skip_only_what_is_already_set() {
+        let mut a = HostArguments::default();
+        assert!(a.changed(false, 2, &HostArgument::Cbv(0x100)));
+        assert!(!a.changed(false, 2, &HostArgument::Cbv(0x100)));
+        // Compute and graphics are apart; another kind or value is a change.
+        assert!(a.changed(true, 2, &HostArgument::Cbv(0x100)));
+        assert!(a.changed(false, 2, &HostArgument::Srv(0x100)));
+        assert!(a.changed(false, 0, &HostArgument::Constants(vec![1, 2])));
+        assert!(!a.changed(false, 0, &HostArgument::Constants(vec![1, 2])));
+        assert!(a.changed(false, 0, &HostArgument::Constants(vec![1, 3])));
+        // A new root signature forgets its side only.
+        a.invalidate(false);
+        assert!(a.changed(false, 2, &HostArgument::Srv(0x100)));
+        assert!(!a.changed(true, 2, &HostArgument::Cbv(0x100)));
     }
 }
