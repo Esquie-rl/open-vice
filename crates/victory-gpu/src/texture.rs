@@ -707,9 +707,13 @@ impl Staging {
         // write to the same pages through another view) is still found by
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
-        // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        // Open Vice: off by default (`VICTORY_TEXTURE_GUARD=1` turns it on):
+        // the opening logos' and videos' textures change through writes the
+        // guard misses, and showed an older frame between newer ones (23
+        // one-frame flickers in a minute on an RTX 4080 Laptop, none with
+        // the hash at every check, as before).
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
+        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_some_and(|v| v == "1"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
