@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
+use crate::backstat::{C as Back, Timed as BackTime};
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
@@ -183,11 +184,40 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out
 }
 
+/// The card compares and fetches pieces this many bytes long. Smaller
+/// pieces avoid fetching 64 KiB for a few changed words and shorten the
+/// hash shader's serial chain of loads. This does not change the title's
+/// write watch or the CPU snapshots, both still cut at 64 KiB.
+/// `VICTORY_CARD_BACK_KB=4`, 8, 16 and 32 opt into finer pieces. Keep the
+/// established 64 KiB default until measured. Read before hashes are made.
+pub(crate) fn card_piece_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| card_granularity(std::env::var("VICTORY_CARD_BACK_KB").ok().and_then(|v| v.trim().parse().ok())))
+}
+
+fn card_granularity(kb: Option<usize>) -> usize {
+    match kb {
+        Some(n @ (4 | 8 | 16 | 32 | 64)) => n * 1024,
+        _ => 65536,
+    }
+}
+
+/// Maximum contiguous relay merge, bounding scratch memory and the time
+/// the CPU-side lock is held. 64 restores the previous chunk size; holes
+/// in title mappings are retried at 4 KiB regardless of this limit.
+pub(crate) fn back_batch_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_BACK_BATCH_KB").ok().and_then(|v| v.parse::<usize>().ok())
+            .filter(|kb| (64..=4096).contains(kb)).unwrap_or(1024) * 1024
+    })
+}
+
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
-/// for each 64 KiB piece (a copy that does not start on a piece boundary
+/// for each card piece (a copy that does not start on a piece boundary
 /// has one piece more).
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    (size / card_piece_bytes() as u64 + 2) * 16
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -358,8 +388,8 @@ pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
 }
 
 /// A declared range of a copy in the card's memory, as the compare on the
-/// card takes it: its offsets in the copy, its first 64 KiB piece (pieces
-/// are cut at multiples of 64 KiB of title memory; piece 0 holds offset
+/// card takes it: its offsets in the copy, its first card piece (pieces
+/// are cut at multiples of `card_piece_bytes()` of title memory; piece 0 holds offset
 /// 0), how many pieces hold it, and where the copy starts in piece 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CardSpan {
@@ -372,28 +402,31 @@ pub(crate) struct CardSpan {
 
 /// [`CardSpan`] for offsets `[from, to)` (`from < to`) of a copy of title
 /// memory from `start` on.
-fn card_span_of(start: usize, from: usize, to: usize) -> CardSpan {
-    let pieces = pieces_of(start, from, to);
+fn card_span_of(start: usize, from: usize, to: usize, bytes: usize) -> CardSpan {
+    let skew = start % bytes;
+    let pieces = (skew + from) / bytes..(skew + to).div_ceil(bytes);
     CardSpan {
         from: from as u32,
         to: to as u32,
         first: pieces.start as u32,
         pieces: pieces.len() as u32,
-        skew: (start % PIECE) as u32,
+        skew: skew as u32,
     }
 }
 
 /// The offsets of piece `i` of `span` that lie in the span, for a copy of
 /// `len` bytes of title memory from `start` on: what is fetched and merged
 /// of a piece the compare found differing.
-fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, usize) {
-    let (lo, hi) = piece_at(start, len, (span.first + i) as usize);
+fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32, bytes: usize) -> (usize, usize) {
+    let piece = (span.first + i) as usize;
+    let lo = (piece * bytes).saturating_sub(start % bytes);
+    let hi = ((piece + 1) * bytes - start % bytes).min(len);
     (lo.max(span.from as usize), hi.min(span.to as usize))
 }
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_granularity, card_piece_of, card_span_of, joined, joined_piece_runs};
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -419,11 +452,11 @@ mod card_tests {
 
     /// The offsets the compare's shader takes for a piece (`CARD_COMPARE`
     /// in host.rs), before it widens them to 16 bytes.
-    fn shader_piece(span: &CardSpan, i: u32) -> (u32, u32) {
+    fn shader_piece(span: &CardSpan, i: u32, bytes: u32) -> (u32, u32) {
         let piece = span.first + i;
-        let lo = piece * 65536;
+        let lo = piece * bytes;
         let lo = if lo > span.skew { lo - span.skew } else { 0 };
-        let hi = (piece + 1) * 65536 - span.skew;
+        let hi = (piece + 1) * bytes - span.skew;
         (lo.max(span.from), hi.min(span.to))
     }
 
@@ -431,20 +464,32 @@ mod card_tests {
     /// arithmetic names the same bytes as ours.
     #[test]
     fn the_shader_and_the_merge_cut_the_same_pieces() {
-        for start in [0usize, 4096, PIECE - 16, PIECE, 3 * PIECE + 0x1f00, 0xd_b790_df00] {
-            let len = 5 * PIECE + 4096;
-            for (from, to) in [(0, len), (0, 1), (16, PIECE), (PIECE - 4, PIECE + 4), (2 * PIECE, len), (12345, 4 * PIECE + 7)] {
-                let span = card_span_of(start, from, to);
-                let mut at = from;
-                for i in 0..span.pieces {
-                    let (lo, hi) = card_piece_of(start, len, &span, i);
-                    assert_eq!(lo, at, "{start:#x} {from} {to} piece {i}");
-                    assert!(hi > lo && hi - lo <= PIECE);
-                    assert_eq!(shader_piece(&span, i), (lo as u32, hi as u32), "{start:#x} {from} {to} piece {i}");
-                    at = hi;
+        for bytes in [4096, 8192, 16384, 32768, 65536] {
+            for start in [0usize, 4096, PIECE - 16, PIECE, 3 * PIECE + 0x1f00, 0xd_b790_df00] {
+                let len = 5 * PIECE + 4096;
+                for (from, to) in [(0, len), (0, 1), (16, PIECE), (PIECE - 4, PIECE + 4), (2 * PIECE, len), (12345, 4 * PIECE + 7)] {
+                    let span = card_span_of(start, from, to, bytes);
+                    let mut at = from;
+                    for i in 0..span.pieces {
+                        let (lo, hi) = card_piece_of(start, len, &span, i, bytes);
+                        assert_eq!(lo, at, "{start:#x} {from} {to} piece {i}");
+                        assert!(hi > lo && hi - lo <= bytes);
+                        assert_eq!(shader_piece(&span, i, bytes as u32), (lo as u32, hi as u32), "{start:#x} {from} {to} piece {i}");
+                        at = hi;
+                    }
+                    assert_eq!(at, to, "{start:#x} {from} {to}");
                 }
-                assert_eq!(at, to, "{start:#x} {from} {to}");
             }
+        }
+    }
+
+    #[test]
+    fn card_granularity_accepts_only_supported_sizes() {
+        for kb in [4, 8, 16, 32, 64] {
+            assert_eq!(card_granularity(Some(kb)), kb * 1024);
+        }
+        for kb in [None, Some(0), Some(3), Some(63), Some(128), Some(usize::MAX)] {
+            assert_eq!(card_granularity(kb), 65536);
         }
     }
 
@@ -564,6 +609,7 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let _time = BackTime::new(Back::Blend);
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
@@ -573,6 +619,54 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
         *h = (*h & !wrote) | (*n & wrote);
     }
     differs != 0
+}
+
+/// Bounds of the bytes a shader changed, with copy-back comparisons timed
+/// separately from the reads and writes of title pages.
+fn back_bounds(now: &[u8], old: &[u8]) -> Option<(usize, usize)> {
+    let _time = BackTime::new(Back::Compare);
+    let first = first_difference(now, old)?;
+    Some((first, last_difference(now, old).unwrap_or(first)))
+}
+
+/// Merge a contiguous declared run with one kernel read/write in the
+/// common case. On a failed read, retry at actual OS page boundaries so
+/// one unmapped page cannot discard its mapped neighbours. The reference
+/// is updated only after the read succeeds, or for an unreadable page as
+/// in the original card merge. Callers exclude later CPU uploads first.
+fn merge_card_pages(
+    address: usize,
+    gpu: &[u8],
+    held: &mut [u8],
+    title: &mut Vec<u8>,
+    read: &impl Fn(usize, &mut [u8]) -> bool,
+    write: &impl Fn(usize, &[u8]),
+) -> usize {
+    let Some((first, last)) = back_bounds(gpu, held) else {
+        return 0;
+    };
+    let address = address + first;
+    let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+    title.resize(gpu.len(), 0);
+    if read(address, title) {
+        if merge_piece(gpu, held, title) {
+            write(address, title);
+            return gpu.len();
+        }
+        return 0;
+    }
+    const PAGE_BYTES: usize = 4096;
+    if address / PAGE_BYTES == (address + gpu.len() - 1) / PAGE_BYTES {
+        held.copy_from_slice(gpu);
+        return 0;
+    }
+    let (mut at, mut written) = (0, 0);
+    while at < gpu.len() {
+        let end = (at + PAGE_BYTES - (address + at) % PAGE_BYTES).min(gpu.len());
+        written += merge_card_pages(address + at, &gpu[at..end], &mut held[at..end], title, read, write);
+        at = end;
+    }
+    written
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -600,7 +694,103 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, changed_runs, merge_card_pages, merge_piece, outside};
+
+    #[test]
+    fn contiguous_card_merge_batches_reads_and_writes_and_preserves_cpu_neighbours() {
+        use std::cell::{Cell, RefCell};
+        const N: usize = 1024 * 1024;
+        let mut held = vec![0x12; N];
+        let mut gpu = held.clone();
+        let memory = RefCell::new(held.clone());
+        for at in (0..N).step_by(4096) {
+            gpu[at] = 0x55;
+            memory.borrow_mut()[at + 1] = 0x77;
+        }
+        gpu[N - 1] = 0x55;
+        let (reads, writes) = (Cell::new(0), Cell::new(0));
+        let mut scratch = Vec::new();
+        let written = merge_card_pages(0, &gpu, &mut held, &mut scratch, &|at, dst| {
+            reads.set(reads.get() + 1);
+            dst.copy_from_slice(&memory.borrow()[at..at + dst.len()]);
+            true
+        }, &|at, src| {
+            writes.set(writes.get() + 1);
+            memory.borrow_mut()[at..at + src.len()].copy_from_slice(src);
+        });
+        assert_eq!((written, reads.get(), writes.get()), (N, 1, 1));
+        assert_eq!(held, gpu, "title-only bytes must not become shader writes on the next merge");
+        for (at, &byte) in memory.borrow().iter().enumerate() {
+            assert_eq!(byte, if at % 4096 == 1 { 0x77 } else { gpu[at] }, "offset {at}");
+        }
+        assert_eq!(merge_card_pages(0, &gpu, &mut held, &mut scratch,
+            &|_, _| panic!("unchanged run must not read title memory"),
+            &|_, _| panic!("unchanged run must not write title memory")), 0);
+    }
+
+    #[test]
+    fn failed_large_read_retries_unaligned_pages_without_losing_mapped_neighbours() {
+        use std::cell::RefCell;
+        const START: usize = 0x1003;
+        const N: usize = 5 * 4096;
+        let hole = 0x3000..0x4000;
+        let mut held = vec![0x12; N];
+        let gpu = vec![0x55; N];
+        let memory = RefCell::new(held.clone());
+        let mut scratch = Vec::new();
+        let written = merge_card_pages(START, &gpu, &mut held, &mut scratch, &|at, dst| {
+            if at < hole.end && at + dst.len() > hole.start {
+                dst.fill(0xcc); // A failed kernel read may have filled part of the destination.
+                return false;
+            }
+            dst.copy_from_slice(&memory.borrow()[at - START..at - START + dst.len()]);
+            true
+        }, &|at, src| {
+            assert!(at >= hole.end || at + src.len() <= hole.start);
+            memory.borrow_mut()[at - START..at - START + src.len()].copy_from_slice(src);
+        });
+        assert_eq!(written, N - hole.len());
+        assert_eq!(held, gpu);
+        for (at, &byte) in memory.borrow().iter().enumerate() {
+            assert_eq!(byte, if hole.contains(&(START + at)) { 0x12 } else { 0x55 });
+        }
+    }
+
+    #[test]
+    fn card_merge_relay_excludes_pending_and_later_uploads_then_accepts_their_next_result() {
+        use super::{Card, Shadow};
+        use std::sync::Mutex;
+        let Some(host) = crate::host::host() else { return };
+        let mut title = vec![0x12u8; 3 * 65536];
+        let (staging, data) = host.shared_buffer(title.len() as u64).expect("synthetic staging");
+        // SAFETY: our persistent mapping has exactly title.len() bytes.
+        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr(), data, title.len()) };
+        let mut shadow = Shadow::new(staging.clone(), data, 0, title.as_ptr() as u64, title.len() as u64);
+        shadow.card = Some(Card {
+            staging, before: Mutex::default(), dirty: Mutex::new(vec![(100, 104)]),
+            sent: Mutex::new(vec![(65536, 65540, 8)]), size: 0,
+        });
+        let mut gpu = title.clone();
+        for at in [0, 100, 65536, title.len() - 1] { gpu[at] = 0x55; }
+        title[1] = 0x77;
+        title[100..104].fill(0x88);
+        title[65536..65540].fill(0x99);
+        // The CPU side already contains the title bytes of those uploads.
+        // SAFETY: both ranges are inside our mapping, and no GPU uses it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(title.as_ptr().add(100), data.add(100), 4);
+            std::ptr::copy_nonoverlapping(title.as_ptr().add(65536), data.add(65536), 4);
+        }
+        let mut scratch = Vec::new();
+        assert!(shadow.card_merge_relay(0, &gpu, 7, &mut scratch) > 0);
+        assert_eq!((title[0], title[1], title[100], title[65536], title[title.len() - 1]), (0x55, 0x77, 0x88, 0x99, 0x55));
+        // Later GPU results for the sent bytes are accepted, while the
+        // still-pending upload stays excluded even across a batched run.
+        gpu[65536..65540].fill(0x66);
+        assert_eq!(shadow.card_merge_relay(0, &gpu, 8, &mut scratch), 4);
+        assert_eq!(&title[65536..65540], &[0x66; 4]);
+        assert_eq!(&title[100..104], &[0x88; 4]);
+    }
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -1892,10 +2082,13 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+        let _merging = BackTime::new(Back::Merge);
         if self.place.is_some() {
             return 0;
         }
+        let locking = BackTime::new(Back::Lock);
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        drop(locking);
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
@@ -1937,14 +2130,13 @@ impl Shadow {
                 // memory is read and written there only (a shader that sets
                 // a few words of a piece cost a read, a walk and a write of
                 // all 64 KiB of it).
-                let Some(first) = first_difference(host, old) else {
+                let Some((first, last)) = back_bounds(host, old) else {
                     continue;
                 };
-                let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
                 let title = &mut title[..n];
-                if !crate::host::read_into((start + at) as *const u8, title) {
+                if !crate::backstat::read((start + at) as *const u8, title) {
                     continue;
                 }
                 // Title memory with the GPU's bytes put in; the copy takes
@@ -1953,6 +2145,7 @@ impl Shadow {
                 // the GPU's byte where the copy's byte is not what it was
                 // before the submission, else the title's. (With the two
                 // searches above this was 44 ms a frame for 970 pieces.)
+                let blending = BackTime::new(Back::Blend);
                 let mut differs = 0u8;
                 for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
                     let gpu = if *h != *o { 0xffu8 } else { 0 };
@@ -1961,9 +2154,9 @@ impl Shadow {
                     *t = merged;
                     *h = merged;
                 }
+                drop(blending);
                 if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    crate::backstat::write(start + at, title);
                     written += n;
                 }
             }
@@ -2017,7 +2210,9 @@ impl Shadow {
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
+        let locking = BackTime::new(Back::Lock);
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        drop(locking);
         let Some(before) = snapshot.as_mut() else {
             return 0;
         };
@@ -2035,24 +2230,22 @@ impl Shadow {
         // done with, whose bytes it holds; nothing else touches them
         // without the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(before.as_mut_ptr().add(at), n) };
-        let Some(first) = first_difference(now, held) else {
+        let Some((first, last)) = back_bounds(now, held) else {
             return 0;
         };
-        let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
         title.clear();
         title.resize(n, 0);
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
-        if !crate::host::read_into((start + at) as *const u8, title) {
+        if !crate::backstat::read((start + at) as *const u8, title) {
             return 0;
         }
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::backstat::write(start + at, title);
         n
     }
 
@@ -2527,19 +2720,19 @@ impl Shadow {
     /// takes it; `None` if none of it lies in the copy.
     pub(crate) fn card_span(&self, address: usize, end: usize) -> Option<CardSpan> {
         let (from, to) = self.inside(address, end.saturating_sub(address));
-        (from < to).then(|| card_span_of(self.start as usize, from, to))
+        (from < to).then(|| card_span_of(self.start as usize, from, to, card_piece_bytes()))
     }
 
     /// The pieces that hold offsets `[from, to)` of the copy (cut to it),
     /// as the card's hashing takes them.
     pub(crate) fn card_run(&self, from: usize, to: usize) -> CardSpan {
         let to = to.min(self.len as usize);
-        card_span_of(self.start as usize, from.min(to.saturating_sub(1)), to)
+        card_span_of(self.start as usize, from.min(to.saturating_sub(1)), to, card_piece_bytes())
     }
 
     /// The offsets of piece `i` of `span` that lie in the span.
     pub(crate) fn card_piece(&self, span: &CardSpan, i: u32) -> (usize, usize) {
-        card_piece_of(self.start as usize, self.len as usize, span, i)
+        card_piece_of(self.start as usize, self.len as usize, span, i, card_piece_bytes())
     }
 
     /// After a submission, for a copy in the card's memory: `gpu` is what
@@ -2558,18 +2751,18 @@ impl Shadow {
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
-        let Some(first) = first_difference(gpu, old) else {
+        let Some((first, last)) = back_bounds(gpu, old) else {
             return 0;
         };
-        let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
-        if crate::host::read_into((start + at) as *const u8, title) {
+        if crate::backstat::read((start + at) as *const u8, title) {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
+            let blending = BackTime::new(Back::Blend);
             let mut differs = 0u8;
             for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
                 let wrote = if *g != *o { 0xffu8 } else { 0 };
@@ -2578,9 +2771,9 @@ impl Shadow {
                 *t = merged;
                 *o = merged;
             }
+            drop(blending);
             if differs != 0 {
-                crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                crate::backstat::write(start + at, title);
                 written = n;
             }
         } else {
@@ -2619,16 +2812,17 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
+        let locking = BackTime::new(Back::Lock);
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        drop(locking);
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
-        let Some(first) = first_difference(gpu, held) else {
+        let Some((first, last)) = back_bounds(gpu, held) else {
             return 0;
         };
-        let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
@@ -2641,22 +2835,16 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
-        title.clear();
-        title.resize(n, 0);
-        let mapped = crate::host::read_into((start + at) as *const u8, title);
-        let mut changed = false;
+        let mut written = 0;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
-            // Title memory that is not mapped: the CPU's side keeps what
-            // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            written += merge_card_pages(
+                start + at + a, &gpu[a..b], &mut held[a..b], title,
+                &|address, bytes| crate::backstat::read(address as *const u8, bytes),
+                &crate::backstat::write,
+            );
         }
-        if !mapped || !changed {
-            return 0;
-        }
-        crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        written
     }
 }
 

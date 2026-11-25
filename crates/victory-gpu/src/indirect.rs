@@ -661,13 +661,20 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        for bytes in [4096, 8192, 16384, 32768, 65536] {
+            for skew in [0, 256, bytes - 16] {
+                check_card_compare(bytes, skew);
+            }
+        }
+    }
+
+    fn check_card_compare(piece: usize, skew: usize) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
         let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
-        const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
-        let size = PIECE * PIECES as usize;
+        let size = piece * PIECES as usize;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
         let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
@@ -685,8 +692,8 @@ void main() {
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                let constants = [0u32, skew as u32, size as u32, PIECES, 0, mode, piece as u32];
+                warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
@@ -696,7 +703,7 @@ void main() {
             // SAFETY: as above.
             [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
         };
-        let at = PIECE + 1234;
+        let at = piece - skew + 1234;
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
@@ -714,6 +721,19 @@ void main() {
         set(content[at] ^ 0x40);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // Every piece boundary, including a shortened first piece, agrees
+        // with the CPU's slicing. These bytes are entirely synthetic.
+        for (at, expected) in [(0, 0), (piece - skew - 1, 0), (piece - skew, 1),
+            (2 * piece - skew - 1, 1), (2 * piece - skew, 2), (3 * piece - skew - 1, 2)] {
+            // SAFETY: inside the mapping, after the preceding fence.
+            unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x20) };
+            let mut flags = [0, 0, 0];
+            flags[expected] = 1;
+            assert_eq!(run(&mut warp, 2), flags, "piece {piece}, skew {skew}, offset {at}");
+            // SAFETY: the same mapped byte.
+            unsafe { now_ptr.add(at).write_volatile(content[at]) };
+            assert_eq!(run(&mut warp, 2), flags);
+        }
         // Changed back: flagged, where 1 saw nothing.
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);

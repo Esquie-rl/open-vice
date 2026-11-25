@@ -211,6 +211,30 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+Copy-back measurements are available in release and diagnostics builds:
+
+| Variable | Default and effect |
+|----------|--------------------|
+| `VICTORY_BACK_TIMING=1` | Off by default. Adds `copy-back stages per frame`: flight/fetch fence waits, GPU copy timestamps, CPU merge stages, bytes and title-memory call/run counts. |
+| `VICTORY_RELAY_COPY_QUEUE=1` | Off by default; requires the relay (`VICTORY_RELAY=2`). Fetches each flight on a copy queue after its direct-queue fence. Later direct work waits for the fetch to finish, then overlaps its CPU merge. This avoids fetching behind later submissions and keeps their writes out of the earlier result. It can add GPU idle time while the relay prepares the fetch; measure frame time before enabling permanently. |
+| `VICTORY_BACK_BATCH_KB` | 1024 KiB per contiguous relay merge; accepts 64–4096. `64` restores the former chunk limit. Undeclared gaps and newer CPU uploads are excluded; failed reads retry at 4 KiB page boundaries. |
+| `VICTORY_CARD_BACK_KB` | 64 KiB per GPU hash piece. Accepts 4, 8, 16, 32 or 64; smaller pieces are experimental and may reduce fetched bytes. |
+
+Set these before starting the process. Compare with `VICTORY_BACK_TIMING=1`
+in both runs, changing only `VICTORY_RELAY_COPY_QUEUE` first. Watch total
+`ms/frame`, `fetch fence`, `GPU copies`, CPU `merge` and title read/write
+counts. `flight fence` is the relay's wait before landing, outside
+`copying back`; GPU timestamps overlap the fetch wait and must not be added
+to it. Zero timestamp samples means GPU copy time was unavailable.
+The stages in parentheses are included in `merge`. These thread timings
+overlap other frame work, so their sum is not frame time.
+
+The synthetic relay round-trip test must run alone with
+`VICTORY_RELAY=2 VICTORY_RELAY_COPY_QUEUE=1`:
+`cargo test -p victory-gpu relay_copy_queue_round_trip -- --ignored --test-threads=1`.
+On Windows, call `SetErrorMode(0x0003)` in the launching PowerShell process
+before tests so a crashing test exits without an application-error dialog.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
