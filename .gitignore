@@ -76,3 +76,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# journal des lanceurs de scripts/windows
+/open-vice-derniere-sortie.log
