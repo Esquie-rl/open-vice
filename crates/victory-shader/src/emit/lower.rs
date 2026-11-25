@@ -4901,7 +4901,8 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            // (pixel programs: quad reads reach the helper lanes, see `dpp`)
+            let r = if mesh_quad || quad && self.s.pixel {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -7415,7 +7416,13 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        // Pixel programs (after VIctory 4015a18): the console runs them in whole-quad mode, so
+        // in every quad a triangle edge crosses the pixels outside the triangle run as helpers,
+        // and the compiler takes derivatives of computed values by reading the neighbour with
+        // DPP `quad_perm` or `ds_swizzle`. Wave reads leave helper lanes out on the host (a read
+        // of one gives 0 on AMD): wrong derivatives along every triangle edge, lines along the
+        // triangles of car paint, glass and skin. Quad reads include them.
+        let mut r = if mesh_quad || quad && self.s.pixel {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
