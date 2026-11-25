@@ -1,3 +1,33 @@
+# Open Vice
+
+Open Vice runs the Xbox Series version of Grand Theft Auto VI natively on a Windows PC, from the
+player's own copy of the game. **This repository contains no game files, code or assets.**
+
+Since 2026-11-25 Open Vice is based on [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6),
+the VIctory fork that renders the game's world on an NVIDIA RTX 4070, itself based on
+[VIctory](https://github.com/Marvisak/VIctory) by Marvisak and contributors. Both are GPL-3.0; so
+is Open Vice. The earlier Open Vice work stays on the `open-vice-monde` branch.
+
+What Open Vice changes on top of that fork: the name (the `open-vice` program, its window and its
+messages), the rules and protections for contributions ([CONTRIBUTING.md](CONTRIBUTING.md),
+[AGENTS.md](AGENTS.md)), and the machine it is tested on: Intel i9-12900HX, NVIDIA RTX 4080 Laptop
+(12 GB), 64 GB RAM, Windows 11.
+
+Build: `cargo build --release -p open-vice`; run:
+`target\release\open-vice.exe run <game folder>\game_scarlett_master.exe --execute`.
+Internal names are unchanged: the `victory-*` crates, the `VICTORY_*` variables, `victory.toml`.
+
+## Contribuer
+
+1. Clonez le dépôt et ouvrez-le avec votre agent de code (Claude Code lit `CLAUDE.md`, les autres `AGENTS.md`).
+2. Annoncez votre sujet dans l'issue épinglée **« Coordination : qui travaille sur quoi »**.
+3. Ouvrez une pull request vers la branche par défaut : le contrôle « No Game Data » et la relecture du propriétaire sont obligatoires.
+
+Règle n° 1 : **aucune donnée du jeu** dans le dépôt, les issues ou les pull requests (voir [CONTRIBUTING.md](CONTRIBUTING.md)).
+
+---
+
+The fork's own README follows, unchanged.
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a

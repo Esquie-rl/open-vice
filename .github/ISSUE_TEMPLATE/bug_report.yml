@@ -1,0 +1,37 @@
+name: Signaler un problème
+description: Un plantage, un écran noir, un shader refusé, une régression.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        N'ajoutez **aucune donnée du jeu** : pas de shaders, de captures d'écran ou de cibles de rendu, ni de
+        journaux qui en citent le contenu (CONTRIBUTING.md). Les hachages de shaders et les messages d'erreur
+        d'Open Vice sont acceptés.
+  - type: input
+    id: version
+    attributes:
+      label: Commit d'Open Vice
+      placeholder: "ex. 1d573bd"
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU, pilote et Windows
+      placeholder: "ex. RTX 4080 Laptop, pilote 581.xx, Windows 11 26200"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: Ce qui se passe
+      description: Ce que vous attendiez, ce que vous avez vu, et à quel moment du jeu.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Messages d'Open Vice
+      description: Lignes de journal utiles (raisons de rejet, « device removed »…), sans contenu du jeu.
+      render: text

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Règles de contribution
+    url: https://github.com/Esquie-rl/open-vice/blob/open-vice-fx/CONTRIBUTING.md
+    about: À lire avant d'ouvrir une issue ou une pull request (aucune donnée du jeu).
