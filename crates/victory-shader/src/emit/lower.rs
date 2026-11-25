@@ -3260,6 +3260,17 @@ impl<'a> Lower<'a> {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
+            if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                let p = self.x.p;
+                let def = made.and_then(|b| p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo)));
+                let phi = p.blocks.iter().any(|b| b.phis.iter().any(|f| f.value == lo));
+                eprintln!(
+                    "MASK-ELSEWHERE value {:?} made by {:?} at {:#x} (phi: {phi}) block {made:?}",
+                    lo,
+                    def.map(|i| i.name()),
+                    def.map_or(0, |i| i.machine.offset)
+                );
+            }
             return Err(MASK_ELSEWHERE);
         }
         let (x, y) = match self.ballots.get(&lo) {
@@ -5431,8 +5442,25 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+        if inst.write(Reg::S(EXEC)).is_some() {
             return Err(LANE_MASK);
+        }
+        // Open Vice: a mask made of plain numbers alone (no EXEC, no compare's lanes) is the
+        // number the console's register holds: data the structure took for a mask, as a
+        // packed word once AND-ed with a real mask and later bit-cleared, OR-ed and compared
+        // as data (`shadowmask:CS_TraceShadowRays_FullAdaptive`: "a lane mask holding lanes
+        // elsewhere read as data" at a `v_cmp` reading it).
+        if self.is_mask(lo) {
+            let plain = inst.reads.iter().all(|&(r, v)| match r {
+                Reg::S(c) if c == EXEC || c == EXEC + 1 => false,
+                Reg::S(_) => {
+                    matches!(self.vals.get(&v), Some(Val::I32(_) | Val::Bit(_))) || self.params.contains_key(&v)
+                }
+                _ => true,
+            });
+            if !plain {
+                return Err(LANE_MASK);
+            }
         }
         if matches!(
             name,
