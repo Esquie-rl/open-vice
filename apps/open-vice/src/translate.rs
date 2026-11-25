@@ -265,6 +265,16 @@ pub fn run(
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
+    // `VICTORY_ONLY=<file>`: only the shaders whose 16-digit hashes the file
+    // names (as a run's log names them), e.g. the ones a frame uses.
+    let only: Option<HashSet<String>> = std::env::var_os("VICTORY_ONLY").map(|f| {
+        std::fs::read_to_string(f)
+            .unwrap_or_default()
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .filter(|w| w.len() == 16)
+            .map(str::to_ascii_lowercase)
+            .collect()
+    });
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
@@ -299,6 +309,13 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            if let Some(only) = &only
+                                && !job
+                                    .bytes()
+                                    .is_some_and(|b| only.contains(&blake3::hash(&b).to_hex()[..16]))
+                            {
+                                continue;
+                            }
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
                         }
                         lock(&total).merge(t);

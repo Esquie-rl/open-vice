@@ -295,6 +295,47 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    /// [`with_wave_wide`]: this translation takes per-lane branches wave-wide.
+    static WAVE_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// [`with_firstlane_own`]: this translation's first-lane reads where not
+    /// every lane runs take the host wave's own first lane.
+    static FIRSTLANE_OWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Open Vice: `f` (a translation) with `VICTORY_FIRSTLANE_OWN`'s shortcut
+/// (a console wave's first-lane read where not every lane runs takes the
+/// host wave's own first lane, exact where every lane of the console wave
+/// holds the same value) for one program the caller names: the ray-tracing
+/// structure builder's scans, which the shortcut was made for (with it all
+/// 52 builder programs translate and make host pipelines on an RTX 4080
+/// Laptop; without it 3 do not, and the builder runs all or none). The
+/// caller keeps such translations out of the shader cache.
+pub fn with_firstlane_own<T>(f: impl FnOnce() -> T) -> T {
+    let old = FIRSTLANE_OWN.with(|w| w.replace(true));
+    let out = f();
+    FIRSTLANE_OWN.with(|w| w.set(old));
+    out
+}
+
+/// Whether [`with_firstlane_own`] is on for this translation.
+pub(super) fn firstlane_own_now() -> bool {
+    FIRSTLANE_OWN.with(std::cell::Cell::get)
+}
+
+/// Open Vice: `f` (a translation) with per-lane branches around cross-lane
+/// code taken by the whole wave ([`widen`]) as a stuck wave64 compute
+/// program's exact form, as the global switch does, for one program the
+/// caller names (the runtime's list of programs known to run that way:
+/// the switch for every program lost the card in a world run). The caller
+/// keeps such translations out of the shader cache.
+pub fn with_wave_wide<T>(f: impl FnOnce() -> T) -> T {
+    let old = WAVE_WIDE.with(|w| w.replace(true));
+    let out = f();
+    WAVE_WIDE.with(|w| w.set(old));
+    out
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -422,7 +463,8 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+            || WAVE_WIDE.with(std::cell::Cell::get);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {

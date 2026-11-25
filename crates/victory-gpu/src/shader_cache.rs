@@ -21,9 +21,12 @@ use victory_shader::{HwStage, RootType};
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+/// The shader cache folder, for the user's own lists kept beside it.
+static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
+    let _ = CACHE_DIR.set(dir.clone());
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
@@ -95,6 +98,50 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // Open Vice: per-program translation forms, from the file
+    // `shader-forms.txt` beside the shader cache folder (one program a line:
+    // its 16 hex digits, as a run's log names it, then `wide` for the
+    // wave-wide exact form, `victory_shader::emit::with_wave_wide`, or
+    // `firstlane` for `victory_shader::emit::with_firstlane_own`; `wide`
+    // when nothing follows), plus `VICTORY_WAVE_WIDE_ONLY=<hashes>`
+    // (`wide`). Those programs are translated outside the cache, whose
+    // translations of every other program stay valid. The list names the
+    // user's own game's programs, so it stays on their machine (no shader
+    // hash in the repository); each was checked in a world run first.
+    static FORMS: std::sync::OnceLock<Vec<(String, bool, bool)>> = std::sync::OnceLock::new();
+    let forms = FORMS.get_or_init(|| {
+        let mut text = std::env::var("VICTORY_WAVE_WIDE_ONLY").unwrap_or_default().replace(',', "\n");
+        if let Some(dir) = CACHE_DIR.get().and_then(|d| d.parent())
+            && let Ok(file) = std::fs::read_to_string(dir.join("shader-forms.txt"))
+        {
+            text.push('\n');
+            text.push_str(&file);
+        }
+        text.lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                let hash = words.next()?.to_ascii_lowercase();
+                (hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit())).then_some(())?;
+                let rest: Vec<&str> = words.collect();
+                let firstlane = rest.contains(&"firstlane");
+                let wide = rest.is_empty() || rest.contains(&"wide");
+                Some((hash, wide, firstlane))
+            })
+            .collect()
+    });
+    if !forms.is_empty() {
+        let hash = blake3::hash(container).to_hex();
+        if let Some(&(_, wide, firstlane)) = forms.iter().find(|f| f.0 == hash[..16]) {
+            tracing::info!(hash = &hash[..16], wide, firstlane, "translated in its own form (shader-forms.txt)");
+            let run = || translate(container);
+            return match (wide, firstlane) {
+                (true, true) => victory_shader::emit::with_wave_wide(|| victory_shader::emit::with_firstlane_own(run)),
+                (true, false) => victory_shader::emit::with_wave_wide(run),
+                (false, true) => victory_shader::emit::with_firstlane_own(run),
+                (false, false) => run(),
+            };
+        }
+    }
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),

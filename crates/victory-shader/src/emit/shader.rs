@@ -679,6 +679,12 @@ impl Shader {
             self.m.named_md("dx.viewIdState", vec![view_node]);
         }
 
+        // After upstream VIctory 13091f6: one interpolation mode per row.
+        if self.pixel {
+            container::same_mode_per_row(&mut self.inputs, true);
+        } else {
+            container::same_mode_per_row(&mut self.outputs, false);
+        }
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());
