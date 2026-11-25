@@ -396,7 +396,12 @@ fn unspill(
         let mut distinct: Vec<usize> = partners.iter().flatten().copied().collect();
         distinct.sort_unstable();
         distinct.dedup();
-        if partners.iter().all(Option::is_some) && distinct.len() == lower.len() && upper == lower.len() {
+        // Open Vice: a pair where some save or restore of the lower lane comes with its upper
+        // half: those move as a pair, the others alone, into neighbouring codes, which is the
+        // same as the two lanes (`PS_VoxelizeVisiblity`: a mask parked whole once, and a lone
+        // scalar parked later in its lower lane, came back as two opaque halves).
+        let _ = (upper, &distinct);
+        if partners.iter().any(Option::is_some) {
             pairs.push((reg, lane));
         }
     }
@@ -445,21 +450,34 @@ fn unspill(
     let mov = |wide: bool, dst: u8, src: u8| 0xBE80_0000 | field(dst) << 16 | (3 + u32::from(wide)) << 8 | field(src);
     const NOP: u32 = 0xBF80_0000;
     let mut edits: Vec<(usize, Option<(bool, u8, u8)>)> = Vec::new();
+    // The upper halves moved with their lower half.
+    let mut taken = vec![false; list.len()];
+    for i in 0..list.len() {
+        if let Some((_, reg, _, lane)) = parks[i]
+            && pairs.contains(&(reg, lane))
+            && let Some(j) = partner(i)
+        {
+            taken[j] = true;
+        }
+    }
     for i in 0..list.len() {
         let Some((save, reg, code, lane)) = parks[i] else {
             continue;
         };
         let Some(slot) = code_of(reg, lane) else { return Vec::new() };
-        if pairs.contains(&(reg, lane)) {
-            let Some(j) = partner(i) else { return Vec::new() };
+        if taken[i] {
+            // the upper half of a pair: moved with the lower
+            continue;
+        }
+        if pairs.contains(&(reg, lane))
+            && let Some(j) = partner(i)
+        {
             // A save moves the pair where its second half is saved; a
             // restore where its first half is restored.
             let (at, gone) = if save { (j, i) } else { (i, j) };
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
             edits.push((at, Some((true, dst, src))));
             edits.push((gone, None));
-        } else if lane > 0 && pairs.contains(&(reg, lane - 1)) {
-            // the upper half of a pair: moved with the lower
         } else {
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
             edits.push((i, Some((false, dst, src))));

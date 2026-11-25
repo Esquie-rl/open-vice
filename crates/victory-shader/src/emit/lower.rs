@@ -3792,7 +3792,19 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
-            Atom::Opaque(_) => Err("an opaque lane mask"),
+            Atom::Opaque(v) => {
+                if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                    let p = self.x.p;
+                    let def = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.writes.iter().any(|w| w.1 == v));
+                    let phi = p.blocks.iter().enumerate().find_map(|(b, k)| k.phis.iter().find(|f| f.value == v).map(|f| (b, f.reg)));
+                    eprintln!(
+                        "OPAQUE value {v:?} made by {:?} at {:#x}, phi {phi:?}",
+                        def.map(|i| i.name()),
+                        def.map_or(0, |i| i.machine.offset)
+                    );
+                }
+                Err("an opaque lane mask")
+            }
             Atom::Constant(_) => Err("a constant lane mask"),
         }
     }
