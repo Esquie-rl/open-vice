@@ -1056,7 +1056,8 @@ impl State {
             let writes = (t.stores || !write_skip()) && !quarantined;
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                // (only a program that stores by raw address writes them)
+                let Some(ready) = self.memory_ready(list, compute, writes && t.raw_stores) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };

@@ -132,6 +132,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to title memory by raw address ([`raw_stores`]):
+    /// only then are the copies of title memory by address declared written.
+    pub(crate) raw_stores: bool,
 }
 
 #[cfg(windows)]
@@ -190,17 +193,41 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let raw_stores = programs.is_empty() || programs.iter().any(raw_stores);
     let used = programs
         .into_iter()
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs | HwStage::Gs
             )
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, raw_stores })
+}
+
+/// Whether a console program can store to title memory by raw address: a
+/// global or flat store or atomic (the translator takes no other global
+/// write), or code that is not all known. A program that only reads title
+/// memory by address (the structure walkers, whose results go to views)
+/// leaves those copies as they are: declaring them all written made every
+/// walk compare and hand back gigabytes (after DexNom/VIctory bc3cd4b, whose
+/// write tracking took a City frame from 3.5 s to 1 s).
+#[cfg(windows)]
+fn raw_stores(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Flat | Encoding::Global => name.is_none_or(|n| n.contains("store") || n.contains("atomic")),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
