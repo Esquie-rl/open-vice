@@ -364,19 +364,24 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
     heap.make_null(2);
     assert_eq!(heap.entry_words(2), [0, 0]);
     assert_eq!(run([2, 3]), [[0; 4], plain].concat()[..]);
-    heap.make_at(4, &placed(false, data, structured(16), (1, 2)));
-    assert_eq!(heap.entry_words(4), entry(16, Some(pool + 1), 0));
-    heap.make_at(5, &placed(false, data, structured(8), (2, 2)));
-    assert_eq!(heap.entry_words(5), entry(8, Some(pool + 2), 0));
+    // (Views starting off 16 bytes: a structured view starting on 16 is
+    // made raw in its own slot, VIctory #1762, and needs no raw view.)
+    heap.make_at(4, &placed(false, data, structured(12), (1, 2)));
+    assert_eq!(heap.entry_words(4), entry(12, Some(pool + 1), 12));
+    heap.make_at(5, &placed(false, data, structured(8), (1, 2)));
+    assert_eq!(heap.entry_words(5), entry(8, Some(pool + 2), 8));
+    // Open Vice: one starting on 16 bytes reads its own slot.
+    heap.make_at(7, &placed(false, data, structured(16), (1, 2)));
+    assert_eq!(heap.entry_words(7), entry(16, None, 0));
 
     // Dynamic slots give their raw views back when their list is done.
     let first = heap.dynamic(2).expect("dynamic slots");
-    heap.make_at(first, &placed(false, data, structured(12), (0, 4)));
-    assert_eq!(heap.entry_words(first), entry(12, Some(pool + 3), 0));
+    heap.make_at(first, &placed(false, data, structured(12), (1, 4)));
+    assert_eq!(heap.entry_words(first), entry(12, Some(pool + 3), 12));
     heap.release(first, 2);
     assert_eq!(heap.entry_words(first), [0, 0]);
-    heap.make_at(6, &placed(false, data, structured(12), (0, 4)));
-    assert_eq!(heap.entry_words(6), entry(12, Some(pool + 3), 0));
+    heap.make_at(6, &placed(false, data, structured(12), (1, 4)));
+    assert_eq!(heap.entry_words(6), entry(12, Some(pool + 3), 12));
     drop(memory);
 }
 

@@ -1207,10 +1207,27 @@ fn viewed_bytes(view: &View, kept: Option<&ID3D12Resource>) -> Viewed {
     if element == 0 || shadow.buffer.as_raw() != kept.as_raw() {
         return Viewed::Unknown;
     }
+    let start = shadow.offset(base) + first * element;
+    let len = u64::from(count) * element;
+    // A structured view `buffer_srv` / `buffer_uav` made raw (VIctory #1762)
+    // reads its own bytes raw: no raw view of its own (the pool fills up on
+    // a capped heap, and the rest would read zeros).
+    let structured = if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        desc.Format == DXGI_FORMAT_UNKNOWN && unsafe { desc.Anonymous.Buffer }.StructureByteStride > 0
+    } else {
+        let desc = srv_desc(words);
+        // SAFETY: a buffer view's union member.
+        desc.Format == DXGI_FORMAT_UNKNOWN && unsafe { desc.Anonymous.Buffer }.StructureByteStride > 0
+    };
+    if structured && raw_window(start, len).is_some() {
+        return Viewed::Own;
+    }
     Viewed::Bytes {
         buffer: shadow.buffer.clone(),
-        start: shadow.offset(base) + first * element,
-        len: u64::from(count) * element,
+        start,
+        len,
         unordered,
     }
 }
@@ -1300,7 +1317,7 @@ fn buffer_srv(
     }
     if desc.Format == DXGI_FORMAT_UNKNOWN
         && buffer.StructureByteStride > 0
-        && let Some((first, count)) = raw_window(first * element, u64::from(count) * element)
+        && let Some((first, count)) = raw_window(buffer.FirstElement * element, u64::from(buffer.NumElements) * element)
     {
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
         buffer.FirstElement = first;
@@ -1366,7 +1383,7 @@ fn buffer_uav(
     }
     if desc.Format == DXGI_FORMAT_UNKNOWN
         && buffer.StructureByteStride > 0
-        && let Some((first, count)) = raw_window(first * element, u64::from(count) * element)
+        && let Some((first, count)) = raw_window(buffer.FirstElement * element, u64::from(buffer.NumElements) * element)
     {
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
         buffer.FirstElement = first;
