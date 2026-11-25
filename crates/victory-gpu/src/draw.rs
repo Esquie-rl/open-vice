@@ -66,6 +66,9 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a stage's tables are walked: its stores stay on the host
+    /// (`VICTORY_BVH_QUARANTINE`, `pipeline::quarantine`).
+    static QUARANTINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -995,17 +998,21 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            let by_address = t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY);
+            let quarantined = crate::pipeline::builder_quarantined(self.pipeline as This)
+                || by_address && crate::pipeline::quarantine() >= 2;
             STORES.set(t.stores);
+            QUARANTINED.set(quarantined);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
+            QUARANTINED.set(false);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
-            let writes = (t.stores || !write_skip())
-                && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            let writes = (t.stores || !write_skip()) && !quarantined;
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
@@ -2076,6 +2083,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        if crate::pipeline::builder_dry() && crate::pipeline::is_builder(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -3162,7 +3173,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            if !QUARANTINED.get() && (STORES.get() || !write_skip()) {
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]

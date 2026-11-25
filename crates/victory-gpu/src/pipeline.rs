@@ -259,8 +259,31 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// memory when the title writes them.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
+    is_builder(this) && quarantine() >= 1
+}
+
+/// `VICTORY_BVH_QUARANTINE`: 1 the structure builder's stores stay on the
+/// host ([`builder_quarantined`]); 2 also those of every program that reads
+/// title memory by address (the ones walking the structures), a check of
+/// whether what they hand back to the title is what the title dies on.
+#[cfg(windows)]
+pub(crate) fn quarantine() -> u8 {
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_BVH_QUARANTINE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// `VICTORY_BVH_BUILDER=2`: the builder's dispatches are prepared and bound
+/// as when it runs (copies, views, waits) but not issued: a check of whether
+/// the title dies on what the builder computes or on what running it costs.
+#[cfg(windows)]
+pub(crate) fn builder_dry() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "2"))
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -284,7 +307,7 @@ pub(crate) fn builder_off(why: &'static str) {
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1" || v == "2")) {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
