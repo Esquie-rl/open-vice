@@ -304,6 +304,10 @@ struct Lower<'a> {
     pair_meet: Option<u32>,
     /// A legacy geometry program ([`GsState`]).
     gs: Option<GsState>,
+    /// A structure-builder program under a partial `DispatchX` by threads,
+    /// where its lanes past the thread counts stay alive: whether this lane
+    /// is inside them ([`Self::dispatch_threads_prologue`]).
+    partial_active: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1659,6 +1663,7 @@ impl<'a> Lower<'a> {
             wave_base: None,
             pair_meet,
             gs,
+            partial_active: None,
             flat: None,
             no_barrier,
             fence_only,
@@ -2323,6 +2328,8 @@ impl<'a> Lower<'a> {
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
+        } else if self.s.threads.is_some() && crate::spill::is_spilled(self.x.native) {
+            self.dispatch_threads_prologue(&order).map_err(|w| unsupported(0, w))?;
         }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
@@ -3270,6 +3277,12 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
+                // (a lane past a partial dispatch's threads is in no mask of
+                // the lanes that run)
+                let bit = match self.partial_active {
+                    Some(a) => self.s.m.bin(at, Bin::And, bit, a),
+                    None => bit,
+                };
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -4129,10 +4142,84 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        match self.x.st.guards[b][i] {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
+        let g = match self.x.st.guards[b][i] {
+            None => None,
+            Some(g) => Some(self.boolean(g, self.cur)?),
+        };
+        // (a lane past a partial dispatch's threads changes nothing)
+        Ok(match (g, self.partial_active) {
+            (Some(g), Some(a)) => Some(self.s.m.bin(self.cur, Bin::And, g, a)),
+            (g, a) => g.or(a),
+        })
+    }
+
+    /// A `DispatchX` with `USE_THREAD_DIMENSIONS` gives thread counts, and the
+    /// console runs no lane at or past them in a partial last group; the
+    /// ray-tracing structure builder (the spilled programs) dispatches so.
+    /// The host runs whole groups and passes the counts
+    /// (`USER_DISPATCH_THREADS`, 0: none). Lanes past them return at once
+    /// where no barrier waits for them (the program has none, and no host
+    /// waves meet: a split console wave's `wave_base` meets in the entry
+    /// block, which every thread runs first); else they stay, changing
+    /// nothing ([`Self::guard`]) and out of the masks read as numbers
+    /// ([`Self::mask_dword`]). Without it the extra lanes stored past the
+    /// builder's arrays into the title's own objects (after flamingo 7ca2674
+    /// and victory-fork #814).
+    /// shortcut: where the lanes stay, the wave's reductions and votes on
+    /// EXEC still count them.
+    fn dispatch_threads_prologue(&mut self, order: &[usize]) -> Result<(), Why> {
+        use super::shader::USER_DISPATCH_THREADS;
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return Ok(());
+        };
+        let e = self.s.entry;
+        let zero = self.s.m.i32(0);
+        let mut active: Option<V> = None;
+        for (c, &dim) in cs.threads.iter().enumerate() {
+            if dim <= 1 {
+                continue;
+            }
+            let limit = self.host_word(RootType::Other(USER_DISPATCH_THREADS), 0, c as u32);
+            let Val::I32(group) = self.compute_id("groupId.i32", 94, c as u8) else {
+                return Err("a partial dispatch's group id");
+            };
+            let Val::I32(tid) = self.thread_id(c as u8) else {
+                return Err("a partial dispatch's thread id");
+            };
+            let dim = self.s.m.i32(dim);
+            let base = self.s.m.bin(e, Bin::Mul, group, dim);
+            let global = self.s.m.bin(e, Bin::Add, base, tid);
+            let none = self.s.m.cmp(e, pred::EQ, limit, zero);
+            let inside = self.s.m.cmp(e, pred::IULT, global, limit);
+            let ok = self.s.m.bin(e, Bin::Or, none, inside);
+            active = Some(match active {
+                None => ok,
+                Some(prev) => self.s.m.bin(e, Bin::And, prev, ok),
+            });
         }
+        let Some(active) = active else {
+            return Ok(());
+        };
+        let barrier = self.x.p.blocks.iter().enumerate().any(|(b, blk)| {
+            !self.no_barrier.contains(&b) && blk.insts.iter().any(|i| i.name() == "s_barrier")
+        });
+        let early = !barrier
+            && self.exchange.is_none()
+            && self.pair_meet.is_none()
+            && !self.split_lds
+            && self.lds_meet.is_none()
+            && self.x.p.blocks[order[0]].preds.is_empty();
+        if early {
+            let body = self.s.m.new_block();
+            let exit = self.s.m.new_block();
+            self.s.m.terminate(e, Term::CondBr(active, body, exit));
+            self.s.m.terminate(exit, Term::Ret);
+            self.block[order[0]] = Some(body);
+            self.cur = body;
+        } else {
+            self.partial_active = Some(active);
+        }
+        Ok(())
     }
 
     // ---- results ----

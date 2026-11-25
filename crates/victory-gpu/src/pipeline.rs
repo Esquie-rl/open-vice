@@ -63,6 +63,10 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// The console compute program's thread-group size, once looked at
+    /// ([`console_threads`]).
+    #[cfg(windows)]
+    threads: OnceLock<Option<[u32; 3]>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -113,6 +117,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                threads: OnceLock::new(),
             })
         })
         .clone()
@@ -274,6 +280,28 @@ pub(crate) fn quarantine() -> u8 {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0)
+    })
+}
+
+/// The thread-group size of the console compute program of the title's
+/// pipeline `this`, for a `DispatchX` that counts threads (`draw.rs`
+/// `State::dispatch_x`; after flamingo 7ca2674 and victory-fork #814).
+#[cfg(windows)]
+pub(crate) fn console_threads(this: This) -> Option<[u32; 3]> {
+    use victory_shader::native::StageIo;
+    use victory_shader::{Container, FourCC};
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let s = p.shaders.iter().find(|s| s.stage == "compute")?;
+    *s.threads.get_or_init(|| {
+        let c = Container::parse(&s.container).ok()?;
+        let programs = victory_shader::native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+        programs.iter().find_map(|p| match p.io {
+            StageIo::Cs(cs) => Some(cs.threads),
+            _ => None,
+        })
     })
 }
 
