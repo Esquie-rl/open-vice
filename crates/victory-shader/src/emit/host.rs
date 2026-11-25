@@ -262,6 +262,20 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        // Open Vice diagnostics: the trace buffer of a traced shader.
+        if stages.iter().any(|(s, _)| s.trace) {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::TRACE_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
         // The address map, then the descriptor words, come last.
         for (wanted, space) in [
             (
@@ -661,6 +675,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         stride_table: false,
         address_map: false,
         descriptor_words: false,
+        trace: false,
     }
 }
 

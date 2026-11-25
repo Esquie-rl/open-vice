@@ -149,8 +149,9 @@ fn cached(
 }
 
 /// VSH2: root view registers are 16 bits (#614). VSH3: root UAVs (Open Vice).
-/// VSH4: the address map and descriptor words (#1198).
-const MAGIC: &[u8; 4] = b"VSH4";
+/// VSH4: the address map and descriptor words (#1198). VSH5: the trace
+/// flag (Open Vice diagnostics).
+const MAGIC: &[u8; 4] = b"VSH5";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -234,6 +235,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     word(&mut out, u32::from(s.stride_table));
     word(&mut out, u32::from(s.address_map));
     word(&mut out, u32::from(s.descriptor_words));
+    word(&mut out, u32::from(s.trace));
     out
 }
 
@@ -305,6 +307,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     };
     let address_map = flag(r.word()?)?;
     let descriptor_words = flag(r.word()?)?;
+    let trace = flag(r.word()?)?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -317,6 +320,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         stride_table,
         address_map,
         descriptor_words,
+        trace,
     })
 }
 
@@ -348,6 +352,7 @@ mod tests {
             stride_table: true,
             address_map: true,
             descriptor_words: true,
+            trace: false,
         }
     }
 

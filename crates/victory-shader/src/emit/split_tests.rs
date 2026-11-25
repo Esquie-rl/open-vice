@@ -261,6 +261,28 @@ fn masks_read_whole_count_both_halves() {
     console_flow_case("s_bcnt1 of lanes below 40", &body, 32, |_| 32);
 }
 
+/// Open Vice: a select on a mask that is EXEC or 0 by SCC
+/// (`s_cselect_b64 s, exec, 0`), as Grand Theft Auto VI's occlusion pass
+/// 9f017d90 keeps the depths it gathered: true, every lane takes the
+/// gathered 0; false, the 1.0 it started with.
+#[test]
+fn selects_on_exec_or_zero_by_scc() {
+    for (k, want) in [(5u32, 0u32), (2, 0x3F80_0000)] {
+        let body = [
+            0x7E02_02F2,     // v_mov_b32 v1, 1.0
+            0x7E06_0280,     // v_mov_b32 v3, 0
+            0xBE8A_0380 + k, // s_mov_b32 s10, k
+            0xBF02_830A,     // s_cmp_gt_i32 s10, 3
+            0x858C_807E,     // s_cselect_b64 s[12:13], exec, 0
+            0xD501_0002,
+            0x0032_0701, // v_cndmask_b32 v2, v1, v3, s[12:13]
+        ];
+        for threads in [64, 128] {
+            console_flow_case(&format!("exec or 0 by SCC (s10 = {k})"), &body, threads, |_| want);
+        }
+    }
+}
+
 /// A lane of the other half: lane 40 is the upper half's lane 8.
 #[test]
 fn lane_reads_cross_halves() {

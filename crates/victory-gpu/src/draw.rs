@@ -572,6 +572,13 @@ impl State {
                 .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                 .flatten();
             let mut extra = Vec::new();
+            // Open Vice: `VICTORY_NO_ADDRESS_MAP` drops what reads title memory
+            // through the address map (its refreshes copy whole host copies at
+            // every submission: seconds a world frame).
+            if stage.address_map.is_some() && std::env::var_os("VICTORY_NO_ADDRESS_MAP").is_some() {
+                failed("the address map is off (VICTORY_NO_ADDRESS_MAP)");
+                return false;
+            }
             if let Some(param) = stage.address_map {
                 let made = self.maps.iter().find(|m| m.0 == self.heaps[0]).map(|m| m.1);
                 let gpu = match (made, heap) {
@@ -599,6 +606,22 @@ impl State {
                     return false;
                 };
                 extra.push((param, gpu));
+            }
+            // Open Vice diagnostics: the trace buffer of a traced shader.
+            if let Some(param) = stage.trace {
+                let Some(gpu) = crate::trace::gpu() else {
+                    once!("a traced shader dropped: no trace buffer");
+                    return false;
+                };
+                crate::trace::bound();
+                // SAFETY: an open list; the buffer lives for the process.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootUnorderedAccessView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                    }
+                }
             }
             for (param, gpu) in extra {
                 // SAFETY: an open list; the buffers live as long as it runs.

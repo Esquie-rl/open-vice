@@ -57,6 +57,8 @@ pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod trace;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]

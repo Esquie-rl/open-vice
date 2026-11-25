@@ -44,6 +44,8 @@ pub(crate) struct Lowered {
     pub address_map: bool,
     /// Reads descriptor words.
     pub descriptor_words: bool,
+    /// Writes the trace buffer (Open Vice diagnostics).
+    pub trace: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -259,6 +261,11 @@ struct Lower<'a> {
     xchg: Option<V>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// Open Vice diagnostics: the traced group, the trace slots taken and
+    /// whether this lane is the traced one ([`Self::trace_writes`]).
+    trace_group: Option<u32>,
+    trace_slots: u32,
+    trace_on: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -723,6 +730,11 @@ impl<'a> Lower<'a> {
             console_flat: None,
             xchg: None,
             flat: None,
+            trace_group: matches!(x.native.io, StageIo::Cs(_))
+                .then(super::traced_group)
+                .flatten(),
+            trace_slots: 0,
+            trace_on: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
@@ -1244,7 +1256,9 @@ impl<'a> Lower<'a> {
         let cmp_samplers = self.s.cmp_samplers;
         let address_map = self.s.address_map.is_some();
         let descriptor_words = self.s.descriptor_words.is_some();
+        let trace = self.s.trace.is_some();
         Ok(Lowered {
+            trace,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -1391,6 +1405,74 @@ impl<'a> Lower<'a> {
             self.s
                 .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c]),
         )
+    }
+
+    /// Open Vice diagnostics: with a traced group ([`super::traced_group`]),
+    /// each register `inst` wrote, as the traced lane (thread 0 of that
+    /// group) holds it, at the write's own slot of the trace buffer
+    /// ([`super::TRACE_SLOTS`] slots of four dwords after a first one): the
+    /// instruction's byte offset in the code, the register (0x100 + n for
+    /// VGPR n, n for SGPR n), the value and a mark. Other lanes store into a
+    /// scratch slot of their own past the slots. A loop leaves its last
+    /// iteration's values.
+    fn trace_writes(&mut self, inst: &Inst) {
+        let Some(group) = self.trace_group else {
+            return;
+        };
+        for &(reg, v) in &inst.writes {
+            let code = match reg {
+                Reg::V(n) => 0x100 + u32::from(n),
+                Reg::S(n) => u32::from(n),
+                _ => continue,
+            };
+            if self.trace_slots >= super::TRACE_SLOTS {
+                return;
+            }
+            let Ok(x) = self.i32_of(v) else { continue };
+            let slot = self.trace_slots;
+            self.trace_slots += 1;
+            let on = match self.trace_on {
+                Some(on) => on,
+                None => {
+                    let e = self.s.entry;
+                    let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                        return;
+                    };
+                    let flat = self.mesh_thread();
+                    let want = self.s.m.i32(group);
+                    let zero = self.s.m.i32(0);
+                    let a = self.s.m.cmp(e, pred::EQ, g, want);
+                    let b = self.s.m.cmp(e, pred::EQ, flat, zero);
+                    let on = self.s.m.bin(e, Bin::And, a, b);
+                    self.trace_on = Some(on);
+                    on
+                }
+            };
+            let c = self.cur;
+            let flat = self.mesh_thread();
+            let k16 = self.s.m.i32(16);
+            let base = self.s.m.i32((1 + super::TRACE_SLOTS) * 16);
+            let scratch = self.s.m.bin(c, Bin::Mul, flat, k16);
+            let scratch = self.s.m.bin(c, Bin::Add, scratch, base);
+            let here = self.s.m.i32((1 + slot) * 16);
+            let at = self.s.m.select(c, on, here, scratch);
+            let h = self.s.trace_handle();
+            let pc = self.s.m.i32(inst.machine.offset as u32);
+            let rg = self.s.m.i32(code);
+            let mark = self.s.m.i32(0x7ACE_0000 | slot);
+            let iu = self.s.m.undef(self.s.t.i32);
+            let mask = self.s.m.i8(0xF);
+            let align = self.s.m.i32(4);
+            let void = self.s.t.void;
+            self.s.op(
+                c,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &[h, at, iu, pc, rg, x, mark, mask, align],
+            );
+        }
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
@@ -2969,7 +3051,10 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } => Err("flat memory"),
         };
         match r {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.trace_writes(inst);
+                Ok(())
+            }
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
                 for &(_, v) in &inst.writes {
@@ -3520,10 +3605,23 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+            // Open Vice: through the raw view of the buffer's bytes the
+            // runtime stride table names, as vector loads of an unknown
+            // stride do: a raw read of a structured or typed view is
+            // undefined in D3D12, and NVIDIA returns zeros (Grand Theft Auto
+            // VI's occlusion pass 9f017d90 read its camera, matrices and
+            // object list as zeros from t77, 456-byte elements, and culled
+            // every object). A descriptor the table cannot name is read
+            // raw as before.
+            let zero = self.s.m.i32(0);
+            let (h, base) = match self.runtime_view(src, zero, addr, 11) {
+                Ok(v) => v,
+                Err(_) => (self.handle(site, src, false, (11, 0))?, addr),
+            };
+            let c = self.cur;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let a = self.s.m.bin(c, Bin::Add, base, off);
                 let mask = self.s.m.i8(1);
                 let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
                 let r = self.s.op(
@@ -8462,6 +8560,7 @@ mod tests {
                     stride_table: l.stride_table,
                     address_map: l.address_map,
                     descriptor_words: l.descriptor_words,
+                    trace: l.trace,
                 };
                 host.compute_pipeline(&cs).unwrap();
             }

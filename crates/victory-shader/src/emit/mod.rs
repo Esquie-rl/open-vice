@@ -115,8 +115,28 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     ADDRESS_MAP_SPACE, DESCRIPTOR_WORDS_SPACE, ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE,
-    STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
+    STRIDE_SPACE, StrideEntry, TRACE_SPACE, USER_DATA_SPACE,
 };
+
+thread_local! {
+    static TRACE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Open Vice diagnostics: compute programs translated on this thread from
+/// now on write their register values for thread 0 of group `g` (x) to the
+/// trace buffer ([`TRACE_SPACE`]; [`HostShader::trace`]), or none.
+pub fn trace_group(g: Option<u32>) {
+    TRACE.with(|t| t.set(g));
+}
+
+pub(crate) fn traced_group() -> Option<u32> {
+    TRACE.with(std::cell::Cell::get)
+}
+
+/// Slots of the trace buffer: 16 bytes each after a first one, then a
+/// scratch slot per thread of the group.
+pub const TRACE_SLOTS: u32 = 1 << 15;
+
 
 /// The stack for threads that make host pipelines from translated shaders.
 /// vkd3d-proton converts DXIL on the calling thread, recursively over its
@@ -201,6 +221,9 @@ pub struct HostShader {
     /// [`DESCRIPTOR_WORDS_SPACE`]. A slot whose words the host cannot give
     /// reads zero.
     pub descriptor_words: bool,
+    /// Open Vice diagnostics: the shader writes the trace buffer, `u0` in
+    /// [`TRACE_SPACE`] ([`trace_group`]).
+    pub trace: bool,
 }
 
 /// Where the address of a root view comes from, and the register it is
@@ -471,6 +494,7 @@ pub fn emit(
         stride_table: l.stride_table,
         address_map: l.address_map,
         descriptor_words: l.descriptor_words,
+        trace: l.trace,
     })
 }
 
@@ -732,6 +756,7 @@ mod tests {
             stride_table: false,
             address_map: false,
             descriptor_words: false,
+            trace: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -746,6 +771,7 @@ mod tests {
                 stride_table: false,
                 address_map: false,
                 descriptor_words: false,
+                trace: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1197,6 +1223,7 @@ mod tests {
             stride_table: l.stride_table,
             address_map: l.address_map,
             descriptor_words: l.descriptor_words,
+        trace: l.trace,
         }
     }
 

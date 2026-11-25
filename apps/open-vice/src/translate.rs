@@ -413,7 +413,9 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r, checks.target) {
+                    // `VICTORY_TRACE_GROUP`: translate with the trace (Open Vice diagnostics).
+        emit::trace_group(std::env::var("VICTORY_TRACE_GROUP").ok().and_then(|g| g.parse().ok()));
+        match emit::emit(&container, &p, &program, &s, &i, &r, checks.target) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
@@ -484,7 +486,13 @@ fn check(
         Ok(()) => {
             *counter(t, shader.stage, 2) += 1;
             if t.list {
-                t.lines.push(format!("{}  validated", label()));
+                // `VICTORY_SUMMARY`: with the module's threads, wave size
+                // and operations.
+                if std::env::var_os("VICTORY_SUMMARY").is_some() {
+                    t.lines.push(format!("{}  validated [{}]", label(), emit::last_module_summary()));
+                } else {
+                    t.lines.push(format!("{}  validated", label()));
+                }
             }
         }
         Err(text) => {

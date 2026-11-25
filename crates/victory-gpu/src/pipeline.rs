@@ -107,7 +107,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate(&self.container, &self.hash);
                 match &done {
                     Ok(t) => {
                         tracing::info!(
@@ -152,8 +152,7 @@ impl Shader {
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+fn translate(container: &[u8], hash: &str) -> Result<Translated, String> {
     // Open Vice: the title's ray-tracing BVH builder (XboxBvhBuilder.dll's
     // build passes, whose containers carry an `XboxBvhBuilder/...` debug
     // path) is dropped as a unit unless `VICTORY_KEEP_BVH_BUILDER` is set.
@@ -175,6 +174,17 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     // drops every world draw (the picture stays black). What a program
     // reads across lanes may come out wrong on 32 lanes; loops stay
     // bounded. `VICTORY_STRICT_WAVES` keeps the refusal.
+    // Open Vice diagnostics: the traced shader, translated afresh (not
+    // from the cache) to write its trace ([`crate::trace`]).
+    if crate::trace::traced().is_some_and(|h| hash.starts_with(&h)) {
+        victory_shader::emit::trace_group(Some(crate::trace::group()));
+        let t = victory_shader::emit::translate_for(container, target)
+            .or_else(|_| victory_shader::emit::translate_for(container, victory_shader::emit::Target::ANY));
+        victory_shader::emit::trace_group(None);
+        let host = t.map_err(|e| e.to_string())?;
+        tracing::info!(hash, trace = host.trace, "traced shader translated");
+        return Ok(Translated { host, used: used_of(container)? });
+    }
     let host = match crate::shader_cache::host_shader(container, target) {
         Ok(host) => host,
         Err(e) if target != victory_shader::emit::Target::ANY
@@ -194,6 +204,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         }
         Err(e) => return Err(e),
     };
+    Ok(Translated { host, used: used_of(container)? })
+}
+
+/// The console resources a container's program reads.
+#[cfg(windows)]
+fn used_of(container: &[u8]) -> Result<Vec<victory_shader::UsedResource>, String> {
+    use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
@@ -209,7 +226,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    Ok(used)
 }
 
 #[repr(C)]

@@ -94,6 +94,9 @@ pub const ADDRESS_MAP_SPACE: u32 = 4;
 /// when the shader reads descriptors as numbers beyond what host views
 /// tell (see [`super::HostShader::descriptor_words`]).
 pub const DESCRIPTOR_WORDS_SPACE: u32 = 5;
+/// Open Vice diagnostics: where a traced shader's trace buffer is bound,
+/// `u0` in this space (see [`super::trace_group`]).
+pub const TRACE_SPACE: u32 = 6;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -157,6 +160,8 @@ pub(crate) struct Shader {
     pub address_map: Option<V>,
     /// The descriptor words' handle, once made.
     pub descriptor_words: Option<V>,
+    /// The trace buffer's handle, once made (Open Vice diagnostics).
+    pub trace: Option<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -232,6 +237,7 @@ impl Shader {
             stride_table: None,
             address_map: None,
             descriptor_words: None,
+            trace: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -404,6 +410,31 @@ impl Shader {
         h
     }
 
+    /// Open Vice diagnostics: the trace buffer's handle (`u0` in
+    /// [`TRACE_SPACE`], a raw read-write buffer), made in the entry block.
+    pub fn trace_handle(&mut self) -> V {
+        if let Some(h) = self.trace {
+            return h;
+        }
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(TRACE_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.trace = Some(h);
+        h
+    }
+
     /// The handle of the address map (`t0` in [`ADDRESS_MAP_SPACE`], a raw
     /// buffer), made in the entry block.
     pub fn address_map_handle(&mut self) -> V {
@@ -539,6 +570,7 @@ impl Shader {
             || self.stride_table.is_some()
             || self.address_map.is_some()
             || self.descriptor_words.is_some()
+            || self.trace.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -640,7 +672,15 @@ impl Shader {
             }
             // Root UAVs: raw read-write buffers (Open Vice).
             let mut uavs = None;
-            if !self.root_uavs.is_empty() {
+            let mut uav_specs: Vec<(u32, u32)> = self
+                .root_uavs
+                .iter()
+                .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                .collect();
+            if self.trace.is_some() {
+                uav_specs.push((TRACE_SPACE, 0));
+            }
+            if !uav_specs.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -648,7 +688,7 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                for (n, (space, register)) in uav_specs.into_iter().enumerate() {
                     // ID, variable, name, space, lower bound, range, shape
                     // (raw), globally coherent, counter, rasterizer
                     // ordered, extended properties.
@@ -656,8 +696,8 @@ impl Shader {
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(self.m.md_value(no)),
@@ -668,8 +708,8 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 7,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register,
                         dxil_kind: 11,
                     });
                 }

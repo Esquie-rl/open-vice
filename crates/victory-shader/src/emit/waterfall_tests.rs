@@ -89,6 +89,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         stride_table: lowered.stride_table,
         address_map: lowered.address_map,
         descriptor_words: lowered.descriptor_words,
+        trace: false,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
