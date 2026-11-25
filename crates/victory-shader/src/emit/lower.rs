@@ -105,6 +105,9 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
+/// The scalar source code of `src_pops_exiting_wave_id` (primitive-ordered pixel shading).
+const POPS_EXITING_WAVE_ID: u8 = 239;
+
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
 
@@ -266,6 +269,9 @@ struct Lower<'a> {
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// [`with_pair_meetings`]: the first of the meeting counters (two per console wave, one
+    /// per half), zeroed in the entry block before its group barrier.
+    pair_meet: Option<u32>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -949,6 +955,25 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_pair_meetings`].
+    static PAIR_MEETINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Open Vice: runs `f` (a lowering of a console wave64 program on a host of
+/// 32-lane waves whose thread group holds several console waves) with the
+/// meetings of a console wave's two host waves made between those two only:
+/// each half adds one to its own counter in LDS and waits until the other
+/// half's counter has reached as far ([`Lower::meet`]). A group barrier
+/// there would also wait for the group's other console waves, which take
+/// their wave-wide branches on their own and need not come (the reason
+/// [`super::widen`] refused such groups). The wait is bounded: a pair that
+/// fell out of step goes on with what it has rather than hang the card.
+/// The program's own `s_barrier`s stay group barriers.
+pub(super) fn with_pair_meetings<R>(f: impl FnOnce() -> R) -> R {
+    let was = PAIR_MEETINGS.replace(true);
+    let r = f();
+    PAIR_MEETINGS.set(was);
+    r
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1272,6 +1297,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // `with_pair_meetings`: the first of the meeting counters
+        let mut pair_meet: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1398,6 +1425,11 @@ impl<'a> Lower<'a> {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
+                // several whole console waves per group: their halves meet pair by pair
+                if PAIR_MEETINGS.get() && group > 64 && group.is_multiple_of(64) {
+                    pair_meet = Some(s.lds_dwords);
+                    s.lds_dwords += 2 * (group / 64);
+                }
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1559,6 +1591,7 @@ impl<'a> Lower<'a> {
             pair: None,
             halves,
             wave_base: None,
+            pair_meet,
             flat: None,
             no_barrier,
             fence_only,
@@ -1948,6 +1981,7 @@ impl<'a> Lower<'a> {
                     let tb = bits(self, total);
                     let c = self.cur;
                     let (lo, _) = self.exchange_halves(c, tb);
+                    let c = self.cur;
                     let lo = back(self, lo);
                     let cl = self.console_lane();
                     let k32 = self.s.m.i32(32);
@@ -1960,6 +1994,7 @@ impl<'a> Lower<'a> {
                     let rb = bits(self, r);
                     let c = self.cur;
                     let (lo, hi) = self.exchange_halves(c, rb);
+                    let c = self.cur;
                     let (lo, hi) = (back(self, lo), back(self, hi));
                     match op {
                         Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
@@ -2307,6 +2342,27 @@ impl<'a> Lower<'a> {
     /// Values of the program's input registers.
     fn inputs(&mut self) -> Result<(), Stop> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
+        // Open Vice: a pixel program of primitive-ordered pixel shading (it reads
+        // `src_pops_exiting_wave_id`, SGPR code 239): its UAVs become rasterizer ordered views,
+        // which keep the order of overlapping pixels; the overlap wait and its inputs (the
+        // collision SGPR the hardware sets, the exiting wave id) read zero, which lets every
+        // wave through at once (the title's `PS_PedTexturedCutOutTint_Zero`: zero skips the
+        // wait loop); `s_setreg` of POPS_PACKER and the ORDERED_PS_DONE message do nothing.
+        let pops = self.s.pixel
+            && (self.x.p.inputs.iter().any(|&(r, _)| r == Reg::S(POPS_EXITING_WAVE_ID))
+                || self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                    match (i.name(), &i.fields) {
+                        // MSG_ORDERED_PS_DONE
+                        ("s_sendmsg", Fields::Sopp { imm }) => imm & 0xF == 7,
+                        // HW_REG_POPS_PACKER
+                        ("s_setreg_b32" | "s_setreg_imm32_b32", Fields::Sop { imm: Some(imm), .. }) => imm & 0x3F == 25,
+                        ("s_endpgm_ordered_ps_done", _) => true,
+                        _ => false,
+                    }
+                }));
+        if pops {
+            self.s.rov = true;
+        }
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
@@ -2329,6 +2385,8 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // (POPS: see above)
+                    None if pops => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3181,6 +3239,8 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // Open Vice: POPS's exiting wave id reads zero (see `inputs`)
+            Operand::Const(POPS_EXITING_WAVE_ID) if self.s.rov => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -3657,6 +3717,15 @@ impl<'a> Lower<'a> {
         let ptr = self.s.m.element(e, lds, k);
         let zero = self.s.m.i32(0);
         self.s.m.store(e, ptr, zero);
+        if let Some(first) = self.pair_meet {
+            // the meeting counters, zeroed before the group's first barrier
+            let n = 2 * self.s.threads.map_or(0, |t| t.iter().product::<u32>() / 64);
+            for k in 0..n {
+                let at = self.s.m.i32(first + k);
+                let ptr = self.s.m.element(e, lds, at);
+                self.s.m.store(e, ptr, zero);
+            }
+        }
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
@@ -3712,6 +3781,71 @@ impl<'a> Lower<'a> {
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
+    /// The two host waves of this thread's console wave meet in `block`, and the block the
+    /// code goes on in is returned. A group barrier, unless [`with_pair_meetings`] is on and
+    /// `block` is the current one: then each half's first lane adds one to its own counter
+    /// (after an LDS fence) and the half waits until the other half's counter has reached
+    /// as far, at most 2^20 polls (a pair fallen out of step goes on rather than hang).
+    fn meet(&mut self, block: usize) -> usize {
+        let Some(first) = self.pair_meet else {
+            self.group_sync(block);
+            return block;
+        };
+        let (i32t, void) = (self.s.t.i32, self.s.t.void);
+        let lds = self.s.lds();
+        // the counters of this console wave: [2 * wave + half]
+        let thread = self.console_thread();
+        let cl = self.console_lane();
+        // (an earlier block, closed already, gets the loop at its end: its terminator goes
+        // on after the loop, and so do its successors' phis' edges from it)
+        let head = self.s.m.resolve(block);
+        let was_cur = self.s.m.resolve(self.cur) == head;
+        let done = self.s.m.new_block();
+        self.s.m.move_term(head, done);
+        let (six, five, one) = (self.s.m.i32(6), self.s.m.i32(5), self.s.m.i32(1));
+        let wave = self.s.m.bin(head, Bin::LShr, thread, six);
+        let twice = self.s.m.bin(head, Bin::Shl, wave, one);
+        let base = self.s.m.i32(first);
+        let pair = self.s.m.bin(head, Bin::Add, base, twice);
+        let half = self.s.m.bin(head, Bin::LShr, cl, five);
+        let other = self.s.m.bin(head, Bin::Xor, half, one);
+        let mine = self.s.m.bin(head, Bin::Add, pair, half);
+        let theirs = self.s.m.bin(head, Bin::Add, pair, other);
+        // what this half wrote before is visible to the other one (LDS fence, no wait)
+        let fence = self.s.m.i32(meeting_mode() & !1);
+        self.s.op(head, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        // one arrival per host wave: its first lane adds one, every lane takes the count
+        let lane = self.s.op(head, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let z = self.s.m.i32(0);
+        let firstlane = self.s.m.cmp(head, pred::EQ, lane, z);
+        let add = self.s.m.select(head, firstlane, one, z);
+        let my_ptr = self.s.m.element(head, lds, mine);
+        let old = self.s.m.atomic(head, Rmw::Add, my_ptr, add);
+        let old = self.s.op(head, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        self.s.flags |= flags::WAVE_OPS;
+        let reached = self.s.m.bin(head, Bin::Add, old, one);
+        let poll = self.s.m.new_block();
+        self.s.m.terminate(head, Term::Br(poll));
+        let n = self.s.m.phi(poll, i32t);
+        let their_ptr = self.s.m.element(poll, lds, theirs);
+        let seen = self.s.m.atomic(poll, Rmw::Or, their_ptr, z);
+        let n1 = self.s.m.bin(poll, Bin::Add, n, one);
+        let behind = self.s.m.cmp(poll, pred::IULT, seen, reached);
+        let limit = self.s.m.i32(1 << 20);
+        let more = self.s.m.cmp(poll, pred::IULT, n1, limit);
+        let again = self.s.m.bin(poll, Bin::And, behind, more);
+        self.s.m.terminate(poll, Term::CondBr(again, poll, done));
+        self.s.m.set_phi(n, vec![(z, head), (n1, poll)]);
+        // what the other half wrote before its arrival is visible from here
+        self.s.op(done, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        // code still put into `head` goes on after the meeting
+        self.s.m.redirect(head, done);
+        if was_cur {
+            self.cur = done;
+        }
+        done
+    }
+
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it.
     fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
@@ -3741,7 +3875,7 @@ impl<'a> Lower<'a> {
         let lds = self.s.lds();
         let ptr = self.s.m.element(at, lds, index);
         self.s.m.store(at, ptr, mine);
-        self.group_sync(at);
+        let at = self.meet(at);
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at, Bin::Add, pair, one);
         let p0 = self.s.m.element(at, lds, pair);
@@ -3749,7 +3883,7 @@ impl<'a> Lower<'a> {
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
-        self.group_sync(at);
+        self.meet(at);
         (lo, hi)
     }
 
@@ -3805,8 +3939,11 @@ impl<'a> Lower<'a> {
             need(made.unwrap_or(0));
             return Err("a lane mask exchanged where not every lane runs");
         }
+        let was_cur = at == self.cur;
         let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
         let (lo, hi) = self.exchange_halves(at, some);
+        // (a pair meeting goes on in a block of its own)
+        let at = if was_cur { self.cur } else { at };
         let both = self.s.m.bin(at, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(at, pred::NE, both, z))
@@ -4790,9 +4927,7 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            self.meet(self.cur);
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
@@ -4854,9 +4989,7 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
-        let mode = self.s.m.i32(meeting_mode());
-        let void = self.s.t.void;
-        self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.meet(self.cur);
     }
 
     /// Whether `v` is a register no program reads as a number: a descriptor dword without
@@ -6367,6 +6500,106 @@ impl<'a> Lower<'a> {
     /// predecessor whose descriptor is itself chosen by control flow (a
     /// phi of an earlier join, which dominates it) gives that join's phi,
     /// at most `depth` joins deep.
+    /// Open Vice: a sampler from the heap on some paths and one immediate sampler on the
+    /// others (40 of the title's programs, reflection maps among them): (the heap sampler,
+    /// whose index the join picks, any one on the immediate paths; the immediate sampler;
+    /// whether the lane came by an immediate path). A handle cannot be chosen by control
+    /// flow in DXIL ("Resource handle should returned by createHandle"), so the sample is
+    /// made with both and each lane keeps its path's result. None for any other sampler.
+    fn sampler_paths(&mut self, src: &Source, props: (u32, u32)) -> Result<Option<(V, V, V)>, Why> {
+        const WHY: Why = "a sampler chosen by control flow";
+        let Source::Phi { block, args } = src else {
+            return Ok(None);
+        };
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            let kinds: Vec<&str> = args
+                .iter()
+                .map(|a| match a {
+                    Source::Loaded { .. } => "loaded",
+                    Source::Constant(_) => "constant",
+                    Source::Phi { .. } => "phi",
+                    Source::Select { .. } => "select",
+                    Source::Built { .. } => "built",
+                    _ => "other",
+                })
+                .collect();
+            eprintln!("SAMPLER-PATHS {kinds:?}");
+        }
+        // the immediate samplers the paths name, at most two different ones
+        let mut distinct: Vec<[u32; 4]> = Vec::new();
+        for a in args {
+            match a {
+                Source::Constant(w) => {
+                    let w: [u32; 4] = w.get(..4).and_then(|w| w.try_into().ok()).ok_or("a sampler constant")?;
+                    if !distinct.contains(&w) {
+                        distinct.push(w);
+                    }
+                }
+                Source::Loaded { .. } => {}
+                _ => return Ok(None),
+            }
+        }
+        let loaded = args.iter().any(|a| matches!(a, Source::Loaded { .. }));
+        // (a heap sampler and one immediate one, or two immediate ones)
+        if distinct.is_empty() || distinct.len() > 2 || (loaded && distinct.len() > 1) {
+            return Ok(None);
+        }
+        let immediate = |l: &mut Self, words: [u32; 4]| {
+            let n = match l.samplers.iter().position(|w| *w == words) {
+                Some(n) => n,
+                None => {
+                    l.samplers.push(words);
+                    l.samplers.len() - 1
+                }
+            };
+            if props.0 & 0x8000 != 0 {
+                l.s.cmp_samplers |= 1 << n;
+            }
+            l.s.sampler_handle(l.cur, n as u32)
+        };
+        if !loaded && distinct.len() == 1 {
+            // the same immediate sampler on every path
+            let h = immediate(self, distinct[0]);
+            let no = self.s.m.bool(false);
+            return Ok(Some((h, h, no)));
+        }
+        // the second sampler: the one immediate sampler with a heap one, else the second
+        let second = if loaded { distinct[0] } else { distinct[1] };
+        let p = self.x.p;
+        let block = *block;
+        let (mut index_in, mut on_in) = (Vec::new(), Vec::new());
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let (index, on) = match arg {
+                Source::Loaded { load, first } => {
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let index = self.heap_index(*load, *first, true);
+                    self.cur = here;
+                    (index?, self.s.m.bool(false))
+                }
+                Source::Constant(w) => (self.s.m.i32(0), self.s.m.bool(w[..4] == second[..])),
+                _ => return Err(WHY),
+            };
+            index_in.push((index, at));
+            on_in.push((on, at));
+        }
+        let join = self.block[block].ok_or(WHY)?;
+        let on = self.s.m.phi(join, self.s.t.i1);
+        self.s.m.set_phi(on, on_in);
+        let first = if loaded {
+            let index = self.s.m.phi(join, self.s.t.i32);
+            self.s.m.set_phi(index, index_in);
+            self.s.heap_handle(self.cur, index, true, false, props)
+        } else {
+            immediate(self, distinct[0])
+        };
+        let second = immediate(self, second);
+        Ok(Some((first, second, on)))
+    }
     fn descriptor_phi(
         &mut self,
         block: usize,
@@ -6381,7 +6614,7 @@ impl<'a> Lower<'a> {
             if self.block[q].is_none() {
                 continue;
             }
-            let tail = self.tail[q].ok_or(WHY)?;
+            let tail = self.tail[q].ok_or("a descriptor chosen by control flow (a loop's edge)")?;
             let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
             let index = match arg {
                 Source::Loaded { load, first } => {
@@ -6393,6 +6626,23 @@ impl<'a> Lower<'a> {
                 Source::Phi { block: inner, args: inner_args } if depth > 0 => {
                     self.descriptor_phi(*inner, inner_args, sampler, depth - 1)?
                 }
+                Source::Phi { .. } => return Err("a descriptor chosen by control flow (joins too deep)"),
+                // Open Vice: a path that leaves the descriptor all zeros (no resource: the
+                // console reads zeros through it) picks the host heap's null slot, which
+                // every view index past the heap is clamped to.
+                Source::Constant(words)
+                    if !sampler && words.iter().all(|&w| w == 0) && super::shader::view_heap_limit() != 0 =>
+                {
+                    self.s.m.i32(super::shader::view_heap_limit())
+                }
+                Source::Constant(words) => {
+                    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                        eprintln!("DESC-CONST sampler={sampler} words={words:08x?} limit={}", super::shader::view_heap_limit());
+                    }
+                    return Err("a descriptor chosen by control flow (a constant one)");
+                }
+                Source::Built { .. } => return Err("a descriptor chosen by control flow (a built one)"),
+                Source::Select { .. } => return Err("a descriptor chosen by control flow (a selected one)"),
                 _ => return Err(WHY),
             };
             incoming.push((index, at));
@@ -7523,10 +7773,10 @@ impl<'a> Lower<'a> {
                     self.s.m.store(self.cur, ptr, a);
                     self.end_guarded(at, &[]);
                     let c2 = self.cur;
-                    self.group_sync(c2);
+                    let c2 = self.meet(c2);
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    self.group_sync(c2);
+                    self.meet(c2);
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
@@ -7610,7 +7860,10 @@ impl<'a> Lower<'a> {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
                         let (lo_has, hi_has) = self.exchange_halves(c, has);
+                        // (a pair meeting goes on in a block of its own)
+                        let c = self.cur;
                         let (lo, hi) = self.exchange_halves(c, mine);
+                        let c = self.cur;
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
                         let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
@@ -9662,6 +9915,8 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(self.s.t.i32);
         // A gather at a named level, done as four texel reads (below).
         let mut gathered: Option<[V; 4]> = None;
+        // A sample made with two samplers: each channel picked by path ([`Self::sampler_paths`]).
+        let mut gathered_dual: Option<Vec<V>> = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -9674,7 +9929,14 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            let sprops = (14 | if cmp { 0x8000 } else { 0 }, 0);
+            // Open Vice: a heap sampler on some paths, one immediate sampler on others: the
+            // sample is made with each and the path's one is kept ([`Self::sampler_paths`]).
+            let dual = self.sampler_paths(ss, sprops)?;
+            let sh = match dual {
+                Some((heap, _, _)) => heap,
+                None => self.handle(site, ss, true, sprops)?,
+            };
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -9780,7 +10042,7 @@ impl<'a> Lower<'a> {
             } else {
                 fu
             };
-            match op {
+            let r0 = match op {
                 // Outside a pixel shader there are no screen derivatives:
                 // the validator refuses `sample` there ("features
                 // incompatible with the shader stage": 730 compute programs,
@@ -10051,6 +10313,26 @@ impl<'a> Lower<'a> {
                         )
                     }
                 }
+            };
+            match dual {
+                None => r0,
+                Some((_, immediate, on_immediate)) => {
+                    // the same operation on the immediate sampler (argument 2: after the
+                    // opcode and the texture), and each lane keeps its path's result
+                    let again = self
+                        .s
+                        .m
+                        .recall_with(c, r0, 2, immediate)
+                        .ok_or("a sample of two samplers in another form")?;
+                    let mut out = Vec::new();
+                    for k in 0..4 {
+                        let a = self.s.m.extract(c, again, k);
+                        let b = self.s.m.extract(c, r0, k);
+                        out.push(self.s.m.select(c, on_immediate, a, b));
+                    }
+                    gathered_dual = Some(out);
+                    r0
+                }
             }
         } else {
             let mut cs = vec![iu; 3];
@@ -10088,9 +10370,10 @@ impl<'a> Lower<'a> {
         };
         let mut xs = Vec::new();
         for ch in channels {
-            let x = match gathered {
-                Some(g) => g[ch as usize],
-                None => self.s.m.extract(c, r, ch),
+            let x = match (gathered, &gathered_dual) {
+                (Some(g), _) => g[ch as usize],
+                (None, Some(d)) => d[ch as usize],
+                (None, None) => self.s.m.extract(c, r, ch),
             };
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to

@@ -226,9 +226,48 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// [`Module::redirect`]: a block cut short and the block its code goes on in.
+    redirects: HashMap<usize, usize>,
 }
 
 impl Module {
+    /// Open Vice: code put into `from` from now on goes into `to` (and into what `to` goes
+    /// on in), and so does its terminator; a phi's value from `from` comes from there. For
+    /// a block a loop was put at the end of (a pair meeting), whose callers may still hold
+    /// it as the current block.
+    pub fn redirect(&mut self, from: usize, to: usize) {
+        if from != to {
+            self.redirects.insert(from, to);
+        }
+    }
+
+    pub fn resolve(&self, mut block: usize) -> usize {
+        while let Some(&to) = self.redirects.get(&block) {
+            block = to;
+        }
+        block
+    }
+
+    /// Moves the terminator of `from` (resolved) to `to`: the phis of its successors that
+    /// came from `from` come from `to` now.
+    pub fn move_term(&mut self, from: usize, to: usize) {
+        let from = self.resolve(from);
+        let Some(t) = self.blocks[from].term.take() else {
+            return;
+        };
+        for &s in successors(Some(t)).iter() {
+            for k in 0..self.blocks[s].phis.len() {
+                let p = self.blocks[s].phis[k] as usize;
+                if let Op::Phi(incoming) = &mut self.insts[p].op {
+                    for edge in incoming.iter_mut().filter(|e| e.1 == from) {
+                        edge.1 = to;
+                    }
+                }
+            }
+        }
+        self.blocks[to].term = Some(t);
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);
@@ -409,6 +448,7 @@ impl Module {
     }
 
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
+        let block = self.resolve(block);
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
@@ -439,6 +479,18 @@ impl Module {
         };
         self.push(block, ty, Op::Extract(agg, index))
     }
+    /// Open Vice: a copy of the call `v` in `block` with argument `index` replaced by `with`
+    /// (the same operation on another handle).
+    pub fn recall_with(&mut self, block: usize, v: V, index: usize, with: V) -> Option<V> {
+        let V::Inst(i) = v else { return None };
+        let (ty, Op::Call(f, args)) = (self.insts[i as usize].ty, &self.insts[i as usize].op) else {
+            return None;
+        };
+        let (f, mut args) = (*f, args.clone());
+        *args.get_mut(index)? = with;
+        Some(self.push(block, ty, Op::Call(f, args)))
+    }
+
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {
             panic!("call of a non-function")
@@ -494,9 +546,11 @@ impl Module {
 
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
+        let incoming = incoming.into_iter().map(|(v, b)| (v, self.resolve(b))).collect();
         self.insts[i as usize].op = Op::Phi(incoming);
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
+        let block = self.resolve(block);
         self.blocks[block].term = Some(t);
     }
 

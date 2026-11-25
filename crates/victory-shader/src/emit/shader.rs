@@ -83,6 +83,8 @@ pub(crate) mod flags {
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    /// Rasterizer ordered views (`SFI0` 0x1000).
+    pub const ROVS: u64 = 1 << 18;
 }
 
 pub(crate) struct Types {
@@ -148,6 +150,10 @@ pub(crate) struct Shader {
     pub samplers: u32,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
+    /// Open Vice: a pixel program of the console's primitive-ordered pixel shading (POPS):
+    /// its heap UAVs are rasterizer ordered views, which keep the order the console's
+    /// overlap wait kept.
+    pub rov: bool,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
@@ -208,6 +214,7 @@ impl Shader {
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
+            rov: false,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
@@ -440,7 +447,14 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        // a UAV (bit 12) of a POPS program: rasterizer ordered (bit 13)
+        let props0 = if self.rov && !sampler && props.0 & 0x1000 != 0 {
+            self.flags |= flags::ROVS;
+            props.0 | 0x2000
+        } else {
+            props.0
+        };
+        self.annotate(block, h, props0, props.1)
     }
 
     /// The finished container.
@@ -460,6 +474,7 @@ impl Shader {
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),
+                (flags::ROVS, used.heap_views),
                 (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
             ] {
                 if !used {
@@ -792,6 +807,9 @@ impl Shader {
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
+        }
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;

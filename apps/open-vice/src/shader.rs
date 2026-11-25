@@ -74,6 +74,15 @@ struct Totals {
 pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
+    // `VICTORY_ONLY=<file>`: only the containers whose 16-digit hashes the file names.
+    let only: Option<std::collections::HashSet<String>> = std::env::var_os("VICTORY_ONLY").map(|f| {
+        std::fs::read_to_string(f)
+            .unwrap_or_default()
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .filter(|w| w.len() == 16)
+            .map(str::to_ascii_lowercase)
+            .collect()
+    });
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -96,6 +105,11 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     eprintln!("corrupt record {}{}", path.display(), source.label());
                     continue;
                 };
+                if let Some(only) = &only
+                    && !only.contains(&blake3::hash(&bytes).to_hex()[..16])
+                {
+                    continue;
+                }
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };

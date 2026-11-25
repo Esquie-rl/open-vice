@@ -598,10 +598,20 @@ fn widen(
         offset: 0,
         what: "wave-wide branches in a thread group of several console waves",
     };
+    // Open Vice: a group of several whole console waves, whose two halves of each meet pair
+    // by pair instead of at group barriers (`lower::with_pair_meetings`).
+    let mut pairs = false;
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs)
+            if (WAVE_WIDE.with(std::cell::Cell::get)
+                || std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1"))
+                && cs.threads.iter().product::<u32>().is_multiple_of(64) =>
+        {
+            pairs = true;
+        }
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -611,12 +621,25 @@ fn widen(
         _ => return Err(NOT),
     }
     let mut wide = std::collections::HashSet::new();
+    // Open Vice: descriptors are traced over the lanes' own paths. Which values a lane holds
+    // does not change when the wave takes a branch together, but the wide structure no
+    // longer shows a branch that skips code when no lane is left for it, which tracing
+    // needs (`alphaResolve:CS_AlphTransmissionPrefilterMip`: "a descriptor neither loaded
+    // nor built" in the wide form only).
+    let lanes = structure::structure(p).ok();
     loop {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;
-        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        let res = match lanes.as_ref().map(|l| resource::track(p, &native.layout, native.stage, Some(l))) {
+            Some(Ok(res)) => res,
+            _ => resource::track(p, &native.layout, native.stage, Some(&st))?,
+        };
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let r = if pairs {
+            lower::with_pair_meetings(|| emit_program(c, native, p, &st, &io, &res))
+        } else {
+            emit_program(c, native, p, &st, &io, &res)
+        };
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
