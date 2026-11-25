@@ -5510,7 +5510,33 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let steps = &self.deferred().copies;
+        let mut skip_to = 0;
+        for (at, step) in steps.iter().enumerate() {
+            if at < skip_to {
+                continue;
+            }
+            // Open Vice: a run of texture steps is brought up to date on
+            // several threads (each detiles into its own staging buffer
+            // through a per-thread read buffer). At the start of the opening
+            // cutscene textures took 2.5 to 9.8 s a frame one after another
+            // (some 70 MB/s), and the title showed its lowest-detail models
+            // and textures for many seconds. `VICTORY_TEXTURE_THREADS=1`
+            // keeps them sequential.
+            if matches!(step, Step::Texture(_)) {
+                let run: Vec<&std::sync::Arc<crate::texture::Staging>> = steps[at..]
+                    .iter()
+                    .map_while(|s| match s {
+                        Step::Texture(staging) => Some(staging),
+                        _ => None,
+                    })
+                    .collect();
+                skip_to = at + run.len();
+                let due: Vec<&std::sync::Arc<crate::texture::Staging>> =
+                    run.into_iter().filter(|s| batch.texture_due(s)).collect();
+                refresh_textures(&due);
+                continue;
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -6951,4 +6977,32 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
     }
+}
+
+/// Brings textures' staging buffers up to date, on several threads when
+/// there are several (Open Vice; `VICTORY_TEXTURE_THREADS`, default: the
+/// logical processors, at most 16).
+fn refresh_textures(due: &[&std::sync::Arc<crate::texture::Staging>]) {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let threads = *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get().min(16)))
+            .max(1)
+    });
+    if due.len() < 2 || threads == 1 {
+        due.iter().for_each(|s| s.refresh());
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(due.len()) {
+            scope.spawn(|| {
+                while let Some(s) = due.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    s.refresh();
+                }
+            });
+        }
+    });
 }
