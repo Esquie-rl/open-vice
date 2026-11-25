@@ -361,12 +361,8 @@ fn record_clamp_as(
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
     // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
-    // The transition out of UAV orders the scratch writes before indirect
-    // reads. A second global UAV barrier would also wait for unrelated
-    // resources. The private budget is ordered by the next clamp's first
-    // barrier; no title shader can access it.
-    // Diagnostics: `VICTORY_BARRIER_TEST=indirect` omits the first global
-    // wait (the scratch transitions stay).
+    // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
+    // waits for every earlier shader write out (the state changes stay).
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
@@ -381,11 +377,14 @@ fn record_clamp_as(
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         ),
     ];
-    let second = [transition(
-        dst,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-    )];
+    let second = [
+        uav_barrier(),
+        transition(
+            dst,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        ),
+    ];
     let skip = usize::from(!waits);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
@@ -400,7 +399,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second);
+        l.ResourceBarrier(&second[skip..]);
     }
     true
 }

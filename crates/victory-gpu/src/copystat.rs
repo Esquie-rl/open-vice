@@ -122,7 +122,8 @@ pub(crate) enum C {
     NothingBackUs,
     /// Waits for every earlier shader write recorded into host lists: for
     /// the title's barrier groups, for its barriers on buffers, and the
-    /// indirect clamp passes (each a dispatch preceded by one such wait).
+    /// indirect commands bounded (each a dispatch of ours between two such
+    /// waits).
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
@@ -132,9 +133,6 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
-    /// Host ExecuteIndirect calls, and title calls merged into earlier ones.
-    IndirectExecuted,
-    IndirectMerged,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1280,13 +1278,11 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
-         for its barriers on buffers; {:.0} indirect clamp passes (one such wait each), \
-         {:.0} ExecuteIndirect calls, {:.0} calls merged; barrier experiment {}",
+         for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
+         such waits each); barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
-        c[C::IndirectExecuted as usize],
-        c[C::IndirectMerged as usize],
         barrier_test()
     );
     // What is compared after submissions, largest first, and how much of
