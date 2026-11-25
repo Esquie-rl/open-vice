@@ -589,6 +589,10 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
             _ => StageIo::None,
         };
+        let mut code = code.to_vec();
+        if stage == HwStage::Gs {
+            gs_whole_exec(&mut code);
+        }
         out.push(NativeProgram {
             stage,
             wave64: u32_at(record, RECORD_FLAGS)? & FLAG_WAVE32 == 0,
@@ -596,10 +600,46 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             layout,
             used,
             io,
-            code: code.to_vec(),
+            code,
         });
     }
     Ok(out)
+}
+
+/// A legacy geometry program's prologue sets EXEC to its lanes of GS work,
+/// s3 bits 8-15: `s_bfm_b64 exec, sN, 0`, then `s_cselect_b64 exec, -1,
+/// exec` when they are 64. The host's geometry stage gives 64
+/// (`io::GS_ENTRY`: one invocation is one lane), so EXEC stays whole: both
+/// become `s_nop 0`, before the first branch, and the lanes' structure sees
+/// the whole EXEC they leave.
+fn gs_whole_exec(code: &mut [u8]) {
+    const S_NOP: u32 = 0xBF80_0000;
+    let Ok(insts) = crate::gfx10::decode(code) else {
+        return;
+    };
+    let mut bfm = None;
+    for i in insts.iter().take(24) {
+        let at = i.offset;
+        let name = i.name().unwrap_or("");
+        if name.starts_with("s_cbranch") || name == "s_branch" || name == "s_setpc_b64" {
+            return;
+        }
+        match i.words[..] {
+            // s_bfm_b64 exec, sN, 0
+            [w] if name == "s_bfm_b64" && w & 0xFFFF_FF00 == 0x92FE_8000 && w & 0xFF < 106 => {
+                bfm = Some(at);
+            }
+            // s_cselect_b64 exec, -1, exec
+            [0x85FE_7EC1] if name == "s_cselect_b64" => {
+                if let Some(b) = bfm {
+                    code[b..b + 4].copy_from_slice(&S_NOP.to_le_bytes());
+                    code[at..at + 4].copy_from_slice(&S_NOP.to_le_bytes());
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The entries of `size` bytes from `at`, with their count at `count_at`.

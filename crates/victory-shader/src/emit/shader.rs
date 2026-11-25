@@ -699,6 +699,10 @@ impl Shader {
             container::same_mode_per_row(&mut self.inputs, true);
         } else {
             container::same_mode_per_row(&mut self.outputs, false);
+            if self.geometry.is_some() {
+                // (its inputs as its vertex stage's outputs)
+                container::same_mode_per_row(&mut self.inputs, false);
+            }
         }
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());

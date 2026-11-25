@@ -350,10 +350,10 @@ impl HostPipeline {
         if compute.is_none()
             && shaders
                 .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh" | "geometry"))
         {
             return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
+                "only vertex, mesh, geometry, pixel and compute stages are translated",
                 shaders,
             );
         }
@@ -368,6 +368,11 @@ impl HostPipeline {
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            // The title's legacy geometry stage (`victory_shader::emit`'s
+            // `GsState`), after the others: `code` finds the stages by name.
+            if mesh.is_none() {
+                stages.extend(find("geometry").map(|gs| (gs, D3D12_SHADER_VISIBILITY_GEOMETRY)));
+            }
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -614,8 +619,15 @@ impl HostPipeline {
         // that completes each one from the three vertices the vertex
         // shader made. Without it (refused here or by the host) the draws
         // fall back on what `draw` does for rectangles.
+        let ps_at = stages.iter().position(|(s, _)| s.stage == "pixel").unwrap_or(usize::MAX);
+        // The title's own geometry stage, translated.
+        let title_gs = stages
+            .iter()
+            .position(|(s, _)| s.stage == "geometry")
+            .and_then(|i| stages[i].0.translated())
+            .map(|t| t.host.dxil.clone());
         let mut rect_gs = None;
-        if g.topology.0 == RECTANGLES {
+        if g.topology.0 == RECTANGLES && title_gs.is_none() {
             let ps = stages.get(1).and_then(|(s, _)| s.translated());
             let vs = &stages[0].0.translated()?.host.dxil;
             match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
@@ -627,8 +639,8 @@ impl HostPipeline {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
-            PS: code(1),
-            GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+            PS: code(ps_at),
+            GS: title_gs.as_ref().or(rect_gs.as_ref()).map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
                 D3D12_SHADER_BYTECODE {
                     pShaderBytecode: gs.as_ptr().cast(),
                     BytecodeLength: gs.len(),
@@ -657,17 +669,23 @@ impl HostPipeline {
         };
         // A pipeline with the geometry stage has a name of its own in the
         // library; the others keep theirs.
-        let name = |gs: Option<&Vec<u8>>| match gs {
-            Some(gs) => super::library::name(
-                "graphics rectangles",
+        let name = |gs: Option<&Vec<u8>>| match (gs, &title_gs) {
+            (_, Some(gs)) => super::library::name(
+                "graphics geometry",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                &[&code_bytes(&code(0)), &code_bytes(&code(ps_at)), &gs[..]],
                 &state,
             ),
-            None => super::library::name(
+            (Some(gs), None) => super::library::name(
+                "graphics rectangles",
+                &root_blob,
+                &[&code_bytes(&code(0)), &code_bytes(&code(ps_at)), &gs[..]],
+                &state,
+            ),
+            (None, None) => super::library::name(
                 "graphics",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&code(0)), &code_bytes(&code(ps_at))],
                 &state,
             ),
         };

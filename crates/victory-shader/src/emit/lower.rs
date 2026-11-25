@@ -111,6 +111,36 @@ const POPS_EXITING_WAVE_ID: u8 = 239;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
 
+/// `s_sendmsg` ids of a legacy geometry stage: MSG_GS (operation in bits
+/// 4-5: 1 cut, 2 emit, 3 emit and cut; stream in bits 8-9) and MSG_GS_DONE.
+const MSG_GS: u16 = 2;
+const MSG_GS_DONE: u16 = 3;
+
+/// A legacy (merged ES/GS) geometry program on the host's geometry stage
+/// (after Leonida, ubiquitarianism/leonida `rdna2spirv.py`, GPL-3.0):
+/// * its LDS reads are the ES-GS ring, where the host's input vertex i sits
+///   at dword 64·i (`io::GS_ENTRY`): a read at byte address A + offset is
+///   vertex (A + offset) >> 8, dword (offset / 4) mod 64 = 4·r + c of input
+///   register r, component c, which the vertex stage's output signature
+///   gives the same register as this program's input signature;
+/// * its LDS writes are the lane's own area of the GS-VS ring, all at one
+///   address: emitted vertex k is dwords 4·nreg·k.. of it, dword 4·r + c of
+///   output register r (`nreg` registers), so they are staged by offset;
+/// * `MSG_GS EMIT` stores staged vertex <emitted so far> to the outputs and
+///   emits it, `CUT` ends the strip, `MSG_GS_DONE` does nothing.
+#[derive(Clone, Copy)]
+struct GsState {
+    nreg: u32,
+    max_vertices: u32,
+    /// i32 [max_vertices · nreg · 4]: the staged vertices.
+    staged: V,
+    /// i32: vertices emitted so far.
+    emitted: V,
+}
+
+/// Input vertices of the host geometry stage's primitive (triangles).
+const GS_INPUT_VERTICES: u32 = 3;
+
 /// The f16 bits of inline float constant `c` (240..=248: 0.5, -0.5, 1.0,
 /// -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2 pi)).
 fn inline_f16(c: u8) -> u32 {
@@ -272,6 +302,8 @@ struct Lower<'a> {
     /// [`with_pair_meetings`]: the first of the meeting counters (two per console wave, one
     /// per half), zeroed in the entry block before its group barrier.
     pair_meet: Option<u32>,
+    /// A legacy geometry program ([`GsState`]).
+    gs: Option<GsState>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1470,6 +1502,40 @@ impl<'a> Lower<'a> {
             HashSet::new()
         };
         let mut no_barrier = HashSet::new();
+        // A legacy geometry program: as many vertices as it has emits
+        // (each runs at most once: no loop), the GS-VS ring vertex from the
+        // output signature (`GsState`).
+        let mut gs = None;
+        if x.native.stage == HwStage::Gs {
+            let emits = insts()
+                .filter(|i| i.name() == "s_sendmsg")
+                .filter(|i| matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == MSG_GS && imm >> 4 & 2 != 0))
+                .count() as u32;
+            let order = crate::ir::reverse_postorder(&p.blocks);
+            let mut place = vec![usize::MAX; p.blocks.len()];
+            for (n, &b) in order.iter().enumerate() {
+                place[b] = n;
+            }
+            let looped = p.blocks.iter().enumerate().any(|(b, blk)| {
+                blk.exit.successors().into_iter().any(|t| place[t] != usize::MAX && place[t] <= place[b])
+            });
+            let nreg = x.outputs.iter().filter_map(|e| e.row).max().map_or(0, |r| r + 1);
+            if !looped && (1..=256).contains(&emits) && nreg > 0 && emits * nreg * 4 <= 1024 {
+                let i32t = s.t.i32;
+                let arr = s.m.array(emits * nreg * 4, i32t);
+                let staged = s.m.private_global("gs_staged", arr);
+                let emitted = s.m.private_global("gs_emitted", i32t);
+                let zero = s.m.i32(0);
+                s.m.store(s.entry, emitted, zero);
+                s.geometry = Some(super::shader::Geometry { max_vertices: emits });
+                gs = Some(GsState {
+                    nreg,
+                    max_vertices: emits,
+                    staged,
+                    emitted,
+                });
+            }
+        }
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -1592,6 +1658,7 @@ impl<'a> Lower<'a> {
             halves,
             wave_base: None,
             pair_meet,
+            gs,
             flat: None,
             no_barrier,
             fence_only,
@@ -2387,6 +2454,10 @@ impl<'a> Lower<'a> {
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
                     // (POPS: see above)
                     None if pops => Val::I32(self.s.m.i32(0)),
+                    // A legacy geometry stage's other system SGPRs (the
+                    // GS-VS ring's wave offset, the ring descriptors' table)
+                    // place the console's rings, which the host's are not.
+                    None if self.gs.is_some() => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -2428,6 +2499,7 @@ impl<'a> Lower<'a> {
                 let n = self.s.m.i32(self.x.mesh_stride);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Mul, g, n));
             }
+            Input::Fixed(n) => return Val::I32(self.s.m.i32(n)),
             Input::MergedWaveInfo => {
                 // shortcut: only the wave index (bits 24-27) is set; the
                 // console's other bits (lane counts) are read by no program.
@@ -4493,6 +4565,175 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
+    /// A legacy geometry program's LDS access: the ES-GS ring's input
+    /// vertices or the lane's GS-VS ring area ([`GsState`]).
+    #[allow(clippy::too_many_arguments)]
+    fn gs_ds(
+        &mut self,
+        gs: GsState,
+        inst: &Inst,
+        guard: Option<V>,
+        addr: Option<&Operand>,
+        data: &[Operand],
+        dst_reg: Option<u8>,
+        offset: u32,
+    ) -> Result<(), Why> {
+        let name = inst.name();
+        let Fields::Ds { offset0, offset1, .. } = inst.fields else {
+            unreachable!()
+        };
+        let width = match name.rsplit('_').next() {
+            Some("b64") => 2,
+            Some("b96") => 3,
+            Some("b128") => 4,
+            Some("b32") => 1,
+            _ => return Err("a geometry ring access of bytes or halves"),
+        };
+        // (byte offset, dwords) per element; read2/write2 scale their two
+        // offsets by the element size (×64 for st64).
+        let elements: Vec<(u32, u32)> = if name.starts_with("ds_read2") || name.starts_with("ds_write2") {
+            let scale = 4 * width * if name.contains("st64") { 64 } else { 1 };
+            vec![(u32::from(offset0) * scale, width), (u32::from(offset1) * scale, width)]
+        } else if name.starts_with("ds_read_") || name.starts_with("ds_write_") {
+            vec![(offset, width)]
+        } else {
+            return Err("a geometry ring access other than a read or a write");
+        };
+        let c = self.cur;
+        if name.starts_with("ds_read") {
+            let a = self.vgprs(inst, addr.ok_or("an LDS address")?, 1)?[0];
+            let reg = dst_reg.ok_or("an LDS read result")?;
+            let mut n = 0;
+            for (off, w) in elements {
+                for k in 0..w {
+                    let bytes = off + 4 * k;
+                    // The vertex from the address, the register and
+                    // component from the offset.
+                    let o = self.s.m.i32(bytes);
+                    let at = self.s.m.bin(c, Bin::Add, a, o);
+                    let k8 = self.s.m.i32(8);
+                    let vertex = self.s.m.bin(c, Bin::LShr, at, k8);
+                    let dword = (bytes / 4) % crate::io::GS_VERTEX_DWORDS;
+                    let x = match self.find_input((dword / 4) as u8, (dword % 4) as u8) {
+                        Some((id, col)) if !self.s.inputs[id].half => {
+                            let mut x = self.gs_input(id, col, 0);
+                            for v in 1..GS_INPUT_VERTICES {
+                                let at_v = self.gs_input(id, col, v);
+                                let kv = self.s.m.i32(v);
+                                let here = self.s.m.cmp(c, pred::EQ, vertex, kv);
+                                x = self.s.m.select(c, here, at_v, x);
+                            }
+                            x
+                        }
+                        Some(_) => return Err("a 16-bit geometry input"),
+                        // What the vertex stage does not write.
+                        None => self.s.m.i32(0),
+                    };
+                    self.write(inst, Reg::V(reg + n), x, guard);
+                    n += 1;
+                }
+            }
+            return Ok(());
+        }
+        let size = gs.max_vertices * gs.nreg * 4;
+        let mut stores = Vec::new();
+        for (e, (off, w)) in elements.into_iter().enumerate() {
+            let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
+            for (k, x) in vals.into_iter().enumerate() {
+                let dword = off / 4 + k as u32;
+                if dword >= size {
+                    return Err("a GS-VS ring write past the vertices the program emits");
+                }
+                stores.push((dword, x));
+            }
+        }
+        let at = self.begin_guarded(guard);
+        for (dword, x) in stores {
+            let index = self.s.m.i32(dword);
+            let p = self.s.m.element(self.cur, gs.staged, index);
+            self.s.m.store(self.cur, p, x);
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// Input `id`, column `col`, of input vertex `vertex` (as bits).
+    fn gs_input(&mut self, id: usize, col: u8, vertex: u32) -> V {
+        let e = &mut self.s.inputs[id];
+        e.usage |= 1 << col;
+        let float = e.comp == 9;
+        let (name, ty) = if float {
+            ("loadInput.f32", self.s.t.f32)
+        } else {
+            ("loadInput.i32", self.s.t.i32)
+        };
+        let args = [
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            self.s.m.i32(vertex),
+        ];
+        let entry = self.s.entry;
+        let x = self.s.op(entry, name, Attr::ReadNone, ty, 4, &args);
+        if float { self.as_int(x) } else { x }
+    }
+
+    /// A legacy geometry program's `s_sendmsg` ([`GsState`]).
+    fn gs_message(&mut self, gs: GsState, imm: u16, b: usize, i: usize) -> Result<(), Why> {
+        let (id, op, stream) = (imm & 0xF, imm >> 4 & 3, imm >> 8 & 3);
+        if id == MSG_GS_DONE || id == MSG_GS && op == 0 {
+            return Ok(());
+        }
+        if id != MSG_GS {
+            return Ok(());
+        }
+        if stream != 0 {
+            return Err("a geometry stream other than the first");
+        }
+        let guard = self.guard(b, i)?;
+        let at = self.begin_guarded(guard);
+        let stream = self.s.m.i8(0);
+        let void = self.s.t.void;
+        if op & 2 != 0 {
+            let c = self.cur;
+            let k = self.s.m.load(c, gs.emitted);
+            let stride = self.s.m.i32(4 * gs.nreg);
+            let base = self.s.m.bin(c, Bin::Mul, k, stride);
+            for id in 0..self.s.outputs.len() {
+                let Some(row) = self.s.outputs[id].row else {
+                    continue;
+                };
+                let (col0, cols, comp) = {
+                    let e = &self.s.outputs[id];
+                    (e.col, e.cols, e.comp)
+                };
+                for col in 0..cols {
+                    let d = self.s.m.i32(4 * row + u32::from(col0 + col));
+                    let index = self.s.m.bin(c, Bin::Add, base, d);
+                    let p = self.s.m.element(c, gs.staged, index);
+                    let x = self.s.m.load(c, p);
+                    let (name, x) = if comp == 9 {
+                        ("storeOutput.f32", self.as_float(x))
+                    } else {
+                        ("storeOutput.i32", x)
+                    };
+                    let args = [self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(col), x];
+                    self.s.op(c, name, Attr::NoUnwind, void, 5, &args);
+                    self.s.outputs[id].usage |= 1 << col;
+                }
+            }
+            self.s.op(c, "emitStream", Attr::NoUnwind, void, 97, &[stream]);
+            let one = self.s.m.i32(1);
+            let next = self.s.m.bin(c, Bin::Add, k, one);
+            self.s.m.store(c, gs.emitted, next);
+        }
+        if op & 1 != 0 {
+            self.s.op(self.cur, "cutStream", Attr::NoUnwind, void, 98, &[stream]);
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
     /// LDS (thread-group shared memory) and `ds_swizzle`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Ds {
@@ -4594,6 +4835,9 @@ impl<'a> Lower<'a> {
             let reg = dst_reg.ok_or("a permute result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
+        }
+        if let Some(gs) = self.gs {
+            return self.gs_ds(gs, inst, guard, addr.as_ref(), data, dst_reg, offset);
         }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
@@ -4953,6 +5197,10 @@ impl<'a> Lower<'a> {
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
             }
+            Fields::Sopp { imm } if name == "s_sendmsg" && self.gs.is_some() => match self.gs {
+                Some(gs) => self.gs_message(gs, *imm, b, i),
+                None => Ok(()),
+            },
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
@@ -5597,6 +5845,26 @@ impl<'a> Lower<'a> {
         }
         if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
             return self.memory_smem(inst);
+        }
+        if self.scalar.get(&site).is_some_and(|a| a.param == crate::resource::DRIVER) {
+            // The driver's table of a legacy geometry stage: the rings'
+            // places, which the host's rings do not need.
+            let count = match name.strip_prefix("s_load_dword") {
+                Some("") => 1u8,
+                Some("x2") => 2,
+                Some("x4") => 4,
+                Some("x8") => 8,
+                Some("x16") => 16,
+                _ => return Err("a scalar access to the driver's table"),
+            };
+            let Some(Operand::Scalar { code, .. }) = *data else {
+                return Err("a scalar access to the driver's table");
+            };
+            let zero = self.s.m.i32(0);
+            for k in 0..count {
+                self.write(inst, Reg::S(code + k), zero, None);
+            }
+            return Ok(());
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);

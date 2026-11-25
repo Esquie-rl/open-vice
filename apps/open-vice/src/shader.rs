@@ -136,6 +136,16 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         *t.unnamed.entry(key).or_default() += 1;
                                     }
                                     if disasm {
+                                        for cc in [FourCC::ISG1, FourCC::OSG1, FourCC::PSG1] {
+                                            let elems = container
+                                                .part(cc)
+                                                .map(|p| victory_shader::emit::signature_lines(p.data));
+                                            if let Some(Ok(elems)) = elems {
+                                                listing.extend(
+                                                    elems.iter().map(|e| format!("    {cc:?} {e}")),
+                                                );
+                                            }
+                                        }
                                         listing
                                             .extend(n.layout.iter().map(|p| format!("    {p:?}")));
                                         listing.extend(n.used.iter().map(|u| format!("    {u:?}")));

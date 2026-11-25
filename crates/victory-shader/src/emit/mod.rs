@@ -364,12 +364,12 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
             )
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, pixel, compute, mesh or geometry program",
         })?;
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
@@ -687,8 +687,16 @@ fn emit_program(
     let mut outputs = sig(FourCC::OSG1)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
-    let interpolated = if pixel { &mut inputs } else { &mut outputs };
-    for e in interpolated {
+    // A geometry program's inputs carry its vertex stage's output modes.
+    let geometry = native.stage == HwStage::Gs;
+    let mut interpolated: Vec<&mut container::SigElement> = if pixel {
+        inputs.iter_mut().collect()
+    } else if geometry {
+        inputs.iter_mut().chain(outputs.iter_mut()).collect()
+    } else {
+        outputs.iter_mut().collect()
+    };
+    for e in interpolated.iter_mut() {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
@@ -768,6 +776,19 @@ fn emit_program(
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// The rows of an `ISG1`/`OSG1` part, one line each (for listings).
+pub fn signature_lines(part: &[u8]) -> Result<Vec<String>, ShaderError> {
+    Ok(signature(part)?
+        .iter()
+        .map(|e| {
+            format!(
+                "{}{} kind {} comp {} row {:?} col {} cols {} usage {:#x}",
+                e.name, e.index, e.kind, e.comp, e.row, e.col, e.cols, e.usage
+            )
+        })
+        .collect())
 }
 
 /// The rows of an `ISG1`/`OSG1` part.

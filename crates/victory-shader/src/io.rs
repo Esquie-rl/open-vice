@@ -70,7 +70,25 @@ pub enum Input {
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
     MergedWaveInfo,
+    /// Legacy geometry stage: a system register the host's geometry stage
+    /// sets to this value (see [`GS_ENTRY`]).
+    Fixed(u32),
 }
+
+/// What a legacy (merged ES/GS) geometry program finds on entry on the
+/// host: one primitive per invocation, its input vertex i at dword 64·i of
+/// the ES-GS ring (v0 = offsets of vertices 0 and 1, v1 = of vertex 2), and
+/// 64 lanes of GS work in s3 bits 8-15 (the prologue's `s_bfm`/`s_cselect`
+/// then leave EXEC whole; bits 16-23, the ES-GS ring's wave offset, 0).
+pub const GS_ENTRY: [(Reg, u32); 3] = [
+    (Reg::V(0), GS_VERTEX_DWORDS << 16),
+    (Reg::V(1), 2 * GS_VERTEX_DWORDS),
+    (Reg::S(3), 64 << 8),
+];
+
+/// Dwords of one input vertex in the host's ES-GS ring: the dword of
+/// input register r, component c, is 4·r + c, as the ES writes it.
+pub const GS_VERTEX_DWORDS: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Barycentric {
@@ -301,6 +319,15 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 (Reg::S(3), Input::MergedWaveInfo),
             ];
             (loaded, &[][..], &ms.outputs[..])
+        }
+        // Legacy geometry: the vertex offsets and lane count the host sets
+        // (`GS_ENTRY`); v2 is the primitive id. Outputs go through the
+        // GS-VS ring (`emit::lower`), not exports.
+        (_, HwStage::Gs) => {
+            let mut loaded: Vec<(Reg, Input)> =
+                GS_ENTRY.iter().map(|&(r, v)| (r, Input::Fixed(v))).collect();
+            loaded.push((Reg::V(2), Input::PrimitiveId));
+            (loaded, &[][..], &[][..])
         }
         _ => return Err(unsupported(0, "I/O of this stage")),
     };

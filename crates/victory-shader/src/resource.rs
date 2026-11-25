@@ -46,6 +46,12 @@ pub const CODE: usize = usize::MAX;
 /// 64-bit address from the instruction's operands.
 pub const MEMORY: usize = usize::MAX - 1;
 
+/// [`Address::param`] of the console driver's own table behind user data
+/// 0 and 1 of a legacy geometry stage, where its code finds the ring's
+/// place in LDS. The rings are not memory on the host (see
+/// `emit::lower`'s geometry stage), so the loads read zeros.
+pub const DRIVER: usize = usize::MAX - 2;
+
 /// The reasons an address traces to no root parameter for which the
 /// address is then taken as it stands ([`MEMORY`]).
 const RAW: [&str; 5] = [
@@ -879,6 +885,12 @@ impl<'a> Tracer<'a> {
         if self.stage == HwStage::Cs && RAW.contains(&why) {
             Ok(Address {
                 param: MEMORY,
+                offset: 0,
+                dynamic: None,
+            })
+        } else if self.stage == HwStage::Gs && why == RAW[2] {
+            Ok(Address {
+                param: DRIVER,
                 offset: 0,
                 dynamic: None,
             })
