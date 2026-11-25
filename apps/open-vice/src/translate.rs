@@ -489,7 +489,7 @@ fn check(
                 // `VICTORY_SUMMARY`: with the module's threads, wave size
                 // and operations.
                 if std::env::var_os("VICTORY_SUMMARY").is_some() {
-                    t.lines.push(format!("{}  validated [{}]", label(), emit::last_module_summary()));
+                    t.lines.push(format!("{}  validated [{}; stride table {}, root uavs {:?}, address map {}]", label(), emit::last_module_summary(), shader.stride_table, shader.root_uavs, shader.address_map));
                 } else {
                     t.lines.push(format!("{}  validated", label()));
                 }
