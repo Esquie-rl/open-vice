@@ -79,6 +79,8 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Open Vice: the frame its memory was last found changed (0: never).
+    changed: u64,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -943,20 +945,23 @@ impl Staging {
         // write to the same pages through another view) is still found by
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
-        // Open Vice: off by default (`VICTORY_TEXTURE_GUARD=1` turns it on):
-        // the opening logos' and videos' textures change through writes the
-        // guard misses, and showed an older frame between newer ones (23
-        // one-frame flickers in a minute on an RTX 4080 Laptop, none with
-        // the hash at every check, as before).
+        // Open Vice: textures found changed lately are hashed at every check
+        // (below): the opening logos' and videos' textures change through
+        // writes the guard misses, and showed an older frame between newer
+        // ones. `VICTORY_TEXTURE_GUARD=0` hashes every texture at every check.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_some_and(|v| v == "1"))
+        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            // Open Vice: a texture found changed in the last 30 frames (a
+            // video, the opening logos) is hashed at every check: the guard
+            // misses some of its writes, and it flickered between frames.
+            let hot = last.changed != 0 && crate::frame::current() < last.changed + 30;
+            if unwritten && !turn && !hot {
                 return 0;
             }
         }
@@ -999,6 +1004,7 @@ impl Staging {
                     return false;
                 }
                 last.hash = Some(hash);
+                last.changed = crate::frame::current();
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -1021,6 +1027,7 @@ impl Staging {
                     return size;
                 }
                 last.hash = Some(hash);
+                last.changed = crate::frame::current();
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1037,6 +1044,7 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
+                last.changed = crate::frame::current();
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1058,6 +1066,7 @@ impl Staging {
             let hash = blake3::hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
+                last.changed = crate::frame::current();
                 self.detile(read);
             }
             true
