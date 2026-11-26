@@ -1150,7 +1150,6 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1162,10 +1161,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1202,7 +1198,9 @@ mod host {
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
+    /// Open Vice: in every build, not only with `diagnostics` (both are off unless their
+    /// variables are set): a plain release build ignored them, and test runs sat at the
+    /// start screen.
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
@@ -1231,10 +1229,33 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        // `VICTORY_KEYS_AUTO=<seconds>:Enter`: that key every that many seconds, with or without
+        // focus, until the world is drawn (`victory_gpu::world_seen`): the start screen and the
+        // menus pass however long the start takes, and a cutscene is not skipped.
+        static AUTO: LazyLock<Option<(Duration, u8)>> = LazyLock::new(|| {
+            let v = std::env::var("VICTORY_KEYS_AUTO").ok()?;
+            let (every, key) = v.split_once(':')?;
+            let vk = match key.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+                _ => return None,
+            };
+            Some((Duration::try_from_secs_f64(every.trim().parse().ok()?).ok()?, vk))
+        });
+        if let Some((every, vk)) = *AUTO
+            && !every.is_zero()
+            && !victory_gpu::world_seen()
+            && now.as_millis() % every.as_millis() < 200
+        {
+            down.push(vk);
+        }
+        down
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

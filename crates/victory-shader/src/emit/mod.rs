@@ -88,6 +88,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod link;
 mod lower;
 mod own_bits;
 mod rect;
@@ -111,6 +112,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
+pub use link::{link_mesh, mesh_fits};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -784,8 +786,8 @@ pub fn signature_lines(part: &[u8]) -> Result<Vec<String>, ShaderError> {
         .iter()
         .map(|e| {
             format!(
-                "{}{} kind {} comp {} row {:?} col {} cols {} usage {:#x}",
-                e.name, e.index, e.kind, e.comp, e.row, e.col, e.cols, e.usage
+                "{}{} kind {} comp {} row {:?} col {} cols {} usage {:#x} half {}",
+                e.name, e.index, e.kind, e.comp, e.row, e.col, e.cols, e.usage, e.half
             )
         })
         .collect())

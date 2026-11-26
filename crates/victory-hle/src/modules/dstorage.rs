@@ -1056,10 +1056,19 @@ fn into_destination(
         // beside first, see `execute`), so a block guarded again meanwhile
         // faults into the guard instead of failing the write.
         victory_gpu::kernel_will_write(request.destination as usize, len);
-        // SAFETY: the title's destination holds `destination_size` bytes, at
-        // least `len`, and nothing else writes it until completion.
-        let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        let filled = fill(out).map(drop);
+        // Made beside and written in as the console's copy engine writes,
+        // whatever the CPU's protection of the destination: the title maps
+        // some memory it has filled read-only for its CPU, and the
+        // decompressor writing there in place faulted into no guard of ours
+        // (run w2: the process died three minutes into the world).
+        let mut data = vec![0u8; len];
+        let filled = fill(&mut data).and_then(|n| {
+            if victory_gpu::kernel_write_through(request.destination as usize, &data[..n.min(len)]) {
+                Ok(())
+            } else {
+                Err(E_INVALIDARG)
+            }
+        });
         // Said again now that the bytes are there (upstream's c75fdba holds
         // the blocks open over the read and marks them once more at its
         // end): a copy or a texture pass that took the memory while the

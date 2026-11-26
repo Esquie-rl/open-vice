@@ -782,6 +782,57 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// Our write of `data` into title memory at `at` as the console's copy
+/// engine makes it (DirectStorage's decompressed output): whatever the
+/// CPU's protection of the destination. The title may map memory it has
+/// DirectStorage fill read-only for its CPU; written from our thread the
+/// decompressor faulted there, into no guard of ours, and the process died
+/// (run w2: `zlib_rs::inflate` writing 0x632e00000, read-only, three
+/// minutes into the world). Under the guard lock: our guarded blocks are
+/// opened as for any write of ours, and a protection that does not allow
+/// writing is lifted for the copy and put back. False if a page of it is
+/// not committed memory (nothing is written from there on).
+pub fn write_through(at: usize, data: &[u8]) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_READWRITE, PAGE_WRITECOPY, VirtualProtect, VirtualQuery,
+    };
+    let mut g = guards();
+    open(&mut g, at, at.saturating_add(data.len()));
+    let mut done = 0;
+    while done < data.len() {
+        let here = at + done;
+        // SAFETY: plain data the call fills in.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query of our own address space.
+        if unsafe { VirtualQuery(here as *const _, &mut info, size_of_val(&info)) } == 0 || info.State != MEM_COMMIT {
+            return false;
+        }
+        let end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        let n = end.saturating_sub(here).min(data.len() - done);
+        if n == 0 {
+            return false;
+        }
+        let writable = matches!(
+            info.Protect & 0xFF,
+            PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY
+        );
+        let mut old = 0;
+        // SAFETY: committed pages of the title's, made writable for this copy.
+        if !writable && unsafe { VirtualProtect(here as *const _, n, PAGE_READWRITE, &mut old) } == 0 {
+            return false;
+        }
+        // SAFETY: `n` bytes of committed, writable memory; `data` is ours.
+        unsafe { std::ptr::copy_nonoverlapping(data[done..].as_ptr(), here as *mut u8, n) };
+        if !writable {
+            let mut back = 0;
+            // SAFETY: the protection the title had there.
+            unsafe { VirtualProtect(here as *const _, n, old, &mut back) };
+        }
+        done += n;
+    }
+    true
+}
 /// What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do
 /// not see once its bytes are there ([`title_memory_written`]), as bits:
 /// 1, the guarded blocks under it are opened and count as written (host

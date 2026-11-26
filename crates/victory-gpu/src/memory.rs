@@ -38,7 +38,7 @@
 //! memory module of the layer knows and this one does not ask yet.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
+//! there are at most [`copies_limit`] of them (4 MiB windows mostly: 16 GiB at
 //! most). Every dispatch of such a shader brings all numbered copies up to
 //! date and, if it can store, declares all of them written (the bytes are
 //! compared on the CPU afterwards, as for any unordered access view): a
@@ -56,7 +56,23 @@ use crate::shadow::Shadow;
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
+const COPIES_DEFAULT: u32 = 4095;
+
+/// Copies that can be numbered: [`COPIES_DEFAULT`], or
+/// `VICTORY_MEMORY_COPIES`. 1,023 were too few in the prison's first
+/// room with the ray-tracing builder on: 100-400 pages a frame found "no
+/// number left", the walks read zeros there and their rays hit nothing
+/// (sky-blue tiles in the lighting, run r6b).
+fn copies_limit() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_COPIES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n >= 64)
+            .unwrap_or(COPIES_DEFAULT)
+    })
+}
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -75,6 +91,10 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// One page refused as not the title's memory since the last frame, for the log.
+    refused_example: Option<u64>,
+    /// The pages refused as not the title's memory since the last frame, for the log.
+    refused_pages: Vec<u64>,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -111,32 +131,36 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            refused_example: None,
+            refused_pages: Vec::new(),
         })
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
     /// is the title's.
-    fn map(&mut self, address: u64) {
+    fn map(&mut self, address: u64) -> Result<(), &'static str> {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
-            return;
+            return Err("past the directory");
         }
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
         // SAFETY: as above.
         if unsafe { entry.read() } != 0 {
-            return;
+            return Ok(());
         }
         let start = page * PAGE;
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
-            return;
+            return Err("not the title's memory");
         }
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
-            return;
+            self.refused_example.get_or_insert(start);
+            self.refused_pages.push(start);
+            return Err("not the title's memory");
         }
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
@@ -145,16 +169,16 @@ impl Memory {
             .filter(whole)
             .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
         else {
-            return;
+            return Err("no host copy holds the whole page");
         };
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-            return;
+            return Err("its host copy takes no unordered access");
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
+            None if self.copies.len() < copies_limit() as usize => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
@@ -180,9 +204,9 @@ impl Memory {
             None => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+                    tracing::warn!(copies = copies_limit(), "title memory by address: no number left for another copy; its pages read zeros")
                 });
-                return;
+                return Err("no number left");
             }
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
@@ -192,10 +216,12 @@ impl Memory {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
         }
+        Ok(())
     }
 
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
+        self.refused_pages.clear();
         let mut pages = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
@@ -209,27 +235,84 @@ impl Memory {
                 unsafe { at.write_volatile(0) };
             }
         }
-        if !pages.is_empty() {
+        // Why a page gets no copy now (it faults again next frame).
+        let mut why: Vec<(&'static str, u32)> = Vec::new();
+        let n = pages.len();
+        let first = pages.first().map_or(0, |&p| u64::from(p) * PAGE);
+        for page in pages {
+            if let Err(w) = self.map(u64::from(page) * PAGE) {
+                match why.iter_mut().find(|e| e.0 == w) {
+                    Some(e) => e.1 += 1,
+                    None => why.push((w, 1)),
+                }
+            }
+        }
+        if n > 0 {
             // Each is an access that read 0 or was dropped.
             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+                // What the kernel says of a page refused as not the title's: its
+                // allocation, state (0x1000 committed, 0x2000 reserved, 0x10000
+                // free), protection and type (0x20000 private, 0x40000 mapped).
+                let refused = self.refused_example.take().map(|at| {
+                    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+                    // SAFETY: plain data the call fills in.
+                    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                    // SAFETY: a query of our own address space.
+                    let ok = unsafe { VirtualQuery(at as *const _, &mut m, size_of_val(&m)) } != 0;
+                    format!(
+                        "{at:#x}: {}",
+                        if ok {
+                            format!(
+                                "base {:#x} size {:#x} state {:#x} protect {:#x} type {:#x}",
+                                m.AllocationBase as usize, m.RegionSize, m.State, m.Protect, m.Type
+                            )
+                        } else {
+                            "no answer".to_owned()
+                        }
+                    )
+                });
+                // All of them by what the kernel says of their allocation: (allocation
+                // base, state, type) and how many pages, the largest groups first.
+                let mut groups: Vec<((usize, u32, u32), u32)> = Vec::new();
+                for &at in &self.refused_pages {
+                    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+                    // SAFETY: plain data the call fills in.
+                    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                    // SAFETY: a query of our own address space.
+                    let key = if unsafe { VirtualQuery(at as *const _, &mut m, size_of_val(&m)) } != 0 {
+                        (m.AllocationBase as usize, m.State, m.Type)
+                    } else {
+                        (at as usize & !0xFFFF_FFFF, 0, 0)
+                    };
+                    match groups.iter_mut().find(|g| g.0 == key) {
+                        Some(g) => g.1 += 1,
+                        None => groups.push((key, 1)),
+                    }
+                }
+                groups.sort_by(|a, b| b.1.cmp(&a.1));
+                let groups: Vec<String> = groups
+                    .iter()
+                    .take(6)
+                    .map(|((base, state, kind), n)| format!("{n}x base {base:#x} state {state:#x} type {kind:#x}"))
+                    .collect();
                 tracing::warn!(
-                    pages = pages.len(),
-                    first = format_args!("{:#x}", u64::from(pages[0]) * PAGE),
+                    pages = n,
+                    first = format_args!("{first:#x}"),
+                    still_without_copy = ?why,
+                    refused = ?refused,
+                    refused_groups = ?groups,
                     "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); the copies are made now"
                 );
             }
-        }
-        for page in pages {
-            self.map(u64::from(page) * PAGE);
         }
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
     fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+        let _ = self.map(address);
+        let _ = self.map((address & !(CELL - 1)) + CELL);
     }
 }
 
@@ -280,7 +363,7 @@ pub(crate) fn ready(
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let base = heap.dynamic(copies_limit() + 1)?;
             heap.null_raw_uav_at(base);
             (base, 0)
         }

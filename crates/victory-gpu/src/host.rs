@@ -18,6 +18,15 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+/// Whether a frame has drawn the world yet (more than a thousand draws): the scripted
+/// start keys (`VICTORY_KEYS_AUTO`, victory-hle) stop then, before a cutscene they could skip.
+pub static WORLD_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`WORLD_SEEN`].
+pub fn world_seen() -> bool {
+    WORLD_SEEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -6384,6 +6393,10 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        // (the world is drawn: a frame of more than a thousand draws, world_seen)
+        if draws > 1000.0 {
+            WORLD_SEEN.store(true, Ordering::Relaxed);
+        }
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {

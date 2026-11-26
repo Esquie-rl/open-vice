@@ -146,6 +146,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                                 );
                                             }
                                         }
+                                        listing.push(format!("    io {:?}", n.io));
                                         listing
                                             .extend(n.layout.iter().map(|p| format!("    {p:?}")));
                                         listing.extend(n.used.iter().map(|u| format!("    {u:?}")));

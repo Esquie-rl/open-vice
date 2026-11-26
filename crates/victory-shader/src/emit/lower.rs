@@ -304,6 +304,11 @@ struct Lower<'a> {
     pair_meet: Option<u32>,
     /// A legacy geometry program ([`GsState`]).
     gs: Option<GsState>,
+    /// Per element of the inputs and of the vertex outputs, whether a linked pipeline's stage
+    /// leaves it out (`super::link`; empty when not linking).
+    drop_in: Vec<bool>,
+    drop_out: Vec<bool>,
+
     /// A structure-builder program under a partial `DispatchX` by threads,
     /// where its lanes past the thread counts stay alive: whether this lane
     /// is inside them ([`Self::dispatch_threads_prologue`]).
@@ -1318,6 +1323,9 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        // (the signatures stay whole while the program is lowered; what a linked pipeline
+        // leaves out goes at the end, `super::link`)
+        let (drop_in, drop_out) = super::link::left_out(&x.inputs, &x.outputs);
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1664,6 +1672,8 @@ impl<'a> Lower<'a> {
             pair_meet,
             gs,
             partial_active: None,
+            drop_in,
+            drop_out,
             flat: None,
             no_barrier,
             fence_only,
@@ -2381,6 +2391,19 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        // A linked stage's signatures without what it leaves out; an input left out must not
+        // have been read (`super::link`).
+        if !self.drop_in.is_empty() || !self.drop_out.is_empty() {
+            if self.s.inputs.iter().zip(&self.drop_in).any(|(e, &d)| d && e.usage != 0) {
+                return Err(unsupported(0, "an input left out of a linked pipeline read"));
+            }
+            let keep = |els: &mut Vec<SigElement>, drop: &[bool]| {
+                let mut d = drop.iter();
+                els.retain(|_| !d.next().copied().unwrap_or(false));
+            };
+            keep(&mut self.s.inputs, &self.drop_in);
+            keep(&mut self.s.outputs, &self.drop_out);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2611,8 +2634,9 @@ impl<'a> Lower<'a> {
             ".f32"
         };
         let entry = self.s.entry;
+        let sig = self.sig_id(true, id);
         let args = [
-            self.s.m.i32(id as u32),
+            self.s.m.i32(sig),
             self.s.m.i32(0),
             self.s.m.i8(col),
             self.s.m.undef(self.s.t.i32),
@@ -4164,6 +4188,12 @@ impl<'a> Lower<'a> {
         inst.write(pick(reg)?)
     }
 
+    /// Element `id` of the inputs (`input`) or the vertex outputs as the finished signature
+    /// numbers it, without those a linked pipeline leaves out (`super::link`).
+    fn sig_id(&self, input: bool, id: usize) -> u32 {
+        let drop = if input { &self.drop_in } else { &self.drop_out };
+        (id - drop.iter().take(id).filter(|&&d| d).count()) as u32
+    }
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
         let g = match self.x.st.guards[b][i] {
             None => None,
@@ -4491,7 +4521,15 @@ impl<'a> Lower<'a> {
         // never reached: they come down to the lane count when the outputs
         // do not fit.
         use super::container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
-        let (outputs, prims) = (&self.s.outputs, &self.s.prims);
+        // (linked: the outputs the pixel program reads, which are all that is declared)
+        let kept: Vec<SigElement>;
+        let outputs = if self.drop_out.is_empty() {
+            &self.s.outputs
+        } else {
+            kept = self.s.outputs.iter().zip(&self.drop_out).filter(|(_, d)| !**d).map(|(e, _)| e.clone()).collect();
+            &kept
+        };
+        let prims = &self.s.prims;
         let fits = |m: super::shader::Mesh| {
             mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
         };
@@ -10036,8 +10074,9 @@ impl<'a> Lower<'a> {
         };
         self.s.flags |= flags::BARYCENTRICS;
         let entry = self.s.entry;
+        let sig = self.sig_id(true, id);
         let args = [
-            self.s.m.i32(id as u32),
+            self.s.m.i32(sig),
             self.s.m.i32(0),
             self.s.m.i8(col),
             self.s.m.i8(k),
@@ -11568,6 +11607,10 @@ impl<'a> Lower<'a> {
             (true, true) => ("storePrimitiveOutput", 172),
         };
         for (id, col, value, half) in stores {
+            // (an output a linked pixel program does not read: neither stored nor declared)
+            if !primitive && self.drop_out.get(id).copied().unwrap_or(false) {
+                continue;
+            }
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
@@ -11595,8 +11638,9 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            let sig = if primitive { id as u32 } else { self.sig_id(false, id) };
             let mut args = vec![
-                self.s.m.i32(id as u32),
+                self.s.m.i32(sig),
                 self.s.m.i32(0),
                 self.s.m.i8(col),
                 x,
